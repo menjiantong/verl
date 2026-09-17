@@ -14,7 +14,12 @@
 import warnings
 
 from .base import BaseEngine, EngineRegistry
-from .fsdp import FSDPEngine, FSDPEngineWithLMHead, FSDPTurboEngineWithLMHead
+from .fsdp import (
+    FSDPEngine,
+    FSDPEngineWithLMHead,
+    FSDPTurboEngineWithLMHead,
+    FSDPTurboDSV41EngineWithLMHead,
+)
 
 __all__ = [
     "BaseEngine",
@@ -22,6 +27,7 @@ __all__ = [
     "FSDPEngine",
     "FSDPEngineWithLMHead",
     "FSDPTurboEngineWithLMHead",
+    "FSDPTurboDSV41EngineWithLMHead",
 ]
 
 try:
