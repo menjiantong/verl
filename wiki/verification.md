@@ -1,166 +1,131 @@
 # 验证步骤 — DeepSeek-V4.1 RL（verl + FSDPTurbo + vllm-ascend）
 
-> 配套改动见 [README.md](README.md)，方案见 [verl_fsdp_turbo_vllm_ascend_rl_plan.md](verl_fsdp_turbo_vllm_ascend_rl_plan.md)
-> 按顺序执行，每步有明确通过标准。
+> 配套：[改动盘点](README.md) ｜ [方案](verl_fsdp_turbo_vllm_ascend_rl_plan.md) ｜ [工作记录](worklog_dsv41_rl.md)
+> 模型：`/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-8layer-random`（8 层 / 384 experts / 无 engram，209GB）
 
 ---
 
-## Phase 0：环境与依赖（先行，约 1–2 天）
+## Phase 0：环境（已就绪，本地实测）
 
-### 0.1 安装清单
-| 组件 | 版本/来源 | 命令 |
+| 组件 | 本地路径 | 解析结果 |
 |---|---|---|
-| Python | ≥ 3.10（推荐 3.11） | — |
-| PyTorch | ≥ 2.9 | pip install torch |A2/A3 对应 wheel|
-| torch_npu | ≥ 2.9（匹配 CANN） | 昇腾安装指南 |
-| transformers | @cc7ab9be 附近（含 deepseek_v41 config） | pip install git+...@cc7ab9be |
-| vllm | 本地 `a97dacb`（≈v0.28.x） | `VLLM_TARGET_DEVICE=empty pip install -e vllm/` |
-| vllm-ascend | 本地定制分支 | `pip install -e vllm-ascend/` |
-| FSDPTurbo | gitcode 仓库，deepseek_v41 版 | `pip install -e FSDPTurbo/[npu]` |
-| verl | 本地（含本次改动） | `pip install -e verl/` + `requirements-npu.txt` |
+| verl | `/workspace-verl/verl` | editable ✓ |
+| vllm | `/workspace-verl/vllm` | editable（v0.28.1rc1.dev570+ga97dacb71）✓ |
+| vllm-ascend | `/workspace-verl/vllm-ascend-v41-private` | editable（含 V4.1 eager 定制）✓ |
+| FSDPTurbo | `/workspace-verl/FSDPTurbo` | editable（fsdp-turbo 0.1.0）✓ |
+| transformers | 5.10.4 | **不认 `deepseek_v4.1`** → 走 vLLM config fallback（已实现） |
 
-### 0.2 通过标准
 ```bash
-python -c "import verl, fsdp_turbo, vllm, vllm_ascend, torch_npu"
-# 全部成功（无 MissingDependency）
+python3 -c "import verl, vllm, vllm_ascend, fsdp_turbo, torch_npu; print('ok')"
+# 建议显式指定，避免同名副本歧义：
+# PYTHONPATH=/workspace-verl/vllm:/workspace-verl/vllm-ascend-v41-private:/workspace-verl/FSDPTurbo
 ```
 
 ---
 
-## Phase 1：训练侧验证（FSDPTurbo × verl，核心）
+## Phase 1：离线自检（无需 NPU，**已通过**）
 
-### 1.1 先跑 FSDPTurbo 自带 SFT（隔离 verl，验证模型可训练）
-
-```bash
-cd FSDPTurbo/examples/deepseek_v41
-# 改 config.yaml: data.dataset_path 指向真实纯文本数据
-bash run.sh    # 单机 8 卡
-```
-
-**通过标准**：loss 正常下降，无 OOM，checkpoint 可保存。
-
-### 1.2 verl 引擎导入冒烟（验证新引擎注册）
+一条命令跑完全部离线检查（5 项，实测 `all offline checks passed`）：
 
 ```bash
-cd verl
-python -c "
-from verl.workers.engine import EngineRegistry
-import verl.workers.engine  # 触发注册
-cls = EngineRegistry.get_engine_cls('language_model', 'fsdp_turbo_dsv41')
-print('engine OK:', cls)
-"
+cd /workspace-verl/verl
+python3 scripts/check_dsv41_offline.py
+# [ OK ] engine registration — FSDPTurboDSV41EngineWithLMHead
+# [ OK ] hf config (vLLM registry fallback) — DeepseekV41Config, tokenizer vocab=128000
+# [ OK ] external config -> ModelArgs — n_layers=8, experts=384, engram=(), dspark=0
+# [ OK ] checkpoint names + expert fusion — 194 model params: 178 direct + expert-fused, 274 unused (vision); byte-exact
+# [ OK ] build -> prepare (meta experts) — 16 experts deferred to meta, 14 buffers real
 ```
 
-**通过标准**：打印 `FSDPTurboDSV41EngineWithLMHead`，不报 Unknown backend。
-
-### 1.3 verl FSDP SFT 冒烟（真机 8 卡，NPU）
-
-用 verl 的 SFT 引擎测试或手工构造（参考 `tests/special_e2e/sft/run_sft_engine.sh` 的 NPU 变体），关键参数：
+以下为等价的分步命令（排查时用）：
 
 ```bash
-# 最小验证: 纯文本、减层、小 batch
-MODEL_PATH=<tokenizer路径>
-python3 -m verl.trainer.main_sft \
-    data.train_files=<train.parquet> \
-    data.val_files=<test.parquet> \
-    data.train_batch_size=2 \
-    actor_rollout_ref.model.path=$MODEL_PATH \
-    actor_rollout_ref.actor.strategy=fsdp_turbo_dsv41 \
-    +actor_rollout_ref.actor.fsdp_config.turbo_config.distributed.fully_shard_parallel_size=4 \
-    +actor_rollout_ref.actor.fsdp_config.turbo_config.distributed.tensor_parallel_size=2 \
-    trainer.n_gpus_per_node=8 \
-    trainer.logger=['console']
+cd /workspace-verl/verl
+
+# 1. 引擎注册
+python3 -c "from verl.workers.engine import EngineRegistry; print(EngineRegistry.get_engine_cls('language_model','fsdp_turbo_dsv41'))"
+# → FSDPTurboDSV41EngineWithLMHead
+
+# 2. 模型 config 可被 verl 读取
+python3 -c "from verl.workers.config.model import HFModelConfig; c=HFModelConfig(path='/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-8layer-random', trust_remote_code=True); print(type(c.hf_config).__name__, c.architectures)"
+# → DeepseekV41Config ['DeepseekV41ForCausalLM']
+
+# 3. 外部 config → ModelArgs
+python3 -c "from fsdp_turbo.models.deepseek_v41 import build_deepseek_v41_model_args as f; a=f('/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-8layer-random', max_seq_len=4096); print(a.n_layers, a.n_routed_experts, a.engram_layer_ids, a.compress_ratios)"
+# → 8 384 () (0, 0, 2, 2, 2, 2, 2, 2)
+
+# 4. HTTP 语法/配置组装
+env DEVICE=npu bash examples/grpo_trainer/run_deepseek_v41_grpo_fsdp_turbo_npu.sh --cfg job | tail -3
+# → exit 0，composed 配置含 strategy=fsdp_turbo_dsv41 / EP=8 / additional_config.*
+
+# 5. FSDPTurbo 单测（本次改动回归）
+python3 -m pytest /workspace-verl/FSDPTurbo/tests/unit_tests/models/test_deepseek_v41.py -q
+# → 18 passed（test_engram_parallel.py 的 3 个失败为改动前既有）
 ```
 
-**通过标准**：actor 能 build 模型、FSDP wrapper 完成、backward 无错。
-**若失败排查**：
-- `Unknown backend: fsdp_turbo_dsv41` → 引擎注册未生效，检查两个 `__init__.py` 导入路径。
-- 模块名不匹配（apply_modules 报错）→ 先去掉 apply_modules/recompute，或按日志修正为 `model.model.*`。
-- tokenizer 兼容 → 确认 HF tokenizer 与 `DeepSeekV41Processor` 兼容（参考 FSDPTurbo 示例用 `PreTrainedTokenizerFast`）。
+另已验证（脚本内含）：checkpoint 名称映射 194/194 命中、专家融合 `[w1 ; w3]`/`w2` 逐字节一致、hydra 覆盖全部生效。
 
 ---
 
-## Phase 2：rollout 侧验证（vllm-ascend 加载 V4.1）
-
-### 2.1 vllm-ascend 离线加载 V4.1
+## Phase 2：真机 8 卡冒烟（**待 NPU 空闲**）
 
 ```bash
-python -c "
-from vllm import LLM
-# 用减层权重目录 (含 config.json + safetensors)
-llm = LLM(model='<减层V4.1权重目录>',
-          tensor_parallel_size=2,
-          gpu_memory_utilization=0.45)
-out = llm.generate(['Hello'])
-print(out[0].outputs[0].text)
-"
+cd /workspace-verl/verl
+PYTHONPATH=/workspace-verl/vllm:/workspace-verl/vllm-ascend-v41-private:/workspace-verl/FSDPTurbo \
+HCCL_CONNECT_TIMEOUT=1500 HCCL_HOST_SOCKET_PORT_RANGE=60000-60050 HCCL_NPU_SOCKET_PORT_RANGE=61000-61050 \
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 TASK_QUEUE_ENABLE=1 \
+torchrun --nproc_per_node=8 --master_port=59511 scripts/check_dsv41_fsdp_turbo_build.py --forward
 ```
 
-**通过标准**：能构图、生成输出。报错则进 vllm-ascend 侧查 config→模型类映射。
+**通过标准**
+1. `building model (routed experts deferred to meta)` → `model built ... (194 parameters)`
+2. `wrapping with FSDPTurbo` 完成
+3. `parameters materialized in <N>s`（读盘 209GB，预计数分钟）
+4. `no meta parameters left`
+5. 每 rank 的显存/设备报告：专家参数在加速器上（EP 分片），稠密参数按 offload 策略
+6. `--forward` 时打印 `forward ok: logits (1, 8, 128000)`
 
-### 2.2 verl 权重同步一致性（可选但强烈建议）
-
-```bash
-# 用 1.3 产出的 SFT checkpoint 或随机初始化，跑一个最小 GRPO step
-# 观察 actor→vllm 权重同步后 rollout 的 logprob 不再随 step 变化（已对齐）
-```
-可复用 verl 现有单测思路（对比同步前后 `input_ids` 对应的 `log_prob`）。
+**排查**
+| 现象 | 方向 |
+|---|---|
+| 设备初始化失败（内存不足） | NPU 被占用；`npu-smi info` 看空闲 |
+| HCCL 超时 | `HCCL_CONNECT_TIMEOUT` / socket 端口范围 / 网卡 |
+| `parameters left on meta` | checkpoint 缺张量 → 看 rank0 的 missing 列表（引擎会直接报错） |
+| `Checkpoint ... has shape ... expects ...` | config 与 checkpoint 不匹配（换成对应层数的权重目录即可） |
+| EP 派发异常/结果乱 | 确认 `refresh_dsv41_expert_metadata` 已执行（构建日志无 `no meta parameters left` 之后的报错） |
 
 ---
 
-## Phase 3：GRPO 端到端（8 卡 NPU，纯文本）
-
-### 3.1 准备数据
-- 用 geo3k/gsm8k 风格 parquet（`prompt` + 参考答案），转成 verl RL 格式：
-  ```json
-  {"messages":[{"role":"user","content":"..."}], "images": null}
-  ```
-  （纯文本时 `images` 可省略）
-
-### 3.2 运行启动脚本
+## Phase 3：GRPO 端到端（**待 Phase 2 通过**）
 
 ```bash
-cd verl
-DEVICE=npu \
-MODEL_PATH=<tokenizer> \
-TRAIN_FILE=<train.parquet> \
-TEST_FILE=<test.parquet> \
+cd /workspace-verl/verl
+DEVICE=npu PYTHONPATH=/workspace-verl/vllm:/workspace-verl/vllm-ascend-v41-private:/workspace-verl/FSDPTurbo \
 bash examples/grpo_trainer/run_deepseek_v41_grpo_fsdp_turbo_npu.sh
 ```
 
-### 3.3 通过标准
-1. Ray 集群带 8×NPU 资源就绪。
-2. Actor/Ref Engine 构建成功（日志出现 `FSDPTurboDSV41EngineWithLMHead`）。
-3. Rollout 生成完成，reward 计算、GRPO loss 正常，无卡死/超时。
-4. 权重同步后 rollout logprob 稳定。
-5. `save_freq` 设为 >0 时 checkpoint 可保存/恢复。
+可调：`TRAIN_BSZ`（默认 8）、`SAMPLE_N`（默认 5）、`MAX_PROMPT_LEN`/`MAX_RESPONSE_LEN`（默认 1024/1024，同时决定 `VERL_DSV41_MAX_SEQ_LEN`）、`ROLLOUT_GPU_MEM_UTIL`（默认 0.6）、`EP_SIZE`/`EFSDP_SIZE`。
 
-### 3.4 常见问题
-| 现象 | 排查 |
-|---|---|
-| HCCL 连接超时 | 确认 HCCL_SOCKET_IFNAME/GLOO_SOCKET_IFNAME、800T 网卡、`HCCL_CONNECT_TIMEOUT` |
-| Ray 找不到 NPU | `RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1` + `ASCEND_RT_VISIBLE_DEVICES` |
-| rollout OOM | 降 `gpu_memory_utilization`、升 `max_num_batched_tokens` 调优 |
-| FSDPTurbo module 名不匹配 | 日志打印实际 module 名，改 `FSDP_APPLY_MODULES`/`RECOMPUTE_PLAN` |
-| engram/CSA2 报错 | 确认 `use_sparse_flash_attn=False`、`engram_meta_init=True`，且 FSDPTurbo 内置 config 是 demo 层数 |
+**通过标准**
+1. Ray 起 8 卡资源，actor/ref 两个引擎都完成模型构建（日志出现 checkpoint 加载条数与耗时）。
+2. rollout 生成完成（vLLM 加载 8 层权重 + `additional_config` 生效）。
+3. `update_weights` 后 rollout 与 actor 的 logprob 对齐（不随 step 漂移）。
+4. GRPO loss/kl/reward 正常打印，无卡死。
+5. `trainer.save_freq>0` 时 checkpoint 可存/可取。
+
+**已知调优点**：显存（专家分片 27GB/卡 + 权重同步时 18GB 单张量峰值）、`use_remove_padding=False` 的吞吐代价、V4.1 注意力在 NPU 上走 eager（非 fused DSA）。
 
 ---
 
-## Phase 4（后续）：多模态 + V4.1 完整结构
+## Phase 4（后续）：多模态 / 完整结构 / 全层
 
-- 多模态：数据加 `images` 字段，`data.image_key=images`，vllm-ascend `mm_processor_cache_gb=0`；验证 FSDPTurbo `vision.blocks.*` 并行。
-- Engram/CSA2/稀疏索引：FSDPTurbo 训练侧能力开启（`use_sparse_flash_attn=True`、`engram_storage_backend`），vLLM eager 推理侧专项对齐（compressor/indexer/cache 布局）。
-- 全层模型：先解决 FSDPTurbo 内置 config 只能出 4-layer 的问题（扩展 `build_deepseek_v41_model_args` 支持外部 config，或引入全层 config）。
+- 多模态：构建时 `include_vision=True`（`adapter.py` 已支持 `vision_config` 映射），数据加 `images`，`data.image_key=images`。
+- V4.1 特性：`use_sparse_flash_attn=True`（NPU `SparseFlashMla`）、Engram（`engram_meta_init=True` + 存储后端）。
+- 全层权重：换 `MODEL_PATH` 即可（结构随 config 走），需重新评估显存与 EP/EFSDP 拓扑。
 
 ---
 
-## 附加：本次改动的静态自检（已在本机通过）
+## 附：本次新增的诊断/冒烟脚本
 
-```bash
-python -m py_compile verl/workers/engine/fsdp/fsdp_turbo_dsv41_impl.py \
-                  verl/workers/engine/fsdp/__init__.py \
-                  verl/workers/engine/__init__.py
-# 全部通过（无语法错误）
-```
-
-真机运行时再补：`EngineRegistry.get_engine_cls('language_model', 'fsdp_turbo_dsv41')` 冒烟。
+- `scripts/check_dsv41_fsdp_turbo_build.py`：绕开 Ray/verl trainer 的三步验证（构建 / 分片加载 / 前向）+ 每类参数的显存与设备分布报告；`--random-init` 可完全跳过 209GB 读盘。
+- 环境变量：`VERL_DSV41_MAX_SEQ_LEN`（RoPE/scratch 尺寸）、`VERL_DSV41_RANDOM_INIT=1`（跳过 checkpoint）。

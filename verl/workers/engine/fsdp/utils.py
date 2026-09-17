@@ -120,4 +120,22 @@ def unfuse_moe_params(weights, model_type: str | None = None):
                 yield f"{base}.{expert_id}.down_proj.weight", tensor[expert_id].contiguous()
             continue
 
+        # FSDP-Turbo's DeepSeek-V4.1 backbone packs the routed experts the same way
+        # under ``ffn.experts`` but names the halves the way the checkpoint does
+        # (w1/w3/w2): vLLM loads V4 checkpoints one expert at a time, so emitting
+        # those keys keeps the live sync on the same path as a from-disk load.
+        if name.endswith(".ffn.experts.gate_up_proj") and tensor.dim() == 3:
+            gate, up = tensor.chunk(2, dim=1)
+            base = name.removesuffix(".gate_up_proj")
+            for expert_id in range(tensor.size(0)):
+                yield f"{base}.{expert_id}.w1.weight", gate[expert_id].contiguous()
+                yield f"{base}.{expert_id}.w3.weight", up[expert_id].contiguous()
+            continue
+
+        if name.endswith(".ffn.experts.down_proj") and tensor.dim() == 3:
+            base = name.removesuffix(".down_proj")
+            for expert_id in range(tensor.size(0)):
+                yield f"{base}.{expert_id}.w2.weight", tensor[expert_id].contiguous()
+            continue
+
         yield name, tensor

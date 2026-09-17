@@ -1,0 +1,2908 @@
+ ▐▛███▛█   Claude Code v2.1.271
+▝▜██████▀  qwen3.8-max · API Usage Billing
+  ▝▝ ▝▝    /workspace-verl/verl
+
+
+❯ /clear                                                                        
+
+❯ @verl/wiki/ 这个文件夹有几个文件，两份是verl集成FSDP 和 vllm /vllm            
+  ascend的方案，还有个验证方案。请根据这个方案实现下，实现verl对deepseek        
+  v4.1进行强化学习。注意方案中的版本可能和本地目录不一致，以本地目录稳准。本地  
+  目录的版本已经跑通了，FSDP跑的脚本在/workspace-verl/FSDPTurbo/examples/deepse 
+  ek_v41/run.sh,                                                                
+  推理的脚本在scripts/run_vllm2.sh中。模型目前8层的减层权重。注意所有的工作记录 
+  、遇到的问题、修复的方案都要进行记录，输出到/verl/wiki文件夹即可。            
+  ⎿  Listed directory verl/wiki/
+
+  Thought for 24s, read 4 files (ctrl+o to expand)
+  ⎿  Loaded verl/CLAUDE.md
+  ⎿  Loaded 2 skills from verl/.claude/skills
+  ⎿  2 skills available
+
+● wiki 显示方案已确认且 README
+  声称"代码已实施"。我先核实本地实际状态，再决定实施内容。
+
+  Thought for 5s, listed 1 directory (ctrl+o to expand)
+
+● 实现文件已存在。现在读取本地跑通的脚本（事实基准）与已实施的代码，核对一致性。
+
+  Thought for 4m 30s, searched for 1 pattern, read 8 files, listed 2 directories, ran 5 shell commands (ctrl+o to expand)
+
+● 2 background agents launched (↓ to manage)
+   ├ 探索 verl 权重同步流
+   └ 探索 vllm-ascend V4.1 权重命名
+
+  Thought for 6m 20s, searched for 4 patterns, listed 1 directory, ran 6 shell commands (ctrl+o to expand)
+
+● Explore(探索分布式权重加载可行性)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Agent "探索 verl 权重同步流" failed: Agent terminated early due to an API
+error: API Error: Request rejected (429) · Your token-plan 1-week quota has been
+exhausted. The quota will reset at 09-21 09:17:00 UTC. (error type rate_limit,
+HTTP 429, request id 5d27fe34-ba39-46f6-b328-6bbf20e1469f, model sent to the
+API: qwen3.8-max)
+
+● Agent "探索 vllm-ascend V4.1 权重命名" failed: Agent terminated early due to
+an API error: API Error: Request rejected (429) · Your token-plan 1-week quota
+has been exhausted. The quota will reset at 09-21 09:17:00 UTC. (error type
+rate_limit, HTTP 429, request id e0ad7a8e-b6b5-4b9b-98d3-e83cbffca806, model
+sent to the API: qwen3.8-max)
+
+● API Error: Request rejected (429) · Your token-plan 1-week quota has 
+  been exhausted. The quota will reset at 09-21 09:17:00 UTC.
+
+✻ Brewed for 18m 38s · done 10:49 AM
+
+● Agent "探索分布式权重加载可行性" failed: Agent terminated early due to an API
+error: API Error: Request rejected (429) · Your token-plan 1-week quota has been
+exhausted. The quota will reset at 09-21 09:17:00 UTC. (error type rate_limit,
+HTTP 429, request id 245e8878-1164-408c-bfaf-bd055fae267b, model sent to the
+API: qwen3.8-max)
+
+● API Error: Request rejected (429) · Your token-plan 1-week quota has 
+  been exhausted. The quota will reset at 09-21 09:17:00 UTC.
+
+✻ Worked for 19m 3s · done 10:49 AM
+
+❯ /export                                                                       
+  ⎿  Conversation exported to: /workspace-verl/verl/2026-09-17-110254-local-comm
+     and-caveatcaveat-the-messages-below.txt
+
+❯ /status 
+  ⎿  Settings dialog dismissed
+
+❯ 继续工作                                                                      
+
+● API Error: 400 The supported API model names are deepseek-flash, 
+  deepseek-v4-pro, but you passed qwen3.8-max.
+
+✻ Brewed for 1s · done 11:45 AM
+
+❯ 继续工作                                                                      
+
+● 三个探索 agent 都因 API 配额（429，需等到 09-21
+  重置）中止，我改为直接自己排查。先看关键的一环：torch 分布式 checkpoint
+  加载能否支持 "rank0 完整 CPU state + meta 模型分片物化"。
+
+  Ran 1 shell command (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ API配额已更新，继续工作                                                       
+
+● 配额恢复。我重新派出三个探索 agent 并行推进三条关键路径，同时自己读 torch DCP
+  源码。
+● 3 background agents launched (↓ to manage)
+   ├ 探索 verl 权重同步流
+   ├ 探索 vllm-ascend V4.1 权重命名
+   └ 探索分布式权重加载可行性
+
+● 三个 agent 已重新派出。我这边继续做不重叠的检查：数据集格式、reward
+  函数、tokenizer 可用性。
+
+  Searched for 1 pattern, listed 1 directory, ran 6 shell commands (ctrl+o to expand)
+  ⎿  2 skills available
+
+● 关键发现：verl 的 ModelConfig 里已有一段针对 deepseek_v4 的 fallback（走 vllm
+  的 config registry）。测试它对 deepseek_v4.1 是否可用。
+
+  Searched for 1 pattern, ran 12 shell commands (ctrl+o to expand)
+  ⎿  1 skill available
+
+● 引擎注册冒烟通过。现在开始动手实现。先看 FSDPTurbo 仓库状态，然后扩展其
+  adapter 支持外部 config（8 层）。
+
+  Read 1 file, ran 2 shell commands (ctrl+o to expand)
+
+● Now I'll implement the external-config support in FSDPTurbo's adapter:
+
+● Update(/workspace-verl/FSDPTurbo/fsdp_turbo/models/deepseek_v41/adapter.py)
+  ⎿  Added 140 lines, removed 3 lines
+      158          )
+      159  
+      160  
+      161 -def build_deepseek_v41_model_args():                          
+      162 -    """Build model arguments directly from the vendored traini
+          -ng config."""                                                 
+      163 -    model_args = reference_model.ModelArgs(**_load_model_args(
+          -))                                                            
+      161 +def _read_config_file(config_path) -> dict:                   
+      162 +    """Read a config JSON file, or ``<config_path>/config.json
+          +`` for a directory."""                                        
+      163 +    path = Path(config_path)                                  
+      164 +    if path.is_dir():                                         
+      165 +        path = path / "config.json"                           
+      166 +    with path.open("r", encoding="utf-8") as config_file:     
+      167 +        return json.load(config_file)                         
+      168 +                                                              
+      169 +                                                              
+      170 +def _model_args_kwargs_from_hf_config(                        
+      171 +    config: dict,                                             
+      172 +    *,                                                        
+      173 +    include_vision: bool = False,                             
+      174 +    max_seq_len: int | None = None,                           
+      175 +) -> dict:                                                    
+      176 +    """Translate a HuggingFace-style DeepSeek-V4.1 ``config.js
+          +on`` into ``ModelArgs`` kwargs.                               
+      177 +                                                              
+      178 +    Inference checkpoints nest the language model under ``text
+          +_config`` (and the tower                                      
+      179 +    under ``vision_config``) and use HF field names; the train
+          +ing model wants the flat                                      
+      180 +    reference-model names. DSpark/MTP is an inference-only str
+          +ucture that the                                               
+      181 +    causal-LM adapter rejects, so it is always pinned off here
+          +.                                                             
+      182 +    """                                                       
+      183 +    text = config.get("text_config", config)                  
+      184 +    rope = text.get("rope_scaling") or {}                     
+      185 +    kwargs = {                                                
+      186 +        "vocab_size": text["vocab_size"],                     
+      187 +        "dim": text["hidden_size"],                           
+      188 +        "moe_inter_dim": text["moe_intermediate_size"],       
+      189 +        "n_layers": text["num_hidden_layers"],                
+      190 +        "n_mtp_layers": 0,                                    
+      191 +        "n_heads": text["num_attention_heads"],               
+      192 +        "n_routed_experts": text["n_routed_experts"],         
+      193 +        "n_shared_experts": text.get("n_shared_experts", 1),  
+      194 +        "n_activated_experts": text.get("num_experts_per_tok",
+          + 6),                                                          
+      195 +        "score_func": text.get("scoring_func", "sqrtsoftplus")
+          +,                                                             
+      196 +        "norm_topk_prob": text.get("norm_topk_prob", True),   
+      197 +        "route_scale": text.get("routed_scaling_factor", 1.0),
+      198 +        "swiglu_limit": text.get("swiglu_limit", 0.0),        
+      199 +        "q_lora_rank": text["q_lora_rank"],                   
+      200 +        "head_dim": text["head_dim"],                         
+      201 +        "rope_head_dim": text["qk_rope_head_dim"],            
+      202 +        "norm_eps": text.get("rms_norm_eps", 1e-20),          
+      203 +        "o_groups": text.get("o_groups", 8),                  
+      204 +        "o_lora_rank": text["o_lora_rank"],                   
+      205 +        "window_size": text.get("sliding_window", 128),       
+      206 +        "compress_ratios": tuple(text["compress_ratios"]),    
+      207 +        "kv_source_layers": tuple(                            
+      208 +            text.get("kv_source_layer_ids") or text.get("kv_so
+          +urce_layers") or ()                                           
+      209 +        ),                                                    
+      210 +        "index_source_layers": tuple(                         
+      211 +            text.get("index_source_layer_ids")                
+      212 +            or text.get("index_source_layers")                
+      213 +            or ()                                             
+      214 +        ),                                                    
+      215 +        "compress_rope_theta": text.get("compress_rope_theta",
+          + 40000.0),                                                    
+      216 +        "original_seq_len": rope.get("original_max_position_em
+          +beddings", 0),                                                
+      217 +        "rope_theta": text.get("rope_theta", 10000.0),        
+      218 +        "rope_factor": rope.get("factor", 1.0),               
+      219 +        "beta_fast": rope.get("beta_fast", 32),               
+      220 +        "beta_slow": rope.get("beta_slow", 1),                
+      221 +        "index_n_heads": text.get("index_n_heads", 16),       
+      222 +        "index_head_dim": text.get("index_head_dim", 64),     
+      223 +        "index_topk": text.get("index_topk", 64),             
+      224 +        "candidate_source_layer": text.get(                   
+      225 +            "candidate_source_layer_id", text.get("candidate_s
+          +ource_layer", -1)                                             
+      226 +        ),                                                    
+      227 +        "candidate_topk_blocks": text.get("candidate_topk_bloc
+          +ks", 0),                                                      
+      228 +        "candidate_block_size": text.get("candidate_block_size
+          +", 0),                                                        
+      229 +        "hc_mult": text.get("hc_mult", 4),                    
+      230 +        "hc_sinkhorn_iters": text.get("hc_sinkhorn_iters", 20)
+          +,                                                             
+      231 +        "hc_eps": text.get("hc_eps", 1e-6),                   
+      232 +        "engram_layer_ids": tuple(text.get("engram_layer_ids")
+          + or ()),                                                      
+      233 +        "engram_num_embeddings": tuple(text.get("engram_num_em
+          +beddings") or ()),                                            
+      234 +        "engram_max_ngram_size": text.get("engram_max_ngram_si
+          +ze", 1),                                                      
+      235 +        "engram_vocab_size": text.get("engram_vocab_size", 0),
+      236 +        "engram_n_heads": text.get("engram_n_heads", 0),      
+      237 +        "engram_head_dim": text.get("engram_head_dim", 0),    
+      238 +        "engram_pad_id": text.get("engram_pad_token_id", 2),  
+      239 +        "engram_compressed_vocab_size": text.get("engram_compr
+          +essed_vocab_size", 0),                                        
+      240 +        # DSpark / MTP draft heads are inference-only.        
+      241 +        "dspark_block_size": 0,                               
+      242 +        "dspark_target_layer_ids": (),                        
+      243 +        "dtype": "bf16",                                      
+      244 +        "expert_dtype": None,                                 
+      245 +    }                                                         
+      246 +    if max_seq_len is not None:                               
+      247 +        kwargs["max_seq_len"] = max_seq_len                   
+      248 +    vision = config.get("vision_config")                      
+      249 +    if include_vision and vision:                             
+      250 +        kwargs.update(                                        
+      251 +            {                                                 
+      252 +                "vision_n_layers": vision["num_hidden_layers"]
+          +,                                                             
+      253 +                "vision_dim": vision["hidden_size"],          
+      254 +                "vision_n_heads": vision["num_attention_heads"
+          +],                                                            
+      255 +                "vision_inter_dim": vision["intermediate_size"
+          +],                                                            
+      256 +                "vision_patch_size": vision["patch_size"],    
+      257 +                "vision_rope_theta": vision.get("rope_theta", 
+          +10000.0),                                                     
+      258 +                "vision_downsample_ratio": vision.get("downsam
+          +ple_ratio", 3),                                               
+      259 +                "vision_max_n_token": vision.get(             
+      260 +                    "max_image_tokens", vision.get("max_num_to
+          +kens", 1024)                                                  
+      261 +                ),                                            
+      262 +                "vision_min_pixels": vision.get("min_pixels", 
+          +544 * 544),                                                   
+      263 +                "vision_max_wh_ratio": vision.get("max_wh_rati
+          +o"),                                                          
+      264 +                "image_token_id": config.get("image_token_id",
+          + 129264),                                                     
+      265 +            }                                                 
+      266 +        )                                                     
+      267 +    return kwargs                                             
+      268 +                                                              
+      269 +                                                              
+      270 +def build_deepseek_v41_model_args(                            
+      271 +    config_path=None,                                         
+      272 +    *,                                                        
+      273 +    include_vision: bool = False,                             
+      274 +    max_seq_len: int | None = None,                           
+      275 +):                                                            
+      276 +    """Build model arguments.                                 
+      277 +                                                              
+      278 +    Without ``config_path`` the vendored training config is us
+          +ed (the standalone                                            
+      279 +    examples' behavior). With a path to a HuggingFace-style ``
+          +config.json`` (or the                                         
+      280 +    checkpoint directory holding one, e.g. ``DeepSeek-V4.1-Fla
+          +sh-*``), the structure is                                     
+      281 +    taken from that file instead — this is what lets verl trai
+          +n the same layers/experts                                     
+      282 +    as the rollout checkpoint.                                
+      283 +    """                                                       
+      284 +    if config_path is None:                                   
+      285 +        raw_config = _load_model_args()                       
+      286 +    elif isinstance(config_path, dict):                       
+      287 +        raw_config = config_path                              
+      288 +    else:                                                     
+      289 +        raw_config = _read_config_file(config_path)           
+      290 +    if "text_config" in raw_config or config_path is None:    
+      291 +        kwargs = (                                            
+      292 +            raw_config                                        
+      293 +            if config_path is None                            
+      294 +            else _model_args_kwargs_from_hf_config(           
+      295 +                raw_config, include_vision=include_vision, max
+          +_seq_len=max_seq_len                                          
+      296 +            )                                                 
+      297 +        )                                                     
+      298 +    else:                                                     
+      299 +        kwargs = raw_config                                   
+      300 +    model_args = reference_model.ModelArgs(**kwargs)          
+      301      _validate_training_args(model_args)
+      302      return model_args
+      303  
+
+● Update(/workspace-verl/FSDPTurbo/fsdp_turbo/models/deepseek_v41/adapter.py)
+  ⎿  Added 13 lines, removed 2 lines
+      327          "row_sharded", "host_offload", "elastic_buffer"
+      328      ] = "row_sharded",
+      329      use_sparse_flash_attn: bool = False,
+      330 +    config_path=None,                                         
+      331 +    include_vision: bool = False,                             
+      332 +    max_seq_len: int | None = None,                           
+      333  ) -> DeepseekV41ForCausalLMAdapter:
+      331 -    """Build an uninitialized BF16 model from the vendored con
+          -fig JSON.                                                     
+      334 +    """Build an uninitialized BF16 model.                     
+      335  
+      336 +    Structure comes from the vendored config JSON unless ``con
+          +fig_path`` points at a                                        
+      337 +    HuggingFace-style ``config.json`` / checkpoint directory (
+          +see                                                           
+      338 +    :func:`build_deepseek_v41_model_args`).                   
+      339 +                                                              
+      340      engram_meta_init defers only the large Engram tables; othe
+           r parameters and
+      341      runtime buffers are constructed normally. FSDPTurbo later 
+           shards and
+      342      initializes those tables without allocating their full sto
+           rage.
+      343      """
+      337 -    model_args = replace(build_deepseek_v41_model_args())     
+      344 +    model_args = replace(                                     
+      345 +        build_deepseek_v41_model_args(                        
+      346 +            config_path, include_vision=include_vision, max_se
+          +q_len=max_seq_len                                             
+      347 +        )                                                     
+      348 +    )                                                         
+      349      model_args.engram_storage_backend = engram_storage_backend
+      350      model_args.use_sparse_flash_attn = use_sparse_flash_attn
+      351      return _build_deepseek_v41_model(
+
+  Searched for 1 pattern, ran 7 shell commands (ctrl+o to expand)
+
+● Agent "探索分布式权重加载可行性" finished · 12m 0s
+
+● 分布式加载探索完成，结论明确：set_model_state_dict(full_state_dict=True, 
+  broadcast_from_rank0=True) 官方支持 "rank0 CPU 完整 state + meta
+  模型分片物化"，但有几个静默陷阱（确定性 buffer、expert_ids_per_ep_rank 滞留
+  meta、expert 张量是堆叠命名）。先读 buffer 构造函数与 dispatcher 用法。
+
+  Read 1 file, ran 5 shell commands (ctrl+o to expand)
+
+● 开始实现。先在 FSDPTurbo 侧加"专家张量 meta 构造"开关（对齐仓库已有的
+  engram_meta_init 先例，避免整模型 meta 破坏确定性 buffer）。
+
+● Update(/workspace-verl/FSDPTurbo/fsdp_turbo/models/deepseek_v41/experts.py)
+  ⎿  Added 3 lines
+      22          *,
+      23          swiglu_limit: float = 0.0,
+      24          dtype: torch.dtype | None = None,
+      25 +        device: torch.device | str | None = None,              
+      26      ) -> None:
+      27          super().__init__()
+      28          self.num_experts = num_experts
+     ...
+      36                  2 * intermediate_size,
+      37                  hidden_size,
+      38                  dtype=dtype,
+      39 +                device=device,                                 
+      40              )
+      41          )
+      42          self.down_proj = nn.Parameter(
+     ...
+      45                  hidden_size,
+      46                  intermediate_size,
+      47                  dtype=dtype,
+      48 +                device=device,                                 
+      49              )
+      50          )
+      51  
+
+● Update(/workspace-verl/FSDPTurbo/fsdp_turbo/models/deepseek_v41/model.py)
+  ⎿  Added 1 line
+      1003              intermediate_size=args.moe_inter_dim,
+      1004              dtype=None,
+      1005              swiglu_limit=args.swiglu_limit,
+      1006 +            device="meta" if args.experts_meta_init else None
+           +,                                                            
+      1007          )
+      1008          assert args.n_shared_experts == 1
+      1009          self.shared_experts = Expert(
+
+● Now add the experts_meta_init field to ModelArgs and plumb it through the
+  adapter:
+
+● Update(/workspace-verl/FSDPTurbo/fsdp_turbo/models/deepseek_v41/model.py)
+  ⎿  Added 5 lines
+      153      # dspark draft head. Only the forward pass is implemented 
+           here -- nothing calls forward_spec,
+      154      # so these are read but the speculative-decoding loop itse
+           lf is out of scope for this repo.
+      155      dspark_block_size: int = 0
+      156 +    # Defer the stacked routed-expert tensors (the bulk of a f
+          +ull-size model) to the meta                                   
+      157 +    # device at construction. Other parameters and every buffe
+          +r are still created with real                                 
+      158 +    # values, so this is safe to combine with checkpoint loadi
+          +ng: FSDPTurbo shards the meta                                 
+      159 +    # experts and the loader only materializes each rank's sli
+          +ce.                                                           
+      160 +    experts_meta_init: bool = False                           
+      161      dspark_noise_token_id: int = 0
+      162      dspark_target_layer_ids: tuple[int, ...] = ()
+      163      dspark_markov_rank: int = 256
+
+● Update(/workspace-verl/FSDPTurbo/fsdp_turbo/models/deepseek_v41/adapter.py)
+  ⎿  Added 7 lines, removed 3 lines
+      327          "row_sharded", "host_offload", "elastic_buffer"
+      328      ] = "row_sharded",
+      329      use_sparse_flash_attn: bool = False,
+      330 +    experts_meta_init: bool = False,                          
+      331      config_path=None,
+      332      include_vision: bool = False,
+      333      max_seq_len: int | None = None,
+     ...
+      338      HuggingFace-style ``config.json`` / checkpoint directory (
+           see
+      339      :func:`build_deepseek_v41_model_args`).
+      340  
+      340 -    engram_meta_init defers only the large Engram tables; othe
+          -r parameters and                                              
+      341 -    runtime buffers are constructed normally. FSDPTurbo later 
+          -shards and                                                    
+      342 -    initializes those tables without allocating their full sto
+          -rage.                                                         
+      341 +    engram_meta_init defers only the large Engram tables; expe
+          +rts_meta_init defers the                                      
+      342 +    stacked routed-expert tensors. In both cases the remaining
+          + parameters and all                                           
+      343 +    runtime buffers are constructed normally, so a later check
+          +point load only has to                                        
+      344 +    materialize the deferred pieces. FSDPTurbo shards and init
+          +ializes those tables                                          
+      345 +    without allocating their full storage.                    
+      346      """
+      347      model_args = replace(
+      348          build_deepseek_v41_model_args(
+     ...
+      351      )
+      352      model_args.engram_storage_backend = engram_storage_backend
+      353      model_args.use_sparse_flash_attn = use_sparse_flash_attn
+      354 +    model_args.experts_meta_init = experts_meta_init          
+      355      return _build_deepseek_v41_model(
+      356          model_args,
+      357          tokenizer=tokenizer,
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● 实现可行且高效（真实参数仅 2.65B ≈ 4.9GB/rank，专家张量延迟到 meta）。现在检查
+  EngineConfig 里可用于 max_seq_len 的字段。
+
+  Searched for 1 pattern, read 1 file, ran 2 shell commands (ctrl+o to expand)
+
+● Update(/workspace-verl/FSDPTurbo/fsdp_turbo/distributed/expert_parallel/expert
+        _parallel.py)
+  ⎿  Added 25 lines
+      52      return modules
+      53  
+      54  
+      55 +def refresh_expert_parallel_metadata(modules: torch.nn.Module, 
+         +device=None) -> None:                                          
+      56 +    """Rebuild the dispatcher bookkeeping that lives outside th
+         +e state dict.                                                  
+      57 +                                                               
+      58 +    ``expert_ids_per_ep_rank`` is derived purely from the exper
+         +t counts, but it is                                            
+      59 +    created on the expert weights' device — the meta device, wh
+         +en the weights were                                            
+      60 +    deferred there. It is a plain attribute rather than a buffe
+         +r, so materializing or                                         
+      61 +    loading the weights never refreshes it: without this call t
+         +he EP dispatcher would                                         
+      62 +    read uninitialized ids and route tokens to the wrong expert
+         +s. Call it once the                                            
+      63 +    expert weights are real.                                   
+      64 +    """                                                        
+      65 +    for module in modules.modules():                           
+      66 +        num_global_experts = getattr(module, "num_global_expert
+         +s", None)                                                      
+      67 +        if num_global_experts is None or not hasattr(module, "e
+         +xpert_ids_per_ep_rank"):                                       
+      68 +            continue                                           
+      69 +        if device is None:                                     
+      70 +            target_device = next(module.parameters()).device   
+      71 +        else:                                                  
+      72 +            target_device = device                             
+      73 +        module.expert_ids_per_ep_rank = torch.arange(          
+      74 +            num_global_experts,                                
+      75 +            dtype=torch.int32,                                 
+      76 +            device=target_device,                              
+      77 +        ).remainder(module.num_local_experts)                  
+      78 +                                                               
+      79 +                                                               
+      80  def get_ep_modules(modules: torch.nn.Module, plan: EPPlanConfig
+          ):
+      81      ep_modules = []
+      82      for plan_name in plan.apply_modules:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● 现在写 verl 引擎的核心实现（外部 config + 分布式 checkpoint 加载）。
+
+● Write(verl/workers/engine/fsdp/fsdp_turbo_dsv41_impl.py)
+  ⎿  Added 252 lines, removed 11 lines
+       17  DeepSeek-V4.1's trainable model lives in ``fsdp_turbo.models.d
+           eepseek_v41``
+       18  (``DeepseekV41ForCausalLMAdapter`` + the vendored reference ar
+           chitecture) and is
+       19  *not* a transformers ``AutoModel`` class, so verl's generic ``
+           _build_module``
+       20 -(HF ``from_pretrained``) cannot construct it. This engine over
+          -rides                                                         
+       21 -``_build_module`` to build the V4.1 adapter through FSDP-Turbo
+          -'s own                                                        
+       22 -build/initialize/prepare pipeline and lets the parent ``_build
+          -_fsdp_module``                                                
+       23 -wrap it with FSDP-Turbo parallelism as usual.                 
+       20 +(HF ``from_pretrained``) cannot construct it. This engine buil
+          +ds the V4.1 adapter                                           
+       21 +through FSDP-Turbo's own build/initialize/prepare pipeline and
+          + lets the parent                                              
+       22 +``_build_fsdp_module`` wrap it with FSDP-Turbo parallelism.   
+       23  
+       25 -Model structure is currently read from FSDP-Turbo's vendored `
+          -`config.json``                                                
+       26 -(``fsdp_turbo/models/deepseek_v41/config.json``, a 4-layer dem
+          -o), not from                                                  
+       27 -``actor_rollout_ref.model.path``. ``model.path`` still supplie
+          -s the tokenizer.                                              
+       24 +Two things are specific to the full-size (rollout-sized) model
+          +:                                                             
+       25 +                                                              
+       26 +* **Structure comes from the rollout checkpoint's ``config.jso
+          +n``**, not from                                               
+       27 +  FSDP-Turbo's vendored demo config, so the actor/ref model ma
+          +tches the model vLLM                                          
+       28 +  serves. ``actor_rollout_ref.model.path`` points at that dire
+          +ctory (which also                                             
+       29 +  supplies the tokenizer).                                    
+       30 +* **The routed experts are ~98% of the parameters** (108B of 1
+          +11B here). They are                                           
+       31 +  built on the meta device and materialized straight from the 
+          +checkpoint, once per                                          
+       32 +  rank, by ``torch.distributed.checkpoint``'s ``set_model_stat
+          +e_dict`` with                                                 
+       33 +  ``broadcast_from_rank0=True``: rank 0 streams the safetensor
+          +s, everyone else                                              
+       34 +  receives the broadcast and keeps only its shard. Building a 
+          +full replica per rank                                         
+       35 +  would need ~220GB of accelerator memory, which does not exis
+          +t.                                                            
+       36 +                                                              
+       37 +The checkpoint stores experts per expert (``w1``/``w3``/``w2``
+          +) while the training                                          
+       38 +model keeps them stacked (``gate_up_proj``/``down_proj``), so 
+          +the loader fuses rows                                         
+       39 +while reading.                                                
+       40  """
+       41  
+       42  from __future__ import annotations
+       43  
+       44 +import json                                                   
+       45 +import logging                                                
+       46 +import os                                                     
+       47 +import re                                                     
+       48 +from pathlib import Path                                      
+       49 +                                                              
+       50  import torch
+       51 +import torch.distributed as dist                              
+       52  
+       53  from ..base import EngineRegistry
+       54  from .fsdp_turbo_impl import FSDPTurboEngineWithLMHead
+       55  
+       56 +logger = logging.getLogger(__name__)                          
+       57  
+       58 +# ``layers.<N>.ffn.experts.<E>.w1.weight`` … the routed expert
+          +s are stored per expert in                                    
+       59 +# the checkpoint but stacked in the training model (``gate_up_
+          +proj`` / ``down_proj``).                                      
+       60 +_EXPERT_WEIGHT_PATTERN = re.compile(r"^layers\.(\d+)\.ffn\.exp
+          +erts\.(\d+)\.(w1|w2|w3)\.weight$")                            
+       61 +# The adapter wraps the backbone as ``self.model``, the checkp
+          +oint names the backbone.                                      
+       62 +_MODEL_PREFIX = "model."                                      
+       63 +# Fallback sequence length: covers prompt+response of the GRPO
+          + config; only sizes the                                       
+       64 +# RoPE tables and the per-layer attention scratch caches.     
+       65 +_DEFAULT_MAX_SEQ_LEN = 8192                                   
+       66 +                                                              
+       67 +                                                              
+       68 +def _config_path_from_model_path(model_path: str) -> Path:    
+       69 +    """Return the ``config.json`` for a checkpoint directory (
+          +or the file itself)."""                                       
+       70 +    path = Path(model_path)                                   
+       71 +    return path / "config.json" if path.is_dir() else path    
+       72 +                                                              
+       73 +                                                              
+       74 +def _checkpoint_weight_map(ckpt_dir: Path) -> dict[str, str]: 
+       75 +    """Map checkpoint tensor name -> shard file name."""      
+       76 +    index_path = ckpt_dir / "model.safetensors.index.json"    
+       77 +    if index_path.exists():                                   
+       78 +        with index_path.open("r", encoding="utf-8") as index_f
+          +ile:                                                          
+       79 +            return json.load(index_file)["weight_map"]        
+       80 +    shard_files = sorted(ckpt_dir.glob("*.safetensors"))      
+       81 +    if not shard_files:                                       
+       82 +        raise FileNotFoundError(f"No safetensors checkpoint fo
+          +und in {ckpt_dir}.")                                          
+       83 +    from safetensors import safe_open                         
+       84 +                                                              
+       85 +    weight_map = {}                                           
+       86 +    for shard_file in shard_files:                            
+       87 +        with safe_open(str(shard_file), framework="pt", device
+          +="cpu") as handle:                                            
+       88 +            for name in handle.keys():                        
+       89 +                weight_map[name] = shard_file.name            
+       90 +    return weight_map                                         
+       91 +                                                              
+       92 +                                                              
+       93 +def read_dsv41_checkpoint_state_dict(                         
+       94 +    ckpt_dir: Path, param_meta: dict[str, tuple[tuple[int, ...
+          +], torch.dtype]]                                              
+       95 +) -> tuple[dict[str, torch.Tensor], dict[str, list[str]]]:    
+       96 +    """Build the full, unsharded CPU state dict for the traini
+          +ng model.                                                     
+       97 +                                                              
+       98 +    Only rank 0 calls this; the result feeds ``set_model_state
+          +_dict`` with                                                  
+       99 +    ``broadcast_from_rank0=True``, which broadcasts one tensor
+          + at a time and writes                                         
+      100 +    each rank's shard, so rank 0 is the only rank that ever ho
+          +lds the full model.                                           
+      101 +                                                              
+      102 +    Returns the state dict and a report of the checkpoint tens
+          +ors that were skipped                                         
+      103 +    (vision tower / aligner / unused router biases) or expecte
+          +d but absent.                                                 
+      104 +    """                                                       
+      105 +    from safetensors import safe_open                         
+      106 +                                                              
+      107 +    weight_map = _checkpoint_weight_map(ckpt_dir)             
+      108 +    handles: dict[str, object] = {}                           
+      109 +                                                              
+      110 +    def fetch(name: str) -> torch.Tensor:                     
+      111 +        shard_file = weight_map[name]                         
+      112 +        if shard_file not in handles:                         
+      113 +            handles[shard_file] = safe_open(str(ckpt_dir / sha
+          +rd_file), framework="pt", device="cpu")                       
+      114 +        return handles[shard_file].get_tensor(name)           
+      115 +                                                              
+      116 +    def cast(tensor: torch.Tensor, expected_name: str, shape, 
+          +dtype) -> torch.Tensor:                                       
+      117 +        if tuple(tensor.shape) != tuple(shape):               
+      118 +            raise ValueError(                                 
+      119 +                f"Checkpoint tensor {expected_name} has shape 
+          +{tuple(tensor.shape)}, "                                      
+      120 +                f"the training model expects {tuple(shape)}." 
+      121 +            )                                                 
+      122 +        return tensor.to(dtype)                               
+      123 +                                                              
+      124 +    state_dict: dict[str, torch.Tensor] = {}                  
+      125 +    skipped: list[str] = []                                   
+      126 +    expert_names: dict[int, dict[str, dict[int, str]]] = {}   
+      127 +    for name in weight_map:                                   
+      128 +        expert_match = _EXPERT_WEIGHT_PATTERN.match(name)     
+      129 +        if expert_match:                                      
+      130 +            layer_id, expert_id, kind = int(expert_match.group
+          +(1)), int(expert_match.group(2)), expert_match.group(3)       
+      131 +            expert_names.setdefault(layer_id, {}).setdefault(k
+          +ind, {})[expert_id] = name                                    
+      132 +            continue                                          
+      133 +        model_name = _MODEL_PREFIX + name                     
+      134 +        if model_name not in param_meta:                      
+      135 +            # vision tower / aligner / image embeddings / visi
+          +on router bias                                                
+      136 +            skipped.append(name)                              
+      137 +            continue                                          
+      138 +        shape, dtype = param_meta[model_name]                 
+      139 +        state_dict[model_name] = cast(fetch(name), name, shape
+          +, dtype)                                                      
+      140 +                                                              
+      141 +    for layer_id, kinds in sorted(expert_names.items()):      
+      142 +        for fused_name, fused_kinds in (                      
+      143 +            (f"layers.{layer_id}.ffn.experts.gate_up_proj", ((
+          +"w1",), ("w3",))),                                            
+      144 +            (f"layers.{layer_id}.ffn.experts.down_proj", (("w2
+          +",),)),                                                       
+      145 +        ):                                                    
+      146 +            model_name = _MODEL_PREFIX + fused_name           
+      147 +            if model_name not in param_meta:                  
+      148 +                skipped.extend(kinds[kind][expert_id] for part
+          +s in fused_kinds for kind in parts for expert_id in kinds[kind
+          +])                                                            
+      149 +                continue                                      
+      150 +            shape, dtype = param_meta[model_name]             
+      151 +            num_experts = shape[0]                            
+      152 +            fused = torch.empty(shape, dtype=dtype)           
+      153 +            per_kind = {kind: kinds[kind] for parts in fused_k
+          +inds for kind in parts}                                       
+      154 +            for expert_id in range(num_experts):              
+      155 +                offset = 0                                    
+      156 +                for kind in per_kind:                         
+      157 +                    tensor = fetch(per_kind[kind][expert_id]).
+          +to(dtype)                                                     
+      158 +                    if len(per_kind) == 1:                    
+      159 +                        fused[expert_id] = tensor             
+      160 +                    else:                                     
+      161 +                        fused[expert_id, offset : offset + ten
+          +sor.shape[0]] = tensor                                        
+      162 +                        offset += tensor.shape[0]             
+      163 +                del tensor                                    
+      164 +            state_dict[model_name] = fused                    
+      165 +                                                              
+      166 +    missing = [name for name in param_meta if name not in stat
+          +e_dict]                                                       
+      167 +    return state_dict, {"skipped": skipped, "missing": missing
+          +}                                                             
+      168 +                                                              
+      169 +                                                              
+      170 +def _random_state_dict(                                       
+      171 +    param_meta: dict[str, tuple[tuple[int, ...], torch.dtype]]
+      172 +) -> dict[str, torch.Tensor]:                                 
+      173 +    """Fallback initializer (``VERL_DSV41_RANDOM_INIT=1``): sa
+          +me recipe as                                                  
+      174 +    ``fsdp_turbo.models.deepseek_v41.initialize_deepseek_v41_m
+          +odel``, applied to the                                        
+      175 +    deferred expert tensors only. Lets the RL loop be brought 
+          +up without checkpoint IO.                                     
+      176 +    """                                                       
+      177 +    state_dict: dict[str, torch.Tensor] = {}                  
+      178 +    for name, (shape, dtype) in param_meta.items():           
+      179 +        if not name.endswith(("experts.gate_up_proj", "experts
+          +.down_proj")):                                                
+      180 +            continue                                          
+      181 +        state_dict[name] = torch.empty(shape, dtype=dtype).nor
+          +mal_(mean=0.0, std=0.02)                                      
+      182 +    return state_dict                                         
+      183 +                                                              
+      184 +                                                              
+      185  @EngineRegistry.register(
+      186      model_type="language_model",
+      187      backend="fsdp_turbo_dsv41",
+     ...
+      205              prepare_deepseek_v41_model_for_fsdp,
+      206          )
+      207  
+       61 -        # Hard code the memory-optimized path for now: keep de
+          -ferred Engram                                                 
+       62 -        # tables on meta (sharded/initialized later by FSDP-Tu
+          -rbo after it has                                              
+       63 -        # the data-parallel mesh). Disable sparse flash attent
+          -ion (engram                                                   
+       64 -        # remains disabled while we first bring up the base RL
+          - loop).                                                       
+      208 +        # Engram is a V4.1 structure that neither the text-onl
+          +y bring-up nor the                                            
+      209 +        # sparse-attention path uses yet; the checkpoint has n
+          +o engram tables.                                              
+      210          training_model = build_deepseek_v41_model(
+      211              tokenizer=self.model_config.tokenizer,
+      212              engram_meta_init=True,
+      213              engram_storage_backend="row_sharded",
+      214              use_sparse_flash_attn=False,
+      215 +            # The routed experts stay on meta until the checkp
+          +oint loader                                                   
+      216 +            # materializes each rank's shard.                 
+      217 +            experts_meta_init=True,                           
+      218 +            config_path=_config_path_from_model_path(self._dsv
+          +41_model_path()),                                             
+      219 +            max_seq_len=self._dsv41_max_seq_len(),            
+      220          )
+      221          initialize_deepseek_v41_model(training_model)
+      222          training_model = prepare_deepseek_v41_model_for_fsdp(
+     ...
+      225              parameter_dtype=torch.bfloat16,
+      226          )
+      227          return training_model
+      228 +                                                              
+      229 +    def _build_fsdp_module(self, module):                     
+      230 +        from fsdp_turbo.fsdp_turbo import FSDPTurbo           
+      231 +                                                              
+      232 +        # Metadata of the unsharded model, captured before FSD
+          +P-Turbo rewrites                                              
+      233 +        # parameters into (nested) DTensors: the loader needs 
+          +global shapes/dtypes.                                         
+      234 +        param_meta = {name: (tuple(param.shape), param.dtype) 
+          +for name, param in module.named_parameters()}                 
+      235 +        module = FSDPTurbo(self.fsdp_turbo_config, module).mod
+          +el                                                            
+      236 +                                                              
+      237 +        offload_policy = None                                 
+      238 +        if self.engine_config.offload_policy or self.engine_co
+          +nfig.forward_only:                                            
+      239 +            self._is_offload_param = False                    
+      240 +            self._is_offload_optimizer = False                
+      241 +            offload_policy = True                             
+      242 +            self._uses_fsdp2_cpu_offload_policy = True        
+      243 +                                                              
+      244 +        self._materialize_dsv41_parameters(module, param_meta,
+          + offload_policy)                                              
+      245 +        return module                                         
+      246 +                                                              
+      247 +    def _materialize_dsv41_parameters(self, module, param_meta
+          +, offload_policy):                                            
+      248 +        """Load the rollout checkpoint into the sharded model 
+          +(rank 0 reads, everyone                                       
+      249 +        receives) and finish the device placement the meta con
+          +struction skipped."""                                         
+      250 +        from torch.distributed.checkpoint.state_dict import St
+          +ateDictOptions, set_model_state_dict                          
+      251 +                                                              
+      252 +        checkpoint_dir = Path(self._dsv41_model_path())       
+      253 +        if os.environ.get("VERL_DSV41_RANDOM_INIT", "0") == "1
+          +":                                                            
+      254 +            if dist.get_rank() == 0:                          
+      255 +                logger.warning("VERL_DSV41_RANDOM_INIT=1: skip
+          +ping checkpoint weights, deferring experts at N(0, 0.02).")   
+      256 +            full_state = _random_state_dict(param_meta) if dis
+          +t.get_rank() == 0 else {}                                     
+      257 +        elif dist.get_rank() == 0 and checkpoint_dir.exists() 
+          +and _checkpoint_weight_map(checkpoint_dir):                   
+      258 +            full_state, report = read_dsv41_checkpoint_state_d
+          +ict(checkpoint_dir, param_meta)                               
+      259 +            if report["missing"]:                             
+      260 +                raise ValueError(                             
+      261 +                    f"Checkpoint {checkpoint_dir} is missing {
+          +len(report['missing'])} tensors the training model "          
+      262 +                    f"needs, e.g. {report['missing'][:5]}."   
+      263 +                )                                             
+      264 +            logger.info(                                      
+      265 +                "DeepSeek-V4.1 checkpoint loaded from %s (%d t
+          +ensors; %d checkpoint tensors not used, e.g. vision tower).", 
+      266 +                checkpoint_dir,                               
+      267 +                len(full_state),                              
+      268 +                len(report["skipped"]),                       
+      269 +            )                                                 
+      270 +        else:                                                 
+      271 +            full_state = {}                                   
+      272 +                                                              
+      273 +        options = StateDictOptions(                           
+      274 +            full_state_dict=True,                             
+      275 +            broadcast_from_rank0=True,                        
+      276 +            cpu_offload=bool(offload_policy),                 
+      277 +        )                                                     
+      278 +        set_model_state_dict(module, full_state, options=optio
+          +ns)                                                           
+      279 +        del full_state                                        
+      280 +                                                              
+      281 +        # Buffers are built with real values (only parameters 
+          +were deferred) but on                                         
+      282 +        # the host: attention tables and scratch caches must f
+          +ollow the parameters'                                         
+      283 +        # compute device, the way fsdp2_load_full_state_dict d
+          +oes for HF models.                                            
+      284 +        device = torch.accelerator.current_accelerator()      
+      285 +        for buffer in module.buffers():                       
+      286 +            if buffer.device != device:                       
+      287 +                buffer.data = buffer.data.to(device)          
+      288 +                                                              
+      289 +        self._refresh_expert_parallel_metadata(module, device)
+      290 +                                                              
+      291 +        still_meta = [name for name, parameter in module.named
+          +_parameters() if parameter.is_meta]                           
+      292 +        if still_meta:                                        
+      293 +            raise RuntimeError(                               
+      294 +                "DeepSeek-V4.1 parameters were left on the met
+          +a device, e.g. {}. "                                          
+      295 +                "Check that the checkpoint covers every parame
+          +ter.".format(still_meta[:5])                                  
+      296 +            )                                                 
+      297 +                                                              
+      298 +    def _refresh_expert_parallel_metadata(self, module, device
+          +):                                                            
+      299 +        """``expert_ids_per_ep_rank`` is an attribute, not a b
+          +uffer: the EP dispatcher                                      
+      300 +        reads it at forward time, and a meta-built expert tens
+          +or leaves it on meta."""                                      
+      301 +        from fsdp_turbo.distributed.expert_parallel.expert_par
+          +allel import refresh_expert_parallel_metadata                 
+      302 +                                                              
+      303 +        refresh_expert_parallel_metadata(module, device=device
+          +)                                                             
+      304 +                                                              
+      305 +    def _dsv41_model_path(self) -> str:                       
+      306 +        """Directory of the rollout checkpoint: config.json + 
+          +tokenizer + safetensors."""                                   
+      307 +        model_config = self.model_config                      
+      308 +        for attribute in ("local_hf_config_path", "hf_config_p
+          +ath", "local_path", "path"):                                  
+      309 +            candidate = getattr(model_config, attribute, None)
+      310 +            if candidate:                                     
+      311 +                return candidate                              
+      312 +        raise ValueError("actor_rollout_ref.model.path must po
+          +int at the DeepSeek-V4.1 checkpoint directory.")              
+      313 +                                                              
+      314 +    def _dsv41_max_seq_len(self) -> int:                      
+      315 +        override = os.environ.get("VERL_DSV41_MAX_SEQ_LEN")   
+      316 +        if override:                                          
+      317 +            return int(override)                              
+      318 +        return _DEFAULT_MAX_SEQ_LEN                           
+
+● 引擎实现完成。先离线验证 checkpoint 名称映射的覆盖率（无需 NPU）。
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● 名称映射完整覆盖（194 = 178 直接 + 16 融合；跳过 266 视觉 + 8 视觉路由
+  bias）。现在修 verl 的 config 加载 fallback，使其支持 deepseek_v4.1。
+  Read 1 file (ctrl+o to expand)
+  ⎿  Loaded CLAUDE.md
+
+● Update(verl/workers/config/model.py)
+  ⎿  Added 12 lines, removed 1 line
+      191              )
+      192          except ValueError as error:
+      193              lookup_error = error.__cause__ or error.__context_
+           _
+      194 -            if not isinstance(lookup_error, KeyError) or looku
+          -p_error.args != ("deepseek_v4",):                             
+      194 +            # transformers does not know the DeepSeek-V4 famil
+          +y: vllm-ascend registers                                      
+      195 +            # those config classes in vllm's registry (not wit
+          +h AutoConfig), so fall                                        
+      196 +            # back to vllm's loader and make sure the registra
+          +tion ran.                                                     
+      197 +            if not isinstance(lookup_error, KeyError) or looku
+          +p_error.args not in (                                         
+      198 +                ("deepseek_v4",),                             
+      199 +                ("deepseek_v4.1",),                           
+      200 +            ):                                                
+      201                  raise
+      202 +            try:                                              
+      203 +                # noqa: F401 — importing applies the registry 
+          +patch                                                         
+      204 +                import vllm_ascend.patch.platform.patch_deepse
+          +ek_v41_config                                                 
+      205 +            except ImportError:                               
+      206 +                pass                                          
+      207              from vllm.transformers_utils.config import get_con
+           fig
+      208  
+      209              self.hf_config = get_config(
+
+  Searched for 1 pattern, ran 5 shell commands (ctrl+o to expand)
+
+● Update(verl/utils/model.py)
+  ⎿  Added 27 lines, removed 1 line
+       85              setattr(module_config, key, val)
+       86  
+       87  
+       88 +def get_auto_config_with_vllm_fallback(model_name: str, trust_
+          +remote_code: bool = False, **kwargs):                         
+       89 +    """``AutoConfig.from_pretrained`` with a fallback to vLLM'
+          +s config registry.                                            
+       90 +                                                              
+       91 +    The DeepSeek-V4 family (``deepseek_v4``, ``deepseek_v4.1``
+          +) is not registered with                                      
+       92 +    transformers: vllm-ascend registers those config classes i
+          +n vLLM's own registry, so                                     
+       93 +    load them the way vLLM does. Anything else keeps the defau
+          +lt behavior.                                                  
+       94 +    """                                                       
+       95 +    try:                                                      
+       96 +        return AutoConfig.from_pretrained(model_name, trust_re
+          +mote_code=trust_remote_code, **kwargs)                        
+       97 +    except ValueError as error:                               
+       98 +        lookup_error = error.__cause__ or error.__context__   
+       99 +        if not isinstance(lookup_error, KeyError) or lookup_er
+          +ror.args not in (                                             
+      100 +            ("deepseek_v4",),                                 
+      101 +            ("deepseek_v4.1",),                               
+      102 +        ):                                                    
+      103 +            raise                                             
+      104 +        try:                                                  
+      105 +            # noqa: F401 — importing applies the config-regist
+          +ry patch                                                      
+      106 +            import vllm_ascend.patch.platform.patch_deepseek_v
+          +41_config                                                     
+      107 +        except ImportError:                                   
+      108 +            pass                                              
+      109 +        from vllm.transformers_utils.config import get_config 
+      110 +                                                              
+      111 +        return get_config(model_name, trust_remote_code=trust_
+          +remote_code, **kwargs)                                        
+      112 +                                                              
+      113 +                                                              
+      114  def get_huggingface_actor_config(model_name: str, override_con
+           fig_kwargs=None, trust_remote_code=False) -> dict:
+      115      if override_config_kwargs is None:
+      116          override_config_kwargs = {}
+      117      assert isinstance(override_config_kwargs, dict), (
+      118          f"override_config_kwargs must be a dict, got {type(ove
+           rride_config_kwargs)}"
+      119      )
+       94 -    module_config = AutoConfig.from_pretrained(model_name, tru
+          -st_remote_code=trust_remote_code)                             
+      120 +    module_config = get_auto_config_with_vllm_fallback(model_n
+          +ame, trust_remote_code=trust_remote_code)                     
+      121      update_model_config(module_config, override_config_kwargs)
+      122  
+      123      return module_config
+
+● Update(verl/workers/config/model.py)
+  ⎿  Added 5 lines, removed 28 lines
+      183  
+      184          # construct hf_config
+      185          attn_implementation = self.override_config.get("attn_i
+           mplementation", "flash_attention_2")
+      186 -        try:                                                  
+      187 -            self.hf_config = AutoConfig.from_pretrained(      
+      188 -                self.local_hf_config_path,                    
+      189 -                trust_remote_code=self.trust_remote_code,     
+      190 -                attn_implementation=attn_implementation,      
+      191 -            )                                                 
+      192 -        except ValueError as error:                           
+      193 -            lookup_error = error.__cause__ or error.__context_
+          -_                                                             
+      194 -            # transformers does not know the DeepSeek-V4 famil
+          -y: vllm-ascend registers                                      
+      195 -            # those config classes in vllm's registry (not wit
+          -h AutoConfig), so fall                                        
+      196 -            # back to vllm's loader and make sure the registra
+          -tion ran.                                                     
+      197 -            if not isinstance(lookup_error, KeyError) or looku
+          -p_error.args not in (                                         
+      198 -                ("deepseek_v4",),                             
+      199 -                ("deepseek_v4.1",),                           
+      200 -            ):                                                
+      201 -                raise                                         
+      202 -            try:                                              
+      203 -                # noqa: F401 — importing applies the registry 
+          -patch                                                         
+      204 -                import vllm_ascend.patch.platform.patch_deepse
+          -ek_v41_config                                                 
+      205 -            except ImportError:                               
+      206 -                pass                                          
+      207 -            from vllm.transformers_utils.config import get_con
+          -fig                                                           
+      186 +        self.hf_config = get_auto_config_with_vllm_fallback(  
+      187 +            self.local_hf_config_path,                        
+      188 +            trust_remote_code=self.trust_remote_code,         
+      189 +            attn_implementation=attn_implementation,          
+      190 +        )                                                     
+      191  
+      209 -            self.hf_config = get_config(                      
+      210 -                self.local_hf_config_path,                    
+      211 -                trust_remote_code=self.trust_remote_code,     
+      212 -                attn_implementation=attn_implementation,      
+      213 -            )                                                 
+      214 -                                                              
+      192          override_config_kwargs = {}
+      193  
+      194          if self.tokenizer is not None:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Update(verl/workers/config/model.py)
+  ⎿  Added 1 line, removed 1 line
+      21  from verl.utils import hf_processor, hf_tokenizer
+      22  from verl.utils.fs import copy_to_local
+      23  from verl.utils.import_utils import import_external_libs
+      24 -from verl.utils.model import get_generation_config, update_mode
+         -l_config                                                       
+      24 +from verl.utils.model import get_auto_config_with_vllm_fallback
+         +, get_generation_config, update_model_config                   
+      25  
+      26  __all__ = ["HFModelConfig", "MtpConfig"]
+      27  
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● 现在看 verl 的 fsdp.yaml 与 FSDPTurbo 的配置结构，准备把 GRPO
+  脚本对齐到本地跑通的拓扑。
+
+  Searched for 2 patterns, listed 1 directory, ran 3 shell commands (ctrl+o to expand)
+
+● Agent "探索 vllm-ascend V4.1 权重命名" finished · 24m 1s
+
+● vllm-ascend
+  命名报告到位：训练侧的融合专家名（experts.gate_up_proj）不能直接发给 vllm（会
+  KeyError），必须拆成 per-expert 的 w1/w3/w2 名字。看一下 verl
+  权重同步流的接口。
+
+  Searched for 5 patterns, ran 2 shell commands (ctrl+o to expand)
+
+● Update(verl/workers/engine/fsdp/utils.py)
+  ⎿  Added 18 lines
+      120                  yield f"{base}.{expert_id}.down_proj.weight", 
+           tensor[expert_id].contiguous()
+      121              continue
+      122  
+      123 +        # FSDP-Turbo's DeepSeek-V4.1 backbone packs the routed
+          + experts the same way                                         
+      124 +        # under ``ffn.experts`` but names the halves the way t
+          +he checkpoint does                                            
+      125 +        # (w1/w3/w2): vLLM loads V4 checkpoints one expert at 
+          +a time, so emitting                                           
+      126 +        # those keys keeps the live sync on the same path as a
+          + from-disk load.                                              
+      127 +        if name.endswith(".ffn.experts.gate_up_proj") and tens
+          +or.dim() == 3:                                                
+      128 +            gate, up = tensor.chunk(2, dim=1)                 
+      129 +            base = name.removesuffix(".gate_up_proj")         
+      130 +            for expert_id in range(tensor.size(0)):           
+      131 +                yield f"{base}.{expert_id}.w1.weight", gate[ex
+          +pert_id].contiguous()                                         
+      132 +                yield f"{base}.{expert_id}.w3.weight", up[expe
+          +rt_id].contiguous()                                           
+      133 +            continue                                          
+      134 +                                                              
+      135 +        if name.endswith(".ffn.experts.down_proj") and tensor.
+          +dim() == 3:                                                   
+      136 +            base = name.removesuffix(".down_proj")            
+      137 +            for expert_id in range(tensor.size(0)):           
+      138 +                yield f"{base}.{expert_id}.w2.weight", tensor[
+          +expert_id].contiguous()                                       
+      139 +            continue                                          
+      140 +                                                              
+      141          yield name, tensor
+
+  Searched for 3 patterns, ran 2 shell commands (ctrl+o to expand)
+
+● Now rewriting the GRPO launch script for the local 8-layer checkpoint and NPU
+  topology:
+
+● Write(examples/grpo_trainer/run_deepseek_v41_grpo_fsdp_turbo_npu.sh)
+  ⎿  Added 86 lines, removed 70 lines
+       1  #!/usr/bin/env bash
+       2 -# Dependency: vllm(本地 pin a97dacb, ≈v0.28.x), vllm-ascend(本 
+         -地定制分支, DeepSeek-V4.1 eager),                              
+       3 -#            transformers(@cc7ab9be 附近), FSDPTurbo(deepseek_v
+         -41 BF16 训练适配)                                              
+       2 +# DeepSeek-V4.1 GRPO on Ascend NPU: verl + FSDPTurbo(fsdp_turbo
+         +_dsv41) + vllm/vllm-ascend                                     
+       3  #
+       5 -# DeepSeek-V4.1 纯文本 GRPO，verl + FSDPTurbo(fsdp_turbo_dsv41)
+         - + vllm/vllm-ascend                                            
+       4 +# Local baseline this script is aligned with (2026-09-17):     
+       5 +#   * training-side reference: FSDPTurbo/examples/deepseek_v41/
+         +run.sh + config2.yaml                                          
+       6 +#     (topology FSDP=8 / TP=1 / EP=8, apply_modules on `model.l
+         +ayers.{*}`, no recompute)                                      
+       7 +#   * rollout-side reference:  scripts/run_vllm2.sh            
+       8 +#     (vllm serve <8layer ckpt>, TP=8 + expert parallel, max-mo
+         +del-len 8192, eager,                                           
+       9 +#      additional-config {"enable_engram": false, "mc2_comm_alg
+         +": "fullmesh_v2", ...})                                        
+      10  #
+       7 -# 说明:                                                        
+       8 -#  - 训练后端: actor/ref 均 strategy=fsdp_turbo_dsv41 (DeepSeek
+         --V4.1 专用引擎子类)                                            
+       9 -#  - 模型结构目前由 FSDPTurbo 内置 config.json (4-layer demo)  
+         -决定, model.path 只提供 tokenizer                              
+      10 -#  - 先屏蔽 V4.1 新结构 (Engram/CSA2/稀疏索引), 纯文本 GRPO 起 
+         -步                                                             
+      11 -#  - 8 卡默认拓扑: FSDP=4, TP=2, EP=1 (后续全层/MoE 再调)      
+      11 +# Notes:                                                       
+      12 +#  - actor/ref both run strategy=fsdp_turbo_dsv41: the DeepSeek
+         +-V4.1 training model is an                                     
+      13 +#    FSDPTurbo class, not a transformers AutoModel.            
+      14 +#  - Model structure comes from MODEL_PATH/config.json (8 layer
+         +s, 384 experts, no engram);                                    
+      15 +#    the ~108B routed-expert weights are built on the meta devi
+         +ce, then materialized from                                     
+      16 +#    the checkpoint shards by torch.distributed.checkpoint (ran
+         +k 0 reads, everyone else                                       
+      17 +#    receives the broadcast).                                  
+      18 +#  - V4.1 recompute is intentionally not supported by the adapt
+         +er -> no recompute plan.                                       
+      19 +#  - Pure text GRPO: padding path (use_remove_padding=False) be
+         +cause the reference model                                      
+      20 +#    consumes [batch, seq] + attention_mask.                   
+      21  
+      22  set -xeuo pipefail
+      23  
+     ...
+      25  DEVICE=${DEVICE:-$(python3 -c 'import torch_npu' 2>/dev/null &&
+           echo npu || echo gpu)}
+      26  INFER_BACKEND=${INFER_BACKEND:-vllm}
+      27  PROJECT_NAME=${PROJECT_NAME:-GRPO-DeepSeekV41}
+      19 -EXPERIMENT_NAME=${EXPERIMENT_NAME:-GRPO-DeepSeekV41-8card}     
+      28 +EXPERIMENT_NAME=${EXPERIMENT_NAME:-GRPO-DeepSeekV41-8layer-8car
+         +d}                                                             
+      29  
+      30  NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-}
+      31  NNODES=${NNODES:-1}
+      32  
+      24 -GEN_TP=${GEN_TP:-2}                  # rollout vLLM tensor para
+         -llel                                                           
+      25 -FSDP_SIZE=${FSDP_SIZE:-4}            # FSDPTurbo fully_shard_pa
+         -rallel_size                                                    
+      26 -TP_SIZE=${TP_SIZE:-2}                # FSDPTurbo tensor_paralle
+         -l_size                                                         
+      27 -ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.45}             
+      33 +# vLLM rollout (mirrors scripts/run_vllm2.sh): TP=8 with expert
+         + parallel.                                                     
+      34 +GEN_TP=${GEN_TP:-8}                                            
+      35 +GEN_EP=${GEN_EP:-8}                                            
+      36 +# FSDPTurbo topology (mirrors FSDPTurbo/examples/deepseek_v41/c
+         +onfig2.yaml).                                                  
+      37 +FSDP_SIZE=${FSDP_SIZE:-8}                                      
+      38 +TP_SIZE=${TP_SIZE:-1}                                          
+      39 +EP_SIZE=${EP_SIZE:-8}                                          
+      40 +EFSDP_SIZE=${EFSDP_SIZE:-1}                                    
+      41 +ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.6}              
+      42  
+      29 -RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}                 
+      30 -TOKENIZER_PATH=${TOKENIZER_PATH:-"${RAY_DATA_HOME}/models/DeepS
+         -eek-V4.1-Flash"}                                               
+      31 -CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${PROJECT_NAME}/
+         -${EXPERIMENT_NAME}"}                                           
+      32 -TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/geo3k/train.par
+         -quet"}                                                         
+      33 -TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/geo3k/test.parque
+         -t"}                                                            
+      43 +MODEL_PATH=${MODEL_PATH:-"/mnt/share/m00899630/weights/DeepSeek
+         +-V4.1-Flash-8layer-random"}                                    
+      44 +TRAIN_FILE=${TRAIN_FILE:-"/mnt/share/m00899630/dsv41/rl_data/da
+         +po_math_train_512.parquet"}                                    
+      45 +TEST_FILE=${TEST_FILE:-"/mnt/share/m00899630/dsv41/rl_data/dapo
+         +_math_val_64.parquet"}                                         
+      46 +CKPTS_DIR=${CKPTS_DIR:-"/mnt/share/m00899630/dsv41/ckpts/${PROJ
+         +ECT_NAME}/${EXPERIMENT_NAME}"}                                 
+      47  WORKING_DIR=${WORKING_DIR:-"${PWD}"}
+      48  RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime
+          _env.yaml"}
+      49 +                                                               
+      50 +MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-1024}                         
+      51 +MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN:-1024}                     
+      52 +# Sizes the RoPE tables and the per-layer attention scratch cac
+         +hes in the training model;                                     
+      53 +# must cover prompt+response (the checkpoint's own max_position
+         +_embeddings is 1M).                                            
+      54 +export VERL_DSV41_MAX_SEQ_LEN=${VERL_DSV41_MAX_SEQ_LEN:-$((MAX_
+         +PROMPT_LEN + MAX_RESPONSE_LEN))}                               
+      55 +SAMPLE_N=${SAMPLE_N:-5}                                        
+      56 +TRAIN_BSZ=${TRAIN_BSZ:-8}                                      
+      57  ########################### end user-adjustable ###############
+          ############
+      58  
+      59  ########################### derived defaults ##################
+          #########
+      60  n_devices_per_node=${NDEVICES_PER_NODE:-8}
+      40 -fsdp_size=${FSDP_SIZE:-4}                                      
+      41 -tp_size=${TP_SIZE:-2}                                          
+      61  
+      62  case "${DEVICE}" in
+      63      gpu)
+     ...
+       85  ACTOR_TURBO="actor_rollout_ref.actor.fsdp_config.turbo_config"
+       86  REF_TURBO="actor_rollout_ref.ref.fsdp_config.turbo_config"
+       87  
+       69 -# DeepSeek-V4.1 FSDPTurbo backbone module names (DeepseekV41Fo
+          -rCausalLMAdapter:                                             
+       70 -#   self.model = backbone; backbone has embed / layers.{N} / n
+          -orm / head / vision)                                          
+       71 -# NOTE: 前缀按 FSDPTurbo(...).model 实际 module 名可能需要补 `
+          -model.` 前缀, 真机首次                                        
+       72 -#       启动后按日志里 module 名修正.                         
+       73 -FSDP_APPLY_MODULES='{model.model.embed:{},'\                  
+       74 -'model.model.layers.\{*\}:{},'\                               
+       75 -'model.model.vision.blocks.\{*\}:{},'\                        
+       76 -'model.model.norm:{},'\                                       
+       77 -'model.model.head:{}}'                                        
+       88 +# Module names as seen by FSDPTurbo: the adapter wraps the bac
+          +kbone as `model`                                              
+       89 +# (DeepseekV41ForCausalLMAdapter.model = Transformer -> embed 
+          +/ layers.{N} / norm / head).                                  
+       90 +# Vision is disabled for text-only RL, so no `model.vision.*` 
+          +entries.                                                      
+       91 +FSDP_APPLY_MODULES='{model.embed:{},'\                        
+       92 +'model.layers.\{*\}:{},'\                                     
+       93 +'model.norm:{},'\                                             
+       94 +'model.head:{}}'                                              
+       95  
+       79 -HOOK_MODULES="['model.model.layers.{*}']"                     
+       80 -RECOMPUTE_PLAN="['model.model.layers.{*}']"                   
+       96 +HOOK_MODULES="['model.layers.{*}']"                           
+       97  
+       98 +# vLLM engine args that the V4.1 Ascend path needs (see script
+          +s/run_vllm2.sh).                                              
+       99 +VLLM_ADDITIONAL_CONFIG='{"mc2_comm_alg":"fullmesh_v2","enable_
+          +engram":false,"engram_storage":"int8","ascend_compilation_conf
+          +ig":{"enable_npugraph_ex":false,"enable_static_kernel":false}}
+          +'                                                             
+      100 +                                                              
+      101  ########################### parameter arrays #################
+           ##########
+      102  
+      103  DATA=(
+     ...
+      105      algorithm.use_kl_in_reward=False
+      106      data.train_files="${TRAIN_FILE}"
+      107      data.val_files="${TEST_FILE}"
+       89 -    data.train_batch_size=8                                   
+       90 -    data.max_prompt_length=1024                               
+       91 -    data.max_response_length=2048                             
+      108 +    data.train_batch_size=${TRAIN_BSZ}                        
+      109 +    data.max_prompt_length=${MAX_PROMPT_LEN}                  
+      110 +    data.max_response_length=${MAX_RESPONSE_LEN}              
+      111      data.filter_overlong_prompts=True
+      112      data.truncation='error'
+      113      data.shuffle=False
+      114  )
+      115  
+      116  MODEL=(
+       98 -    actor_rollout_ref.model.path=${TOKENIZER_PATH}            
+       99 -    actor_rollout_ref.model.use_remove_padding=True           
+      117 +    actor_rollout_ref.model.path=${MODEL_PATH}                
+      118 +    # The reference model consumes padded [batch, seq] + atten
+          +tion_mask; the packed                                         
+      119 +    # (remove-padding) path would require per-sequence positio
+          +n handling it does not have.                                  
+      120 +    actor_rollout_ref.model.use_remove_padding=False          
+      121 +    # V4.1 recompute is disabled inside the FSDPTurbo adapter.
+      122      actor_rollout_ref.model.enable_gradient_checkpointing=Fals
+           e
+      123  )
+      124  
+      125  ACTOR=(
+      126      actor_rollout_ref.actor.optim.lr=1e-6
+      127      actor_rollout_ref.actor.optim.optimizer=AdamW
+      106 -    actor_rollout_ref.actor.ppo_mini_batch_size=8             
+      128 +    actor_rollout_ref.actor.ppo_mini_batch_size=${TRAIN_BSZ}  
+      129      actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
+      130      actor_rollout_ref.actor.use_kl_loss=True
+      131      actor_rollout_ref.actor.entropy_coeff=0
+      110 -    actor_rollout_ref.actor.kl_loss_coef=0.01                 
+      132 +    actor_rollout_ref.actor.kl_loss_coef=0.001                
+      133      actor_rollout_ref.actor.kl_loss_type=low_var_kl
+      134      actor_rollout_ref.actor.use_dynamic_bsz=False
+      135      actor_rollout_ref.actor.strategy=fsdp_turbo_dsv41
+      114 -    "${ACTOR_TURBO}.distributed.fully_shard_parallel_size=${fs
+          -dp_size}"                                                     
+      115 -    "${ACTOR_TURBO}.distributed.tensor_parallel_size=${tp_size
+          -}"                                                            
+      116 -    "${ACTOR_TURBO}.distributed.expert_parallel_size=1"       
+      136 +    "${ACTOR_TURBO}.distributed.fully_shard_parallel_size=${FS
+          +DP_SIZE}"                                                     
+      137 +    "${ACTOR_TURBO}.distributed.tensor_parallel_size=${TP_SIZE
+          +}"                                                            
+      138 +    "${ACTOR_TURBO}.distributed.expert_parallel_size=${EP_SIZE
+          +}"                                                            
+      139 +    "${ACTOR_TURBO}.distributed.expert_fully_shard_parallel_si
+          +ze=${EFSDP_SIZE}"                                             
+      140      "${ACTOR_TURBO}.distributed.ulysses_parallel_size=1"
+      141      "+${ACTOR_TURBO}.distributed.fsdp_plan.apply_modules=${FSD
+           P_APPLY_MODULES}"
+      142      "+${ACTOR_TURBO}.distributed.fsdp_plan.hook_modules=${HOOK
+           _MODULES}"
+      120 -    "+${ACTOR_TURBO}.memory.recompute=True"                   
+      121 -    "+${ACTOR_TURBO}.memory.recompute_plan=${RECOMPUTE_PLAN}" 
+      143 +    "+${ACTOR_TURBO}.distributed.fsdp_plan.cast_forward_inputs
+          +=False"                                                       
+      144 +    "+${ACTOR_TURBO}.distributed.fsdp_plan.output_dtype=null" 
+      145 +    "+${ACTOR_TURBO}.distributed.ep_plan.apply_modules=['model
+          +.layers.{*}.ffn.experts']"                                    
+      146 +    "+${ACTOR_TURBO}.distributed.ep_plan.dispatcher=fused"    
+      147      actor_rollout_ref.actor.fsdp_config.reshard_after_forward=
+           True
+      148      actor_rollout_ref.actor.fsdp_config.entropy_checkpointing=
+           True
+      149      actor_rollout_ref.actor.entropy_from_logits_with_chunking=
+           True
+     ...
+      156  REF=(
+      157      actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1
+      158      actor_rollout_ref.ref.strategy=fsdp_turbo_dsv41
+      134 -    "${REF_TURBO}.distributed.fully_shard_parallel_size=${fsdp
+          -_size}"                                                       
+      135 -    "${REF_TURBO}.distributed.tensor_parallel_size=${tp_size}"
+      136 -    "${REF_TURBO}.distributed.expert_parallel_size=1"         
+      159 +    "${REF_TURBO}.distributed.fully_shard_parallel_size=${FSDP
+          +_SIZE}"                                                       
+      160 +    "${REF_TURBO}.distributed.tensor_parallel_size=${TP_SIZE}"
+      161 +    "${REF_TURBO}.distributed.expert_parallel_size=${EP_SIZE}"
+      162 +    "${REF_TURBO}.distributed.expert_fully_shard_parallel_size
+          +=${EFSDP_SIZE}"                                               
+      163      "${REF_TURBO}.distributed.ulysses_parallel_size=1"
+      164      "+${REF_TURBO}.distributed.fsdp_plan.apply_modules=${FSDP_
+           APPLY_MODULES}"
+      165      "+${REF_TURBO}.distributed.fsdp_plan.hook_modules=${HOOK_M
+           ODULES}"
+      140 -    "+${REF_TURBO}.memory.recompute=True"                     
+      141 -    "+${REF_TURBO}.memory.recompute_plan=${RECOMPUTE_PLAN}"   
+      166 +    "+${REF_TURBO}.distributed.fsdp_plan.cast_forward_inputs=F
+          +alse"                                                         
+      167 +    "+${REF_TURBO}.distributed.fsdp_plan.output_dtype=null"   
+      168 +    "+${REF_TURBO}.distributed.ep_plan.apply_modules=['model.l
+          +ayers.{*}.ffn.experts']"                                      
+      169 +    "+${REF_TURBO}.distributed.ep_plan.dispatcher=fused"      
+      170      actor_rollout_ref.ref.fsdp_config.reshard_after_forward=Tr
+           ue
+      171      actor_rollout_ref.ref.entropy_from_logits_with_chunking=Tr
+           ue
+      172      actor_rollout_ref.ref.use_torch_compile=False
+     ...
+      179      actor_rollout_ref.rollout.ignore_eos=False
+      180      actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gp
+           u=1
+      181      actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN
+           _TP}
+      182 +    actor_rollout_ref.rollout.expert_parallel_size=${GEN_EP}  
+      183      actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT
+           _GPU_MEM_UTIL}
+      155 -    actor_rollout_ref.rollout.n=5                             
+      184 +    actor_rollout_ref.rollout.max_model_len=$((MAX_PROMPT_LEN 
+          ++ MAX_RESPONSE_LEN))                                          
+      185 +    actor_rollout_ref.rollout.n=${SAMPLE_N}                   
+      186      actor_rollout_ref.rollout.enable_chunked_prefill=True
+      157 -    actor_rollout_ref.rollout.max_num_batched_tokens=8192     
+      187 +    actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PR
+          +OMPT_LEN + MAX_RESPONSE_LEN))                                 
+      188      actor_rollout_ref.rollout.free_cache_engine=True
+      159 -    actor_rollout_ref.rollout.enforce_eager=False             
+      189 +    # run_vllm2.sh serves the 8-layer checkpoint with --enforc
+          +e-eager.                                                      
+      190 +    actor_rollout_ref.rollout.enforce_eager=True              
+      191      actor_rollout_ref.rollout.enable_prefix_caching=False
+      192      actor_rollout_ref.rollout.checkpoint_engine.update_weights
+           _bucket_megabytes=6144
+      162 -    +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_
+          -config.cudagraph_mode="FULL_DECODE_ONLY"                      
+      163 -    +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_
+          -config.cudagraph_capture_sizes="[4,8,12,16,24,32,48,56,64]"   
+      193 +    "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_
+          +config=${VLLM_ADDITIONAL_CONFIG}"                             
+      194  )
+      195  
+      196  TRAINER=(
+     ...
+      201      trainer.n_gpus_per_node=${n_devices_per_node}
+      202      trainer.nnodes=${NNODES}
+      203      trainer.balance_batch=False
+      174 -    trainer.resume_from_path=checkpoints/                     
+      204      trainer.val_before_train=False
+      205      trainer.save_freq=-1
+      206      trainer.test_freq=-1
+      178 -    trainer.total_epochs=15                                   
+      207 +    trainer.total_epochs=1                                    
+      208 +    trainer.default_local_dir="${CKPTS_DIR}"                  
+      209  )
+      210  
+      181 -case "${DEVICE}" in                                           
+      182 -    gpu)                                                      
+      183 -        ;;                                                    
+      184 -    npu)                                                      
+      185 -        ROLLOUT+=(                                            
+      186 -            +actor_rollout_ref.rollout.engine_kwargs.vllm.mm_p
+          -rocessor_cache_gb=0                                           
+      187 -        )                                                     
+      188 -        ;;                                                    
+      189 -    *)                                                        
+      190 -        echo "Unsupported DEVICE=${DEVICE}. Expected 'gpu' or 
+          -'npu'." >&2                                                   
+      191 -        exit 1                                                
+      192 -        ;;                                                    
+      193 -esac                                                          
+      194 -                                                              
+      211  ########################### launch ###########################
+      212  python3 -m verl.trainer.main_ppo \
+      213      "${DATA[@]}" \
+     ...
+      216      "${REF[@]}" \
+      217      "${ROLLOUT[@]}" \
+      218      "${TRAINER[@]}" \
+      203 -    "$@" 2>&1 | tee logs/deepseek_v41-8card-${start_time}.log 
+      219 +    "$@" 2>&1 | tee logs/deepseek_v41-8layer-${start_time}.log
+
+● Write(scripts/check_dsv41_fsdp_turbo_build.py)
+  ⎿  Wrote 206 lines to scripts/check_dsv41_fsdp_turbo_build.py
+       1 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Re
+       2 #
+       3 # Licensed under the Apache License, Version 2.0 (the "License")
+       4 # you may not use this file except in compliance with the Licens
+         e.
+       6 #
+       7 #     http://www.apache.org/licenses/LICENSE-2.0
+       9 # Unless required by applicable law or agreed to in writing, sof
+         tware
+         IS,
+     … +231 lines (ctrl+o to expand)
+
+● Update(verl/workers/engine/fsdp/fsdp_turbo_dsv41_impl.py)
+  ⎿  Added 12 lines
+      182      return state_dict
+      183  
+      184  
+      185 +def refresh_dsv41_expert_metadata(module, device) -> None:    
+      186 +    """Rebuild the EP dispatcher bookkeeping that lives outsid
+          +e the state dict.                                             
+      187 +                                                              
+      188 +    ``expert_ids_per_ep_rank`` is an attribute, not a buffer: 
+          +the EP dispatcher reads it                                    
+      189 +    at forward time, and meta-built expert tensors leave it on
+          + the meta device with                                         
+      190 +    uninitialized contents. Must run once the expert weights a
+          +re real.                                                      
+      191 +    """                                                       
+      192 +    from fsdp_turbo.distributed.expert_parallel.expert_paralle
+          +l import refresh_expert_parallel_metadata                     
+      193 +                                                              
+      194 +    refresh_expert_parallel_metadata(module, device=device)   
+      195 +                                                              
+      196 +                                                              
+      197  @EngineRegistry.register(
+      198      model_type="language_model",
+      199      backend="fsdp_turbo_dsv41",
+
+● Update(verl/workers/engine/fsdp/fsdp_turbo_dsv41_impl.py)
+  ⎿  Added 1 line, removed 8 lines
+      298              if buffer.device != device:
+      299                  buffer.data = buffer.data.to(device)
+      300  
+      301 -        self._refresh_expert_parallel_metadata(module, device)
+      301 +        refresh_dsv41_expert_metadata(module, device)         
+      302  
+      303          still_meta = [name for name, parameter in module.named
+           _parameters() if parameter.is_meta]
+      304          if still_meta:
+     ...
+      307                  "Check that the checkpoint covers every parame
+           ter.".format(still_meta[:5])
+      308              )
+      309  
+      310 -    def _refresh_expert_parallel_metadata(self, module, device
+          -):                                                            
+      311 -        """``expert_ids_per_ep_rank`` is an attribute, not a b
+          -uffer: the EP dispatcher                                      
+      312 -        reads it at forward time, and a meta-built expert tens
+          -or leaves it on meta."""                                      
+      313 -        from fsdp_turbo.distributed.expert_parallel.expert_par
+          -allel import refresh_expert_parallel_metadata                 
+      314 -                                                              
+      315 -        refresh_expert_parallel_metadata(module, device=device
+          -)                                                             
+      316 -                                                              
+      310      def _dsv41_model_path(self) -> str:
+      311          """Directory of the rollout checkpoint: config.json + 
+           tokenizer + safetensors."""
+      312          model_config = self.model_config
+
+● Please run /login · API Error: HIS Proxy Notification
+
+✻ Brewed for 29m 13s · done 12:15 PM
+
+● Agent "探索 verl 权重同步流" finished · 29m 20s
+
+● Please run /login · API Error: HIS Proxy Notification
+
+✻ Baked for 29m 24s · done 12:16 PM
+
+❯ 继续                                                                          
+
+● Please run /login · API Error: HIS Proxy Notification
+
+✻ Cooked for 1s · done 12:16 PM
+
+❯ /login                                                                        
+  ⎿  Login interrupted
+❯ 继续                                                                          
+
+  Thought for 22s (ctrl+o to expand)
+
+● 权重同步链路确认清楚：FSDPTurbo 引擎沿用父类 get_per_tensor_param（state_dict
+  → convert_weight_keys → full_tensor() → unfuse_moe_params），而 vllm-ascend 的
+  V4.1 load_weights 接受 checkpoint 风格名（w1/w2/w3、可带或不带 model.
+  前缀）。我加的 unfuse 分支正好对上。现在核实一个关键风险：FSDP2 在 meta + 
+  assign=True 下替换参数对象后，内部缓存的 shard 引用是否会失效。
+
+  Thought for 31s, searched for 1 pattern, ran 2 shell commands (ctrl+o to expand)
+
+● reset_sharded_param 的注释明确写着支持 load_state_dict(assign=True)，且 FSDP2
+  注册了 post-hook 自动重置——meta + assign
+  路线被官方支持。现在完善引擎的加载分支并加上内存诊断。
+
+● Update(verl/workers/engine/fsdp/fsdp_turbo_dsv41_impl.py)
+  ⎿  Added 2 lines, removed 1 line
+      266              if dist.get_rank() == 0:
+      267                  logger.warning("VERL_DSV41_RANDOM_INIT=1: skip
+           ping checkpoint weights, deferring experts at N(0, 0.02).")
+      268              full_state = _random_state_dict(param_meta) if dis
+           t.get_rank() == 0 else {}
+      269 -        elif dist.get_rank() == 0 and checkpoint_dir.exists() 
+          -and _checkpoint_weight_map(checkpoint_dir):                   
+      269 +        elif dist.get_rank() == 0:                            
+      270 +            # Only rank 0 reads the checkpoint; the broadcast 
+          +below feeds every other rank.                                 
+      271              full_state, report = read_dsv41_checkpoint_state_d
+           ict(checkpoint_dir, param_meta)
+      272              if report["missing"]:
+      273                  raise ValueError(
+
+● Update(scripts/check_dsv41_fsdp_turbo_build.py)
+  ⎿  Added 21 lines, removed 2 lines
+      165      if args.random_init:
+      166          full_state = _random_state_dict(param_meta) if rank ==
+            0 else {}
+      167      else:
+      168 -        full_state = read_dsv41_checkpoint_state_dict(args.mod
+          -el_path, param_meta)[0] if rank == 0 else {}                  
+      168 +        full_state = read_dsv41_checkpoint_state_dict(Path(arg
+          +s.model_path), param_meta)[0] if rank == 0 else {}            
+      169      options = StateDictOptions(full_state_dict=True, broadcast
+           _from_rank0=True, cpu_offload=True)
+      170      set_model_state_dict(model, full_state, options=options)
+      171      del full_state
+     ...
+      174      for buffer in model.buffers():
+      175          if buffer.device != device:
+      176              buffer.data = buffer.data.to(device)
+      177 -    _refresh_expert_parallel_metadata_standalone(model, device
+          -)                                                             
+      177 +    refresh_dsv41_expert_metadata(model, device)              
+      178  
+      179      still_meta = [name for name, parameter in model.named_para
+           meters() if parameter.is_meta]
+      180      assert not still_meta, f"parameters left on meta: {still_m
+           eta[:5]}"
+      181      log("no meta parameters left")
+      182  
+      183 +    # Memory/placement report: experts are EP-sharded (residen
+          +t), the rest is FSDP-sharded                                  
+      184 +    # and, with cpu_offload, stays on the host between steps. 
+      185 +    report = {}                                               
+      186 +    for name, parameter in model.named_parameters():          
+      187 +        local = parameter.to_local() if isinstance(parameter, 
+          +DTensor) else parameter                                       
+      188 +        kind = name.split(".")[1] if name.startswith("model.la
+          +yers.") else name                                             
+      189 +        entry = report.setdefault(kind, {"count": 0, "bytes": 
+          +0, "devices": set(), "sample": None})                         
+      190 +        entry["count"] += 1                                   
+      191 +        entry["bytes"] += local.numel() * local.element_size()
+      192 +        entry["devices"].add(str(local.device))               
+      193 +        if entry["sample"] is None:                           
+      194 +            entry["sample"] = f"{name} {tuple(local.shape)} {l
+          +ocal.dtype}"                                                  
+      195 +    for kind, entry in sorted(report.items()):                
+      196 +        log(                                                  
+      197 +            f"  {kind}: {entry['count']} params, {entry['bytes
+          +'] / 2**30:.2f} GiB/rank on {sorted(entry['devices'])}"       
+      198 +            f" | e.g. {entry['sample']}"                      
+      199 +        )                                                     
+      200 +    log(f"accelerator memory allocated: {torch.npu.memory_allo
+          +cated() / 2**30:.2f} GiB" if torch.npu.is_available() else "")
+      201 +                                                              
+      202      if args.forward:
+      203          log("running one forward pass (batch=1, seq=8)")
+      204          from torch.distributed.tensor import DTensor
+
+● Update(scripts/check_dsv41_fsdp_turbo_build.py)
+  ⎿  Added 2 lines, removed 1 line
+      126          prepare_deepseek_v41_model_for_fsdp,
+      127      )
+      128      from torch.distributed.checkpoint.state_dict import StateD
+           ictOptions, set_model_state_dict
+      129 +    from torch.distributed.tensor import DTensor              
+      130  
+      131      from verl.workers.engine.fsdp.fsdp_turbo_dsv41_impl import
+            (
+      131 -        _refresh_expert_parallel_metadata_standalone,         
+      132          _random_state_dict,
+      133          read_dsv41_checkpoint_state_dict,
+      134 +        refresh_dsv41_expert_metadata,                        
+      135      )
+      136  
+      137      def log(message):
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Update(scripts/check_dsv41_fsdp_turbo_build.py)
+  ⎿  Added 1 line
+      35  import os
+      36  import sys
+      37  import time
+      38 +from pathlib import Path                                       
+      39  
+      40  
+      41  def parse_args():
+
+  Thought for 4s (ctrl+o to expand)
+
+● 现在启动 8 卡独立验证（构建 + 分片加载 + 内存诊断）。先确认导入路径。
+
+  Thought for 6s, searched for 1 pattern, ran 4 shell commands (ctrl+o to expand)
+
+● NPU 显存已被占满（0-3 卡
+  61-65GB/65GB），我的验证进程无法初始化设备。先确认是谁在占用。
+
+  Thought for 22s, ran 4 shell commands (ctrl+o to expand)
+
+● NPU 被其他容器的任务占用（0-3 卡 61-65GB、12-14 卡在 100% 算力，持有进程 PID
+  不在本命名空间），不是我的进程，不能动。先做不依赖 NPU
+  的离线验证：检查点读取与专家融合逻辑。
+
+  Thought for 15s, ran 3 shell commands (ctrl+o to expand)
+
+● NPU 显存占用是静止的（两次采样完全一致），说明是其他容器里真实驻留的任务。当前
+  空闲：0-3 卡约 4GB、4-11 卡约 31GB、12-15 卡约 11GB。而 8 卡 RL 每卡峰值需求约
+  46GB（27GB 专家分片 + 18GB 广播临时张量 + 稠密参数），放不下。
+
+● User answered Claude's questions:
+  ⎿  · NPU 被其他容器的任务占用（0-3 卡仅剩 ~4GB，4-11 卡 ~31GB，12-15 卡 
+     ~11GB；持有进程不在本容器 PID 命名空间内，我不便终止）。8 卡 RL 
+     冒烟/训练每卡峰值约 46GB，现在启动会 OOM。如何推进？ → 
+     先做离线/文档，等我信号
+
+  Thought for 9s (ctrl+o to expand)
+
+● 明白，先做离线与文档。现在排查一个关键的接口风险：参考模型 forward 不接受
+  position_ids，而 verl 的 padded 路径会传它。
+
+  Thought for 23s, searched for 5 patterns, listed 1 directory, ran 6 shell commands (ctrl+o to expand)
+
+● 现在补上 position_ids 的接口适配（参考模型不接受该入参）。
+
+● Update(verl/workers/engine/fsdp/fsdp_turbo_dsv41_impl.py)
+  ⎿  Added 18 lines
+      210          finally:
+      211              self.ulysses_sequence_parallel_size = cp_size
+      212  
+      213 +    def prepare_model_inputs(self, micro_batch):              
+      214 +        """Drop the position ids verl hands to HF-style models
+          +.                                                             
+      215 +                                                              
+      216 +        The V4.1 reference forward indexes its RoPE tables by 
+          +absolute position and reads                                   
+      217 +        padding from ``attention_mask``; it has no ``position_
+          +ids`` input (passing one is                                   
+      218 +        rejected). verl's padded batch path always builds one,
+          + so remove it here. Packed                                    
+      219 +        (remove-padding) inputs would need per-sequence positi
+          +ons the reference forward                                     
+      220 +        cannot consume, so fail loudly instead of training on 
+          +wrong positions.                                              
+      221 +        """                                                   
+      222 +        model_inputs, output_args = super().prepare_model_inpu
+          +ts(micro_batch)                                               
+      223 +        model_inputs.pop("position_ids", None)                
+      224 +        if model_inputs.get("cu_seqlens") is not None:        
+      225 +            raise NotImplementedError(                        
+      226 +                "DeepSeek-V4.1 training does not support packe
+          +d (remove-padding) inputs; "                                  
+      227 +                "set actor_rollout_ref.model.use_remove_paddin
+          +g=False."                                                     
+      228 +            )                                                 
+      229 +        return model_inputs, output_args                      
+      230 +                                                              
+      231      def _build_dsv41_module(self):
+      232          from fsdp_turbo.models.deepseek_v41 import (
+      233              build_deepseek_v41_model,
+
+  Thought for 4s, ran 1 shell command (ctrl+o to expand)
+
+● 现在离线校验 GRPO 脚本的 Hydra 配置组装（用 --cfg job 只组装不执行）。
+
+  Thought for 7s, searched for 1 pattern, ran 1 shell command (ctrl+o to expand)
+
+● Hydra 语法错误：JSON 字符串里的 {} 不能被 override 语法解析。改为逐键设置。
+
+● Update(examples/grpo_trainer/run_deepseek_v41_grpo_fsdp_turbo_npu.sh)
+  ⎿  Added 2 lines, removed 1 line
+       96  HOOK_MODULES="['model.layers.{*}']"
+       97  
+       98  # vLLM engine args that the V4.1 Ascend path needs (see script
+           s/run_vllm2.sh).
+       99 -VLLM_ADDITIONAL_CONFIG='{"mc2_comm_alg":"fullmesh_v2","enable_
+          -engram":false,"engram_storage":"int8","ascend_compilation_conf
+          -ig":{"enable_npugraph_ex":false,"enable_static_kernel":false}}
+          -'                                                             
+       99 +# Set as individual overrides: hydra cannot parse a JSON blob 
+          +containing `{}`.                                              
+      100 +VLLM_ADDITIONAL_CONFIG_ROOT="+actor_rollout_ref.rollout.engine
+          +_kwargs.vllm.additional_config"                               
+      101  
+      102  ########################### parameter arrays #################
+           ##########
+      103  
+
+● Update(examples/grpo_trainer/run_deepseek_v41_grpo_fsdp_turbo_npu.sh)
+  ⎿  Added 5 lines, removed 1 line
+      191      actor_rollout_ref.rollout.enforce_eager=True
+      192      actor_rollout_ref.rollout.enable_prefix_caching=False
+      193      actor_rollout_ref.rollout.checkpoint_engine.update_weights
+           _bucket_megabytes=6144
+      194 -    "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_
+          -config=${VLLM_ADDITIONAL_CONFIG}"                             
+      194 +    "${VLLM_ADDITIONAL_CONFIG_ROOT}.mc2_comm_alg=fullmesh_v2" 
+      195 +    "${VLLM_ADDITIONAL_CONFIG_ROOT}.enable_engram=false"      
+      196 +    "${VLLM_ADDITIONAL_CONFIG_ROOT}.engram_storage=int8"      
+      197 +    "${VLLM_ADDITIONAL_CONFIG_ROOT}.ascend_compilation_config.
+          +enable_npugraph_ex=false"                                     
+      198 +    "${VLLM_ADDITIONAL_CONFIG_ROOT}.ascend_compilation_config.
+          +enable_static_kernel=false"                                   
+      199  )
+      200  
+      201  TRAINER=(
+
+  Thought for 18s, ran 5 shell commands (ctrl+o to expand)
+
+● Hydra 配置组装通过（actor strategy/turbo 拓扑/EP plan/rollout
+  additional_config 均正确落地）。现在通读一遍引擎实现做自审。
+  Read 1 file (ctrl+o to expand)
+
+● Update(verl/workers/engine/fsdp/fsdp_turbo_dsv41_impl.py)
+  ⎿  Added 9 lines, removed 7 lines
+      145          ):
+      146              model_name = _MODEL_PREFIX + fused_name
+      147              if model_name not in param_meta:
+      148 -                skipped.extend(kinds[kind][expert_id] for part
+          -s in fused_kinds for kind in parts for expert_id in kinds[kind
+          -])                                                            
+      148 +                skipped.extend(                               
+      149 +                    kinds[kind][expert_id] for parts in fused_
+          +kinds for kind in parts for expert_id in kinds[kind]          
+      150 +                )                                             
+      151                  continue
+      152              shape, dtype = param_meta[model_name]
+      151 -            num_experts = shape[0]                            
+      152 -            fused = torch.empty(shape, dtype=dtype)           
+      153 +            # ``gate_up_proj`` is [w1 ; w3] along the intermed
+          +iate dim, ``down_proj`` is w2 --                              
+      154 +            # exactly how vLLM's loader views the same tensors
+          +, so the fused layout is shared.                              
+      155              per_kind = {kind: kinds[kind] for parts in fused_k
+           inds for kind in parts}
+      154 -            for expert_id in range(num_experts):              
+      156 +            fused = torch.empty(shape, dtype=dtype)           
+      157 +            for expert_id in range(shape[0]):                 
+      158                  offset = 0
+      156 -                for kind in per_kind:                         
+      157 -                    tensor = fetch(per_kind[kind][expert_id]).
+          -to(dtype)                                                     
+      159 +                for kind, names in per_kind.items():          
+      160 +                    tensor = fetch(names[expert_id]).to(dtype)
+      161                      if len(per_kind) == 1:
+      162                          fused[expert_id] = tensor
+      163                      else:
+      164                          fused[expert_id, offset : offset + ten
+           sor.shape[0]] = tensor
+      165                          offset += tensor.shape[0]
+      163 -                del tensor                                    
+      166              state_dict[model_name] = fused
+      167  
+      168      missing = [name for name in param_meta if name not in stat
+           e_dict]
+
+  Thought for 3s, ran 1 shell command (ctrl+o to expand)
+
+● 我的 FSDPTurbo 改动需要回归验证——跑一下它自带的 V4.1 单元测试。
+
+  Thought for 34s, ran 9 shell commands (ctrl+o to expand)
+
+● Agent "探索 verl 权重同步流" finished · 56m 40s
+
+● Agent "探索 vllm-ascend V4.1 权重命名" finished · 57m 27s
+
+● 导入路径全部指向本地副本。现在按用户要求把工作记录、问题与修复写入 wiki。
+
+● Write(wiki/worklog_dsv41_rl.md)
+  ⎿  Wrote 187 lines to wiki/worklog_dsv41_rl.md
+      1 # DeepSeek-V4.1 RL 实施工作记录（2026-09-17）
+      2 
+      3 > 目标：在昇腾 NPU 上用 **verl + FSDPTurbo + vllm/vllm-ascend** 
+      4 > 本文件记录：做了什么、遇到什么问题、怎么修的、验证到什么程度、
+        还剩什么。
+      5 > 相关文档：[方案](verl_fsdp_turbo_vllm_ascend_rl_plan.md) ｜ [改
+        动盘点](README.md) ｜ [验证步骤](verification.md)
+      7 ---
+      8 
+      9 ## 0. 本地事实基准（以本地为准，方案里的版本描述已过时）
+     … +334 lines (ctrl+o to expand)
+
+  Thought for 3s (ctrl+o to expand)
+
+● Write(wiki/README.md)
+  ⎿  Added 53 lines, removed 95 lines
+        1  # verl × FSDPTurbo × vllm-ascend — DeepSeek-V4.1 RL 实施改动盘
+           点
+        2  
+        3 -> 状态：**代码已实施**（2026-09-17）                          
+        4 -> 方案详细文档见 [verl_fsdp_turbo_vllm_ascend_rl_plan.md](verl
+          -_fsdp_turbo_vllm_ascend_rl_plan.md)                           
+        5 -> 验证步骤见 [verification.md](verification.md)               
+        3 +> 状态：**代码已实施 + 离线验证通过；真机 8 卡验证待 NPU 空闲*
+          +*（2026-09-17）                                               
+        4 +> 工作记录（问题/修复/验证）：[worklog_dsv41_rl.md](worklog_ds
+          +v41_rl.md)                                                    
+        5 +> 方案：[verl_fsdp_turbo_vllm_ascend_rl_plan.md](verl_fsdp_tur
+          +bo_vllm_ascend_rl_plan.md) ｜ 验证步骤：[verification.md](veri
+          +fication.md)                                                  
+        6  
+        7  ---
+        8  
+        9 -## 一、改动总览                                               
+        9 +## 一、本地基准（以本地目录为准）                             
+       10  
+       11 -| # | 文件 | 动作 | 说明 |                                    
+       12 -|---|---|---|---|                                             
+       13 -| 1 | `verl/verl/workers/engine/fsdp/fsdp_turbo_dsv41_impl.py`
+          - | **新增** | DeepSeek-V4.1 专用 FSDPTurbo 引擎子类（核心） | 
+       14 -| 2 | `verl/verl/workers/engine/fsdp/__init__.py` | 修改 | 导 
+          -入并导出新引擎 |                                              
+       15 -| 3 | `verl/verl/workers/engine/__init__.py` | 修改 | 顶层导出
+          -新引擎 |                                                      
+       16 -| 4 | `verl/verl/trainer/config/engine/fsdp.yaml` | 修改 | str
+          -ategy 注释 + turbo_config 8 卡默认值 |                        
+       17 -| 5 | `verl/examples/grpo_trainer/run_deepseek_v41_grpo_fsdp_t
+          -urbo_npu.sh` | **新增** | DeepSeek-V4.1 纯文本 GRPO 启动脚本（
+          -8 卡 NPU） |                                                  
+       18 -| 6 | `wiki/verl_fsdp_turbo_vllm_ascend_rl_plan.md` | **新增**
+          - | 完整方案（背景/架构/风险/DoD） |                           
+       19 -| 7 | `wiki/verification.md` | **新增** | 本文件配套的验证步骤
+          - |                                                            
+       20 -| 8 | `wiki/README.md` | **新增** | 本次改动盘点（本文件） |  
+       11 +- 训练参照：`FSDPTurbo/examples/deepseek_v41/run.sh` + `config
+          +2.yaml`（FSDP=8 / TP=1 / EP=8，`apply_modules: model.layers.{*
+          +}`，无 recompute）                                            
+       12 +- 推理参照：`scripts/run_vllm2.sh`（`vllm serve /mnt/share/m00
+          +899630/weights/DeepSeek-V4.1-Flash-8layer-random`，TP=8 + EP，
+          +eager，max-model-len 8192）                                   
+       13 +- 模型：8 层 / 384 experts / 无 engram 的减层权重，209GB（~111
+          +.4B 参数）                                                    
+       14  
+       15  ---
+       16  
+       24 -## 二、核心代码改动细节                                       
+       17 +## 二、改动总览                                               
+       18  
+       26 -### 2.1 新增引擎子类 `fsdp_turbo_dsv41_impl.py`               
+       19 +| # | 文件 | 动作 | 说明 |                                    
+       20 +|---|---|---|---|                                             
+       21 +| 1 | `verl/workers/engine/fsdp/fsdp_turbo_dsv41_impl.py` | **
+          +重写** | 外部 config + meta 专家构造 + 分布式 checkpoint 加载 
+          ++ 前向入参适配（核心） |                                      
+       22 +| 2 | `verl/workers/engine/fsdp/utils.py` | 修改 | `unfuse_moe
+          +_params` 增加 `.ffn.experts.*` → per-expert `w1/w3/w2` |      
+       23 +| 3 | `verl/utils/model.py` | 修改 | 新增 `get_auto_config_wit
+          +h_vllm_fallback()`（支持 `deepseek_v4` / `deepseek_v4.1`） |  
+       24 +| 4 | `verl/workers/config/model.py` | 修改 | `hf_config` 构造
+          +改走上述 fallback |                                           
+       25 +| 5 | `examples/grpo_trainer/run_deepseek_v41_grpo_fsdp_turbo_
+          +npu.sh` | **重写** | 8 层权重 + 8 卡拓扑 + 修 hydra 语法 |    
+       26 +| 6 | `scripts/check_dsv41_fsdp_turbo_build.py` | **新增** |  
+          +不依赖 Ray 的 8 卡构建/加载/前向冒烟 + 显存报告 |             
+       27 +| 7 | `FSDPTurbo/fsdp_turbo/models/deepseek_v41/adapter.py` | 
+          +修改 | `config_path` / `include_vision` / `max_seq_len` / `exp
+          +erts_meta_init` 参数（默认行为不变） |                        
+       28 +| 8 | `FSDPTurbo/fsdp_turbo/models/deepseek_v41/model.py` | 修
+          +改 | `ModelArgs.experts_meta_init`；`MoE` 据此把专家建到 meta 
+          +|                                                             
+       29 +| 9 | `FSDPTurbo/fsdp_turbo/models/deepseek_v41/experts.py` | 
+          +修改 | 支持 `device=` |                                       
+       30 +| 10 | `FSDPTurbo/fsdp_turbo/distributed/expert_parallel/exper
+          +t_parallel.py` | 修改 | 新增 `refresh_expert_parallel_metadata
+          +()` |                                                         
+       31 +| 11 | `wiki/worklog_dsv41_rl.md` | **新增** | 本次工作记录（ 
+          +问题/修复/验证） |                                            
+       32 +| 12 | `wiki/verification.md` | 更新 | 补离线已验证项与真机待 
+          +办命令 |                                                      
+       33  
+       28 -**设计目标**：让 verl 能用 FSDPTurbo 构建 DeepSeek-V4.1 训练模
+          -型（该模型是 FSDPTurbo 独立 `nn.Module`，**不在 transformers A
+          -utoModel 体系内**，verl 通用 `from_pretrained` 路径无法构造） 
+          -。                                                            
+       34 +数据（已就绪）：`/mnt/share/m00899630/dsv41/rl_data/dapo_math_
+          +{train_512,val_64}.parquet`（由 `dapo-math-17k.parquet` 切分，
+          +reward 走 verl 内置 `math_dapo`）。                           
+       35  
+       30 -**关键实现**（完整代码见文件）：                              
+       36 +---                                                           
+       37  
+       38 +## 三、核心实现要点                                           
+       39 +                                                              
+       40 +### 3.1 结构来自 rollout checkpoint                           
+       41 +                                                              
+       42  ```python
+       33 -@EngineRegistry.register(                                     
+       34 -    model_type="language_model",                              
+       35 -    backend="fsdp_turbo_dsv41",                               
+       36 -    device=["npu", "cuda"],                                   
+       43 +build_deepseek_v41_model(                                     
+       44 +    tokenizer=..., engram_meta_init=True, use_sparse_flash_att
+          +n=False,                                                      
+       45 +    experts_meta_init=True,                                   
+       46 +    config_path=<MODEL_PATH>/config.json,          # 8 层 / 38
+          +4 专家 / 无 engram                                            
+       47 +    max_seq_len=int(os.environ.get("VERL_DSV41_MAX_SEQ_LEN", 8
+          +192)),                                                        
+       48  )
+       38 -class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead
+          -):                                                            
+       39 -    def _build_module(self):                                  
+       40 -        # 复用父类 FSDPTurboEngine 的 Qwen VLM monkey-patch gu
+          -ard                                                           
+       41 -        cp_size = self.ulysses_sequence_parallel_size         
+       42 -        self.ulysses_sequence_parallel_size = 1               
+       43 -        try:                                                  
+       44 -            return self._build_dsv41_module()                 
+       45 -        finally:                                              
+       46 -            self.ulysses_sequence_parallel_size = cp_size     
+       47 -                                                              
+       48 -    def _build_dsv41_module(self):                            
+       49 -        from fsdp_turbo.models.deepseek_v41 import (          
+       50 -            build_deepseek_v41_model,                         
+       51 -            initialize_deepseek_v41_model,                    
+       52 -            prepare_deepseek_v41_model_for_fsdp,              
+       53 -        )                                                     
+       54 -        training_model = build_deepseek_v41_model(            
+       55 -            tokenizer=self.model_config.tokenizer,            
+       56 -            engram_meta_init=True,          # Engram 表延迟分 
+          -配（meta），屏蔽巨大表内存                                    
+       57 -            engram_storage_backend="row_sharded",             
+       58 -            use_sparse_flash_attn=False,    # 先屏蔽 V4.1 稀疏
+          -注意力                                                        
+       59 -        )                                                     
+       60 -        initialize_deepseek_v41_model(training_model)         
+       61 -        training_model = prepare_deepseek_v41_model_for_fsdp( 
+       62 -            training_model,                                   
+       63 -            device=torch.accelerator.current_accelerator(),   
+       64 -            parameter_dtype=torch.bfloat16,                   
+       65 -        )                                                     
+       66 -        return training_model                                 
+       49  ```
+       50 +`build_deepseek_v41_model_args()` 不传 `config_path` 时仍读内 
+          +置 4 层 demo，**旧行为不受影响**。                            
+       51  
+       69 -**为什么这样设计**：                                          
+       70 -- 继承 `FSDPTurboEngineWithLMHead`（已有 `_init_parallel_state
+          -` / `_build_fsdp_module` / `optimizer_step` / CP-Ulysses 冲突 
+          -处理 / offload / QAT 全套）。                                 
+       71 -- 只 override `_build_module`：返回 FSDPTurbo V4.1 adapter，**
+          -父类 `_build_fsdp_module` 会自动做 FSDPTurbo 包装 + state_dict
+          - 加载**（`module.state_dict()` → `FSDPTurbo(config, module)` →
+          - `fsdp2_load_full_state_dict`），对齐 FSDPTurbo 官方示例流程。
+       72 -- `_build_module` 不走 HF `from_pretrained`，因此不需要 verl  
+          -的 meta init context——FSDPTurbo V4.1 用 `torch.set_default_dty
+          -pe(bf16)` 自建参数。                                          
+       52 +### 3.2 108B 专家参数：meta 构造 + 分片加载                   
+       53  
+       74 -**路由**：`engine_workers.py:138` 用 `backend=self.engine_conf
+          -ig.strategy` 查找 → `actor.strategy=fsdp_turbo_dsv41` 命中 `En
+          -gineRegistry["language_model"]["fsdp_turbo_dsv41"]`（device=np
+          -u 时 key="npu"）。                                            
+       54 +- 专家张量 meta 构造（`experts_meta_init=True`），其余参数与 *
+          +*全部 buffer 真实构造**（避开整模型 meta 会毁掉 `freqs_cis` 等
+          +确定性 buffer 的坑）。                                        
+       55 +- `FSDPTurbo(config, module)` 分片后，rank0 读 safetensors 并 
+          +融合专家（`w1|w3 → gate_up_proj`、`w2 → down_proj`），        
+       56 +  `set_model_state_dict(full_state_dict=True, broadcast_from_r
+          +ank0=True, cpu_offload=offload_policy)` 逐 tensor 广播，各 ran
+          +k 只保留自己的分片。                                          
+       57 +- 加载后：buffer 落设备 → 重建 `expert_ids_per_ep_rank` → 断言
+          +无 meta 残留。                                                
+       58  
+       76 -### 2.2 导出修改（2 个 __init__.py）                          
+       59 +### 3.3 权重同步（actor → vLLM）                              
+       60  
+       78 -- `fsdp/__init__.py`：`from .fsdp_turbo_dsv41_impl import FSDP
+          -TurboDSV41EngineWithLMHead`，加入 `__all__`。                 
+       79 -- `engine/__init__.py`：从 `.fsdp` 批量导入并加入 `__all__`。 
+       61 +- 名字链路：`module.state_dict()` → `convert_weight_keys`（本 
+          +环境 no-op）→ `full_tensor()` → **`unfuse_moe_params`（新增 `.
+          +ffn.experts.*` 分支）** → bucketed 传输 → `vllm load_weights` 
+          +。                                                            
+       62 +- vllm-ascend V4.1 `load_weights` 期望 **checkpoint 风格名**：
+          +`layers.N.ffn.experts.E.{w1,w3,w2}.weight`（可带 `model.` 前缀
+          +），内部再映射到 `...mlp.experts.routed_experts.w13_weight`。 
+       63  
+       81 -### 2.3 配置默认值（fsdp.yaml）                               
+       64 +### 3.4 前向接口                                              
+       65  
+       83 -```yaml                                                       
+       84 -# fsdp or fsdp2 or fsdp_turbo or fsdp_turbo_dsv41             
+       85 -strategy: fsdp        # 默认仍为 fsdp；要在 GRPO 脚本里显式指 
+          -定 fsdp_turbo_dsv41                                           
+       66 +| 引擎传入 | 处理 |                                           
+       67 +|---|---|                                                     
+       68 +| `position_ids` | 剥离（参考模型按绝对位置索引 RoPE，不接受该
+          +入参） |                                                      
+       69 +| `attention_mask`（int32，1=有效） | 直接用（`.bool()` 后 Tru
+          +e=attend） |                                                  
+       70 +| packed / remove-padding 输入 | **显式报错**（脚本设 `use_rem
+          +ove_padding=False`，走 padded 路径） |                        
+       71  
+       87 -turbo_config:                                                 
+       88 -  distributed:                                                
+       89 -    fully_shard_parallel_size: 4   # 8 卡: FSDP=4, TP=2 → 2×DP
+       90 -    tensor_parallel_size: 2                                   
+       91 -    expert_parallel_size: 1        # 屏蔽 MoE/Engram 时保持 1 
+       92 -    expert_fully_shard_parallel_size: 1                       
+       93 -    ulysses_parallel_size: 1                                  
+       94 -    fsdp_plan:                                                
+       95 -      param_dtype: bf16                                       
+       96 -      reduce_dtype: fp32                                      
+       97 -      output_dtype: bf16                                      
+       98 -      fsdp_implementation: native                             
+       99 -      num_to_forward_prefetch: 1                              
+      100 -      num_to_backward_prefetch: 1                             
+      101 -```                                                           
+      102 -                                                              
+      103 -### 2.4 GRPO 启动脚本（run_deepseek_v41_grpo_fsdp_turbo_npu.sh
+          -）                                                            
+      104 -                                                              
+      105 -参照官方 `run_qwen3_5_27b_fsdp_turbo.sh` 改造，`DEVICE=npu` 分
+          -支完整保留 HCCL/RAY_ASCEND 环境变量，关键差异：               
+      106 -                                                              
+      107 -| 项 | 官方 Qwen3.5 | 本脚本 V4.1 |                           
+      108 -|---|---|---|                                                 
+      109 -| strategy | `fsdp_turbo` | `fsdp_turbo_dsv41` |              
+      110 -| apply_modules | `model.visual/*`, `model.language_model.*` |
+          - `model.model.embed/layers/head/norm/vision` |                
+      111 -| 拓扑 | fsdp_size=16（NPU 分支） | fsdp_size=4, tp=2（8 卡） 
+          -|                                                             
+      112 -| rollout TP | GEN_TP=4 | GEN_TP=2 |                          
+      113 -| 多模态 | image_key=images | 纯文本起步（images 字段可先在建 
+          -数据时省略） |                                                
+      114 -                                                              
+       72  ---
+       73  
+      117 -## 三、未改动但需要知晓的约束                                 
+       74 +## 四、未改动但需知晓                                         
+       75  
+      119 -1. **模型结构由 FSDPTurbo 包内 `config.json` 决定**（`fsdp_tur
+          -bo/models/deepseek_v41/config.json`，4-layer demo）。`actor_ro
+          -llout_ref.model.path` **不决定层数**，只提供 tokenizer。→ 后续
+          -如需外部 config 扩展，改 `build_deepseek_v41_model_args()`。  
+      120 -2. **vllm/vllm-ascend 代码零改动**（rollout 侧验证为主，见 ver
+          -ification.md）。                                              
+      121 -3. **reward / data 零改动**（用 verl 内置 rule-based + 标准 pa
+          -rquet 格式）。                                                
+       76 +1. vllm / vllm-ascend / 数据 / reward **零改动**。            
+       77 +2. 拓扑与 `config2.yaml` 对齐：`FSDP=8, TP=1, EP=8, EFSDP=1, u
+          +lysses=1`；`cast_forward_inputs=False`、`output_dtype=null`（ 
+          +保留 HC 的 FP32 系数）。                                      
+       78 +3. V4.1 适配器不支持 recompute → 脚本不设 recompute plan。    
+       79 +4. 依赖解析：`verl` / `vllm` / `vllm_ascend` / `fsdp_turbo` 均
+          +指向 `/workspace-verl/` 本地副本；机器上有多份同名副本，运行脚
+          +本应显式设置 `PYTHONPATH`。                                   
+
+● Write(wiki/verification.md)
+  ⎿  Added 70 lines, removed 119 lines
+        1  # 验证步骤 — DeepSeek-V4.1 RL（verl + FSDPTurbo + vllm-ascend
+           ）
+        2  
+        3 -> 配套改动见 [README.md](README.md)，方案见 [verl_fsdp_turbo_v
+          -llm_ascend_rl_plan.md](verl_fsdp_turbo_vllm_ascend_rl_plan.md)
+        4 -> 按顺序执行，每步有明确通过标准。                            
+        3 +> 配套：[改动盘点](README.md) ｜ [方案](verl_fsdp_turbo_vllm_a
+          +scend_rl_plan.md) ｜ [工作记录](worklog_dsv41_rl.md)          
+        4 +> 模型：`/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-8lay
+          +er-random`（8 层 / 384 experts / 无 engram，209GB）           
+        5  
+        6  ---
+        7  
+        8 -## Phase 0：环境与依赖（先行，约 1–2 天）                     
+        8 +## Phase 0：环境（已就绪，本地实测）                          
+        9  
+       10 -### 0.1 安装清单                                              
+       11 -| 组件 | 版本/来源 | 命令 |                                   
+       10 +| 组件 | 本地路径 | 解析结果 |                                
+       11  |---|---|---|
+       13 -| Python | ≥ 3.10（推荐 3.11） | — |                          
+       14 -| PyTorch | ≥ 2.9 | pip install torch |A2/A3 对应 wheel|      
+       15 -| torch_npu | ≥ 2.9（匹配 CANN） | 昇腾安装指南 |             
+       16 -| transformers | @cc7ab9be 附近（含 deepseek_v41 config） | pi
+          -p install git+...@cc7ab9be |                                  
+       17 -| vllm | 本地 `a97dacb`（≈v0.28.x） | `VLLM_TARGET_DEVICE=empt
+          -y pip install -e vllm/` |                                     
+       18 -| vllm-ascend | 本地定制分支 | `pip install -e vllm-ascend/` |
+       19 -| FSDPTurbo | gitcode 仓库，deepseek_v41 版 | `pip install -e 
+          -FSDPTurbo/[npu]` |                                            
+       20 -| verl | 本地（含本次改动） | `pip install -e verl/` + `requir
+          -ements-npu.txt` |                                             
+       12 +| verl | `/workspace-verl/verl` | editable ✓ |                
+       13 +| vllm | `/workspace-verl/vllm` | editable（v0.28.1rc1.dev570+
+          +ga97dacb71）✓ |                                               
+       14 +| vllm-ascend | `/workspace-verl/vllm-ascend-v41-private` | ed
+          +itable（含 V4.1 eager 定制）✓ |                               
+       15 +| FSDPTurbo | `/workspace-verl/FSDPTurbo` | editable（fsdp-tur
+          +bo 0.1.0）✓ |                                                 
+       16 +| transformers | 5.10.4 | **不认 `deepseek_v4.1`** → 走 vLLM c
+          +onfig fallback（已实现） |                                    
+       17  
+       22 -### 0.2 通过标准                                              
+       18  ```bash
+       24 -python -c "import verl, fsdp_turbo, vllm, vllm_ascend, torch_n
+          -pu"                                                           
+       25 -# 全部成功（无 MissingDependency）                            
+       19 +python3 -c "import verl, vllm, vllm_ascend, fsdp_turbo, torch_
+          +npu; print('ok')"                                             
+       20 +# 建议显式指定，避免同名副本歧义：                            
+       21 +# PYTHONPATH=/workspace-verl/vllm:/workspace-verl/vllm-ascend-
+          +v41-private:/workspace-verl/FSDPTurbo                         
+       22  ```
+       23  
+       24  ---
+       25  
+       30 -## Phase 1：训练侧验证（FSDPTurbo × verl，核心）              
+       26 +## Phase 1：离线自检（无需 NPU，**已通过**）                  
+       27  
+       32 -### 1.1 先跑 FSDPTurbo 自带 SFT（隔离 verl，验证模型可训练）  
+       33 -                                                              
+       28  ```bash
+       35 -cd FSDPTurbo/examples/deepseek_v41                            
+       36 -# 改 config.yaml: data.dataset_path 指向真实纯文本数据        
+       37 -bash run.sh    # 单机 8 卡                                    
+       38 -```                                                           
+       29 +cd /workspace-verl/verl                                       
+       30  
+       40 -**通过标准**：loss 正常下降，无 OOM，checkpoint 可保存。      
+       31 +# 1. 引擎注册                                                 
+       32 +python3 -c "from verl.workers.engine import EngineRegistry; pr
+          +int(EngineRegistry.get_engine_cls('language_model','fsdp_turbo
+          +_dsv41'))"                                                    
+       33 +# → FSDPTurboDSV41EngineWithLMHead                            
+       34  
+       42 -### 1.2 verl 引擎导入冒烟（验证新引擎注册）                   
+       35 +# 2. 模型 config 可被 verl 读取                               
+       36 +python3 -c "from verl.workers.config.model import HFModelConfi
+          +g; c=HFModelConfig(path='/mnt/share/m00899630/weights/DeepSeek
+          +-V4.1-Flash-8layer-random', trust_remote_code=True); print(typ
+          +e(c.hf_config).__name__, c.architectures)"                    
+       37 +# → DeepseekV41Config ['DeepseekV41ForCausalLM']              
+       38  
+       44 -```bash                                                       
+       45 -cd verl                                                       
+       46 -python -c "                                                   
+       47 -from verl.workers.engine import EngineRegistry                
+       48 -import verl.workers.engine  # 触发注册                        
+       49 -cls = EngineRegistry.get_engine_cls('language_model', 'fsdp_tu
+          -rbo_dsv41')                                                   
+       50 -print('engine OK:', cls)                                      
+       51 -"                                                             
+       52 -```                                                           
+       39 +# 3. 外部 config → ModelArgs                                  
+       40 +python3 -c "from fsdp_turbo.models.deepseek_v41 import build_d
+          +eepseek_v41_model_args as f; a=f('/mnt/share/m00899630/weights
+          +/DeepSeek-V4.1-Flash-8layer-random', max_seq_len=4096); print(
+          +a.n_layers, a.n_routed_experts, a.engram_layer_ids, a.compress
+          +_ratios)"                                                     
+       41 +# → 8 384 () (0, 0, 2, 2, 2, 2, 2, 2)                         
+       42  
+       54 -**通过标准**：打印 `FSDPTurboDSV41EngineWithLMHead`，不报 Unkn
+          -own backend。                                                 
+       43 +# 4. HTTP 语法/配置组装                                       
+       44 +env DEVICE=npu bash examples/grpo_trainer/run_deepseek_v41_grp
+          +o_fsdp_turbo_npu.sh --cfg job | tail -3                       
+       45 +# → exit 0，composed 配置含 strategy=fsdp_turbo_dsv41 / EP=8 /
+          + additional_config.*                                          
+       46  
+       56 -### 1.3 verl FSDP SFT 冒烟（真机 8 卡，NPU）                  
+       57 -                                                              
+       58 -用 verl 的 SFT 引擎测试或手工构造（参考 `tests/special_e2e/sft
+          -/run_sft_engine.sh` 的 NPU 变体），关键参数：                 
+       59 -                                                              
+       60 -```bash                                                       
+       61 -# 最小验证: 纯文本、减层、小 batch                            
+       62 -MODEL_PATH=<tokenizer路径>                                    
+       63 -python3 -m verl.trainer.main_sft \                            
+       64 -    data.train_files=<train.parquet> \                        
+       65 -    data.val_files=<test.parquet> \                           
+       66 -    data.train_batch_size=2 \                                 
+       67 -    actor_rollout_ref.model.path=$MODEL_PATH \                
+       68 -    actor_rollout_ref.actor.strategy=fsdp_turbo_dsv41 \       
+       69 -    +actor_rollout_ref.actor.fsdp_config.turbo_config.distribu
+          -ted.fully_shard_parallel_size=4 \                             
+       70 -    +actor_rollout_ref.actor.fsdp_config.turbo_config.distribu
+          -ted.tensor_parallel_size=2 \                                  
+       71 -    trainer.n_gpus_per_node=8 \                               
+       72 -    trainer.logger=['console']                                
+       47 +# 5. FSDPTurbo 单测（本次改动回归）                           
+       48 +python3 -m pytest /workspace-verl/FSDPTurbo/tests/unit_tests/m
+          +odels/test_deepseek_v41.py -q                                 
+       49 +# → 18 passed（test_engram_parallel.py 的 3 个失败为改动前既有
+          +）                                                            
+       50  ```
+       51  
+       75 -**通过标准**：actor 能 build 模型、FSDP wrapper 完成、backward
+          - 无错。                                                       
+       76 -**若失败排查**：                                              
+       77 -- `Unknown backend: fsdp_turbo_dsv41` → 引擎注册未生效，检查两
+          -个 `__init__.py` 导入路径。                                   
+       78 -- 模块名不匹配（apply_modules 报错）→ 先去掉 apply_modules/rec
+          -ompute，或按日志修正为 `model.model.*`。                      
+       79 -- tokenizer 兼容 → 确认 HF tokenizer 与 `DeepSeekV41Processor`
+          - 兼容（参考 FSDPTurbo 示例用 `PreTrainedTokenizerFast`）。    
+       52 +另已验证（脚本内含）：checkpoint 名称映射 194/194 命中、专家融
+          +合 `[w1 ; w3]`/`w2` 逐字节一致、hydra 覆盖全部生效。          
+       53  
+       54  ---
+       55  
+       83 -## Phase 2：rollout 侧验证（vllm-ascend 加载 V4.1）           
+       56 +## Phase 2：真机 8 卡冒烟（**待 NPU 空闲**）                  
+       57  
+       85 -### 2.1 vllm-ascend 离线加载 V4.1                             
+       86 -                                                              
+       58  ```bash
+       88 -python -c "                                                   
+       89 -from vllm import LLM                                          
+       90 -# 用减层权重目录 (含 config.json + safetensors)               
+       91 -llm = LLM(model='<减层V4.1权重目录>',                         
+       92 -          tensor_parallel_size=2,                             
+       93 -          gpu_memory_utilization=0.45)                        
+       94 -out = llm.generate(['Hello'])                                 
+       95 -print(out[0].outputs[0].text)                                 
+       96 -"                                                             
+       59 +cd /workspace-verl/verl                                       
+       60 +PYTHONPATH=/workspace-verl/vllm:/workspace-verl/vllm-ascend-v4
+          +1-private:/workspace-verl/FSDPTurbo \                         
+       61 +HCCL_CONNECT_TIMEOUT=1500 HCCL_HOST_SOCKET_PORT_RANGE=60000-60
+          +050 HCCL_NPU_SOCKET_PORT_RANGE=61000-61050 \                  
+       62 +ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 TASK_QUEUE_ENABLE=1 
+          +\                                                             
+       63 +torchrun --nproc_per_node=8 --master_port=59511 scripts/check_
+          +dsv41_fsdp_turbo_build.py --forward                           
+       64  ```
+       65  
+       99 -**通过标准**：能构图、生成输出。报错则进 vllm-ascend 侧查 conf
+          -ig→模型类映射。                                               
+       66 +**通过标准**                                                  
+       67 +1. `building model (routed experts deferred to meta)` → `model
+          + built ... (194 parameters)`                                  
+       68 +2. `wrapping with FSDPTurbo` 完成                             
+       69 +3. `parameters materialized in <N>s`（读盘 209GB，预计数分钟）
+       70 +4. `no meta parameters left`                                  
+       71 +5. 每 rank 的显存/设备报告：专家参数在加速器上（EP 分片），稠 
+          +密参数按 offload 策略                                         
+       72 +6. `--forward` 时打印 `forward ok: logits (1, 8, 128000)`     
+       73  
+      101 -### 2.2 verl 权重同步一致性（可选但强烈建议）                 
+       74 +**排查**                                                      
+       75 +| 现象 | 方向 |                                               
+       76 +|---|---|                                                     
+       77 +| 设备初始化失败（内存不足） | NPU 被占用；`npu-smi info` 看空
+          +闲 |                                                          
+       78 +| HCCL 超时 | `HCCL_CONNECT_TIMEOUT` / socket 端口范围 / 网卡 
+          +|                                                             
+       79 +| `parameters left on meta` | checkpoint 缺张量 → 看 rank0 的 
+          +missing 列表（引擎会直接报错） |                              
+       80 +| `Checkpoint ... has shape ... expects ...` | config 与 check
+          +point 不匹配（换成对应层数的权重目录即可） |                  
+       81 +| EP 派发异常/结果乱 | 确认 `refresh_dsv41_expert_metadata` 已
+          +执行（构建日志无 `no meta parameters left` 之后的报错） |     
+       82  
+      103 -```bash                                                       
+      104 -# 用 1.3 产出的 SFT checkpoint 或随机初始化，跑一个最小 GRPO s
+          -tep                                                           
+      105 -# 观察 actor→vllm 权重同步后 rollout 的 logprob 不再随 step 变
+          -化（已对齐）                                                  
+      106 -```                                                           
+      107 -可复用 verl 现有单测思路（对比同步前后 `input_ids` 对应的 `log
+          -_prob`）。                                                    
+      108 -                                                              
+       83  ---
+       84  
+      111 -## Phase 3：GRPO 端到端（8 卡 NPU，纯文本）                   
+       85 +## Phase 3：GRPO 端到端（**待 Phase 2 通过**）                
+       86  
+      113 -### 3.1 准备数据                                              
+      114 -- 用 geo3k/gsm8k 风格 parquet（`prompt` + 参考答案），转成 ver
+          -l RL 格式：                                                   
+      115 -  ```json                                                     
+      116 -  {"messages":[{"role":"user","content":"..."}], "images": nul
+          -l}                                                            
+      117 -  ```                                                         
+      118 -  （纯文本时 `images` 可省略）                                
+      119 -                                                              
+      120 -### 3.2 运行启动脚本                                          
+      121 -                                                              
+       87  ```bash
+      123 -cd verl                                                       
+      124 -DEVICE=npu \                                                  
+      125 -MODEL_PATH=<tokenizer> \                                      
+      126 -TRAIN_FILE=<train.parquet> \                                  
+      127 -TEST_FILE=<test.parquet> \                                    
+       88 +cd /workspace-verl/verl                                       
+       89 +DEVICE=npu PYTHONPATH=/workspace-verl/vllm:/workspace-verl/vll
+          +m-ascend-v41-private:/workspace-verl/FSDPTurbo \              
+       90  bash examples/grpo_trainer/run_deepseek_v41_grpo_fsdp_turbo_np
+           u.sh
+       91  ```
+       92  
+      131 -### 3.3 通过标准                                              
+      132 -1. Ray 集群带 8×NPU 资源就绪。                                
+      133 -2. Actor/Ref Engine 构建成功（日志出现 `FSDPTurboDSV41EngineWi
+          -thLMHead`）。                                                 
+      134 -3. Rollout 生成完成，reward 计算、GRPO loss 正常，无卡死/超时 
+          -。                                                            
+      135 -4. 权重同步后 rollout logprob 稳定。                          
+      136 -5. `save_freq` 设为 >0 时 checkpoint 可保存/恢复。            
+       93 +可调：`TRAIN_BSZ`（默认 8）、`SAMPLE_N`（默认 5）、`MAX_PROMPT
+          +_LEN`/`MAX_RESPONSE_LEN`（默认 1024/1024，同时决定 `VERL_DSV41
+          +_MAX_SEQ_LEN`）、`ROLLOUT_GPU_MEM_UTIL`（默认 0.6）、`EP_SIZE`
+          +/`EFSDP_SIZE`。                                               
+       94  
+      138 -### 3.4 常见问题                                              
+      139 -| 现象 | 排查 |                                               
+      140 -|---|---|                                                     
+      141 -| HCCL 连接超时 | 确认 HCCL_SOCKET_IFNAME/GLOO_SOCKET_IFNAME、
+          -800T 网卡、`HCCL_CONNECT_TIMEOUT` |                           
+      142 -| Ray 找不到 NPU | `RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_D
+          -EVICES=1` + `ASCEND_RT_VISIBLE_DEVICES` |                     
+      143 -| rollout OOM | 降 `gpu_memory_utilization`、升 `max_num_batch
+          -ed_tokens` 调优 |                                             
+      144 -| FSDPTurbo module 名不匹配 | 日志打印实际 module 名，改 `FSDP
+          -_APPLY_MODULES`/`RECOMPUTE_PLAN` |                            
+      145 -| engram/CSA2 报错 | 确认 `use_sparse_flash_attn=False`、`engr
+          -am_meta_init=True`，且 FSDPTurbo 内置 config 是 demo 层数 |   
+       95 +**通过标准**                                                  
+       96 +1. Ray 起 8 卡资源，actor/ref 两个引擎都完成模型构建（日志出现
+          + checkpoint 加载条数与耗时）。                                
+       97 +2. rollout 生成完成（vLLM 加载 8 层权重 + `additional_config` 
+          +生效）。                                                      
+       98 +3. `update_weights` 后 rollout 与 actor 的 logprob 对齐（不随 
+          +step 漂移）。                                                 
+       99 +4. GRPO loss/kl/reward 正常打印，无卡死。                     
+      100 +5. `trainer.save_freq>0` 时 checkpoint 可存/可取。            
+      101  
+      102 +**已知调优点**：显存（专家分片 27GB/卡 + 权重同步时 18GB 单张 
+          +量峰值）、`use_remove_padding=False` 的吞吐代价、V4.1 注意力在
+          + NPU 上走 eager（非 fused DSA）。                             
+      103 +                                                              
+      104  ---
+      105  
+      149 -## Phase 4（后续）：多模态 + V4.1 完整结构                    
+      106 +## Phase 4（后续）：多模态 / 完整结构 / 全层                  
+      107  
+      151 -- 多模态：数据加 `images` 字段，`data.image_key=images`，vllm-
+          -ascend `mm_processor_cache_gb=0`；验证 FSDPTurbo `vision.block
+          -s.*` 并行。                                                   
+      152 -- Engram/CSA2/稀疏索引：FSDPTurbo 训练侧能力开启（`use_sparse_
+          -flash_attn=True`、`engram_storage_backend`），vLLM eager 推理 
+          -侧专项对齐（compressor/indexer/cache 布局）。                 
+      153 -- 全层模型：先解决 FSDPTurbo 内置 config 只能出 4-layer 的问题
+          -（扩展 `build_deepseek_v41_model_args` 支持外部 config，或引入
+          -全层 config）。                                               
+      108 +- 多模态：构建时 `include_vision=True`（`adapter.py` 已支持 `v
+          +ision_config` 映射），数据加 `images`，`data.image_key=images`
+          +。                                                            
+      109 +- V4.1 特性：`use_sparse_flash_attn=True`（NPU `SparseFlashMla
+          +`）、Engram（`engram_meta_init=True` + 存储后端）。           
+      110 +- 全层权重：换 `MODEL_PATH` 即可（结构随 config 走），需重新评
+          +估显存与 EP/EFSDP 拓扑。                                      
+      111  
+      112  ---
+      113  
+      157 -## 附加：本次改动的静态自检（已在本机通过）                   
+      114 +## 附：本次新增的诊断/冒烟脚本                                
+      115  
+      159 -```bash                                                       
+      160 -python -m py_compile verl/workers/engine/fsdp/fsdp_turbo_dsv41
+          -_impl.py \                                                    
+      161 -                  verl/workers/engine/fsdp/__init__.py \      
+      162 -                  verl/workers/engine/__init__.py             
+      163 -# 全部通过（无语法错误）                                      
+      164 -```                                                           
+      165 -                                                              
+      166 -真机运行时再补：`EngineRegistry.get_engine_cls('language_model
+          -', 'fsdp_turbo_dsv41')` 冒烟。                                
+      116 +- `scripts/check_dsv41_fsdp_turbo_build.py`：绕开 Ray/verl tra
+          +iner 的三步验证（构建 / 分片加载 / 前向）+ 每类参数的显存与设 
+          +备分布报告；`--random-init` 可完全跳过 209GB 读盘。           
+      117 +- 环境变量：`VERL_DSV41_MAX_SEQ_LEN`（RoPE/scratch 尺寸）、`VE
+          +RL_DSV41_RANDOM_INIT=1`（跳过 checkpoint）。                  
+
+  Thought for 8s (ctrl+o to expand)
+
+● 继续离线深挖。有一个潜在缺陷需要立刻验证：prepare_deepseek_v41_model_for_fsdp
+  会对模块做 .to(device)，而 meta 张量不能 .to() 到真实设备。
+
+  Thought for 2s, ran 1 shell command (ctrl+o to expand)
+
+● 离线抓到一个必然会崩的真机 bug：prepare_..._for_fsdp 对 meta 专家张量做
+  .to(device) 会抛 Cannot copy out of meta tensor。修复它。
+
+● Update(/workspace-verl/FSDPTurbo/fsdp_turbo/models/deepseek_v41/adapter.py)
+  ⎿  Added 8 lines, removed 8 lines
+      396          for parameter in model.parameters():
+      397              if parameter.is_floating_point():
+      398                  parameter.data = parameter.data.to(dtype=param
+           eter_dtype)
+      399 -    # Keep deferred Engram tables on meta until FSDPTurbo has 
+          -its data mesh.                                                
+      400 -    # Move each module's own tensors so parent .to() cannot ma
+          -terialize them.                                               
+      399 +    # Keep deferred tables (Engram, routed experts) on meta un
+          +til FSDPTurbo has its                                         
+      400 +    # data mesh and the checkpoint loader materializes each ra
+          +nk's slice. Move each                                         
+      401 +    # module's own tensors -- skipping meta ones, which cannot
+          + be copied to a real                                          
+      402 +    # device -- so a parent .to() can never materialize them b
+          +y accident.                                                   
+      403 +    def _to_device_or_keep_meta(tensor):                      
+      404 +        return tensor if tensor.is_meta else tensor.to(device=
+          +device)                                                       
+      405 +                                                              
+      406      for module in model.modules():
+      402 -        if (                                                  
+      403 -            isinstance(module, (RowShardedEmbedding, HostOfflo
+          -adEmbedding))                                                 
+      404 -            and module.weight.is_meta                         
+      405 -        ):                                                    
+      406 -            continue                                          
+      407 -        module._apply(lambda tensor: tensor.to(device=device),
+          - recurse=False)                                               
+      407 +        module._apply(_to_device_or_keep_meta, recurse=False) 
+      408      return model
+      409  
+      410  
+
+  Thought for 11s, ran 1 shell command (ctrl+o to expand)
+
+● 修复已验证。现在做一个更强的离线验证：用小模型 + 2 个 CPU rank (gloo)
+  端到端验证 "meta 专家 + FSDPTurbo 分片 + DCP broadcast 加载" 这套机制本身。
+
+● Write(/tmp/test_dcp_meta_cpu.py)
+  ⎿  Wrote 123 lines to ../../tmp/test_dcp_meta_cpu.py
+       1 """CPU/gloo proxy test for the DCP meta-materialization path use
+       2 
+       3 2 ranks: build the vendored (small) V4.1 config with meta expert
+         s, wrap with FSDPTurbo
+         _state_dict(
+       5 full_state_dict=True, broadcast_from_rank0=True) and verify each
+       6 matches the source values.
+       7 """
+       8 
+      10 import sys
+     … +143 lines (ctrl+o to expand)
+
+  Thought for 3s, ran 2 shell commands (ctrl+o to expand)
+
+● 测试配置里内置 config 带 engram（需要 tokenizer），补上 tokenizer 再跑。
+
+  Thought for 2s, ran 1 shell command (ctrl+o to expand)
+
+● 测试转入后台运行。先看中间输出。
+
+  Thought for 1m 6s, ran 1 shell command (ctrl+o to expand)
+
+● Background command "Re-run CPU proxy test with tokenizer" completed (exit code
+0)
+
+● CPU 代理测试不可行——FSDPTurbo 的 device mesh 绑定加速器（测试进程甚至直接往
+  NPU 上分配，撞上别人占用的显存）。这是个有价值的结论，记录下来。先确认没有残留
+  进程。
+
+  Thought for 12s, ran 2 shell commands (ctrl+o to expand)
+
+● Update(examples/grpo_trainer/run_deepseek_v41_grpo_fsdp_turbo_npu.sh)
+  ⎿  Added 4 lines
+      78          ;;
+      79  esac
+      80  
+      81 +# This machine carries several checkouts of the same packages; 
+         +pin the ones this                                              
+      82 +# integration was verified against (see wiki/worklog_dsv41_rl.m
+         +d §5).                                                         
+      83 +export PYTHONPATH="/workspace-verl/vllm:/workspace-verl/vllm-as
+         +cend-v41-private:/workspace-verl/FSDPTurbo:${PYTHONPATH:-}"    
+      84 +                                                               
+      85  start_time=$(date +%Y%m%d)_$(date +%H%M%S)
+      86  mkdir -p logs
+      87  
+
+  Thought for 9s, searched for 1 pattern, ran 2 shell commands (ctrl+o to expand)
+
+● 脚本仍组装正确。把离线阶段的新发现补进工作记录。
+
+● Update(wiki/worklog_dsv41_rl.md)
+  ⎿  Added 2 lines
+      119  | 8 | hydra 报 `Could not append to config ... output_dtype` |
+            默认树里 `fsdp_plan.output_dtype` 已存在（`bf16`），不能用 `+
+           ` | 改成普通覆盖 `output_dtype=null` |
+      120  | 9 | `expert_ids_per_ep_rank` 在 meta 下是垃圾数据（会导致 EP
+            派发静默错乱） | 它是**普通属性不是 buffer**，`load_state_dic
+           t`/物化都不会刷新它 | 新增 `refresh_expert_parallel_metadata()
+           `，加载后重建（verl 引擎与独立冒烟脚本都会调用） |
+      121  | 10 | 「整模型 meta + `to_empty` 」会静默毁掉确定性 buffer | 
+           `to_empty` 用 `empty_like` 替换，`freqs_cis`/engram 表等 `pers
+           istent=False` buffer 不会被 `load_state_dict` 恢复 | 不做整模
+           型 meta：只 meta 专家张量，其余照常真实构造；加载路径也不调用 
+           `to_empty` |
+      122 +| 13 | **`prepare_deepseek_v41_model_for_fsdp` 抛 `NotImplemen
+          +tedError: Cannot copy out of meta tensor; no data!`**（离线构 
+          +建即复现，真机首次运行必崩） | 该函数逐模块 `module._apply(lam
+          +bda t: t.to(device))`，而延迟到 meta 的专家张量不能 `.to()` 到
+          +真实设备（原代码只对 `RowShardedEmbedding`/`HostOffloadEmbeddi
+          +ng` 特判跳过，不覆盖专家模块） | 改为通用规则：`tensor if tens
+          +or.is_meta else tensor.to(device=device)`，meta 张量原样保留（
+          +engram 与专家两种情况都覆盖）；已用 CPU 构建 → initialize → pr
+          +epare 全流程验证：专家仍为 meta、其余参数与 buffer 正常迁移/转
+          + bf16 |                                                       
+      123 +| 14 | 权重同步会把 buffer 也发给 vLLM（潜在 KeyError） | 训练
+          +侧有 14 个 `persistent=False` buffer | 实测 `module.state_dict
+          +()` = 194 项且**不含任何 buffer** → 同步载荷只有参数，命名全部
+          +落在 vllm-ascend V4.1 `load_weights` 的映射表内 |             
+      124  
+      125  ### 3.2 环境侧阻塞
+      126  
+● Update(wiki/worklog_dsv41_rl.md)
+  ⎿  Added 2 lines
+      143  | FSDPTurbo 单测 | `pytest tests/unit_tests/models/test_deepse
+           ek_v41.py` | ✓ 18 passed（`test_engram_parallel.py` 有 3 个失
+           败，已用 `git stash` 确认是**改动前既有失败**，与本次无关） |
+      144  | hydra 配置组装 | 启动脚本 + `--cfg job` | ✓ exit 0；composed
+            配置里 strategy/拓扑/apply_modules/ep_plan/enforce_eager/TP·E
+           P/additional_config 均正确 |
+      145  | DCP 分布式加载可行性 | 读 torch 源码（`state_dict.py` / `_st
+           ate_dict_utils.py` / `_fsdp_param.py`） | ✓ 官方支持 "rank0 CP
+           U full_state + meta 模型 + broadcast_from_rank0 → 按分片物化"
+           ；FSDP2 注册了 `load_state_dict` post-hook 自动 `reset_sharded
+           _param()` |
+      146 +| 构建 → initialize → prepare 全链路（CPU） | `build(experts_m
+          +eta_init=True) → initialize → prepare(cpu)` | ✓ 专家保持 meta 
+          +、其余参数转 bf16 并迁移、14 个 buffer 保持真实值（**由此发现 
+          +并修复 §3.1-13**） |                                          
+      147 +| 权重同步载荷 | `module.state_dict()` 检查 | ✓ 194 项、无 buf
+          +fer、命名均为 checkpoint 风格（`model.layers.N.ffn.experts.E.w
+          +1.weight` 等） |                                              
+      148  
+      149  **尚待真机验证**（NPU 空闲后按顺序执行）：
+      150  1. `torchrun --nproc_per_node=8 scripts/check_dsv41_fsdp_turbo
+           _build.py --forward`（构建 + 加载 + 前向 + 显存报告）
+
+● Update(wiki/worklog_dsv41_rl.md)
+  ⎿  Added 2 lines
+      146  | 构建 → initialize → prepare 全链路（CPU） | `build(experts_m
+           eta_init=True) → initialize → prepare(cpu)` | ✓ 专家保持 meta
+           、其余参数转 bf16 并迁移、14 个 buffer 保持真实值（**由此发现
+           并修复 §3.1-13**） |
+      147  | 权重同步载荷 | `module.state_dict()` 检查 | ✓ 194 项、无 buf
+           fer、命名均为 checkpoint 风格（`model.layers.N.ffn.experts.E.w
+           1.weight` 等） |
+      148  
+      149 +**已尝试但不可行的验证方式**：想用 "2 rank CPU + gloo" 代理验 
+          +证 DCP 的 meta 分片物化机制，实测不可行 —— FSDPTurbo 的并行状 
+          +态与 mesh 绑定**加速器类型**（`init_parallel_state` 按 `torch_
+          +npu` 存在与否建 "npu" mesh），代理测试仍会向 NPU 分配（实测在 
+          +engram 表分片时要求单卡 91.55GB 而 OOM）。结论：这套机制只能在
+          +真机 NPU 上验证。                                             
+      150 +                                                              
+      151  **尚待真机验证**（NPU 空闲后按顺序执行）：
+      152  1. `torchrun --nproc_per_node=8 scripts/check_dsv41_fsdp_turbo
+           _build.py --forward`（构建 + 加载 + 前向 + 显存报告）
+      153  2. `DEVICE=npu bash examples/grpo_trainer/run_deepseek_v41_grp
+           o_fsdp_turbo_npu.sh`（GRPO 端到端）
+
+  Thought for 13s (ctrl+o to expand)
+
+● 补充显存预算的定量分析到工作记录（这决定真机拓扑选择）。
+
+● Update(wiki/worklog_dsv41_rl.md)
+  ⎿  Added 7 lines
+      160  | 风险/待办 | 说明 | 建议 |
+      161  |---|---|---|
+      162  | 显存紧（每卡 ~46GB 峰值） | 专家分片 27GB + 广播临时 18GB（
+           单个 3D 专家张量）+ 稠密参数/激活 | 真机先跑冒烟；不足时考虑 E
+           FSDP>1（需 `EP*EFSDP*EDP=8`）、或分块加载 |
+      163 +| 若加载阶段 OOM：降峰值的三个办法 | ① 把加载拆成 **逐层调用**
+          + `set_model_state_dict`（每次只传该层参数，广播峰值从 18GB 降 
+          +到 18GB/层内不变——单层专家仍是 18GB，收益有限）；② 让每 rank *
+          +*直接读自己的分片**（自行按 `Shard(0)` 切 safetensors，峰值降 
+          +到 ~2.3GB/层，代价是要写分片切片逻辑）；③ 临时降低 EP 并把 `ex
+          +pert_fully_shard_parallel_size` 用起来（**注意**：8 卡下专家总
+          +切分数固定 = EP×EFSDP = 8，每卡仍是 27GB，除非减少参与训练的设
+          +备） | 先按当前实现跑；OOM 时优先做 ② |                       
+      164 +                                                              
+      165 +**显存定量**（8 卡、全卡空闲时）：                            
+      166 +- 专家：108.72B 参数 / 8 = 13.6B ≈ **27GB/卡**（EP/EFSDP 怎么 
+          +拆都一样，8 卡下总切分数固定为 8；EDP 复制只会更差）。        
+      167 +- 稠密：2.65B / 8 ≈ 0.33B ≈ 0.7GB/卡（FSDP 分片，可 CPU offloa
+          +d）。                                                         
+      168 +- 加载广播：单个 3D 专家张量 18.1GB（`384×4608×5120` bf16）** 
+          +每卡瞬时**，DCP 逐 tensor 广播，同一时刻只有一个。            
+      169 +- 因此加载峰值 ≈ **45–50GB/卡**；训练/rollout 阶段靠 `offload_
+          +policy` + vLLM sleep 与 27GB 专家常驻共存。                   
+      170  | 权重同步峰值 | `get_per_tensor_param` 会对每个专家 DTensor 
+           做 `full_tensor()`（18GB/次上卡），再 unfuse | 观察真机显存；
+           必要时用 bucketed 传输/降低并发 |
+      171  | 训练吞吐 | V4.1 参考注意力在 NPU 上走 `indexed_sparse_attent
+           ion_torch`（eager，非 fused DSA）；`use_remove_padding=False` 
+           走 padded | 先正确后快；后续评估 `use_sparse_flash_attn=True` 
+           / packed 路径 |
+      172  | 包副本歧义 | 机器上存在多份 `fsdp_turbo` / `vllm_ascend` 副
+           本，`PYTHONPATH` 决定加载哪份 | 运行脚本显式导出 `PYTHONPATH=/
+           workspace-verl/vllm:/workspace-verl/vllm-ascend-v41-private:/w
+           orkspace-verl/FSDPTurbo` |
+
+  Thought for 6s, searched for 2 patterns, ran 2 shell commands (ctrl+o to expand)
+
+● Update(verl/workers/config/model.py)
+  ⎿  Removed 1 line
+      15  from typing import Any, Optional
+      16  
+      17  from omegaconf import MISSING
+      18 -from transformers import AutoConfig                            
+      18  
+      19  from verl.base_config import BaseConfig
+      20  from verl.utils import hf_processor, hf_tokenizer
+
+  Thought for 4s, ran 1 shell command (ctrl+o to expand)
+
+● 离线阶段收尾：把各项离线自检固化成一个可重跑的脚本，便于后续回归。
+
+● Write(scripts/check_dsv41_offline.py)
+  ⎿  Wrote 186 lines to scripts/check_dsv41_offline.py
+       1 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Re
+       2 #
+       3 # Licensed under the Apache License, Version 2.0 (the "License")
+       4 # you may not use this file except in compliance with the Licens
+         e.
+       6 #
+       7 #     http://www.apache.org/licenses/LICENSE-2.0
+       9 # Unless required by applicable law or agreed to in writing, sof
+         tware
+         IS,
+     … +230 lines (ctrl+o to expand)
+
+  Thought for 10s, ran 2 shell commands (ctrl+o to expand)
+
+● Update(scripts/check_dsv41_offline.py)
+  ⎿  Removed 2 lines
+       94          )
+       95  
+       96      def name_coverage_and_fusion():
+       97 -        import json                                           
+       98 -                                                              
+       97          from safetensors import safe_open
+       98  
+       99          import verl.workers.engine.fsdp.fsdp_turbo_dsv41_impl 
+           as impl
+
+● Update(wiki/verification.md)
+  ⎿  Added 14 lines
+      25  
+      26  ## Phase 1：离线自检（无需 NPU，**已通过**）
+      27  
+      28 +一条命令跑完全部离线检查（5 项，实测 `all offline checks passed
+         +`）：                                                          
+      29 +                                                               
+      30  ```bash
+      31  cd /workspace-verl/verl
+      32 +python3 scripts/check_dsv41_offline.py                         
+      33 +# [ OK ] engine registration — FSDPTurboDSV41EngineWithLMHead  
+      34 +# [ OK ] hf config (vLLM registry fallback) — DeepseekV41Config
+         +, tokenizer vocab=128000                                       
+      35 +# [ OK ] external config -> ModelArgs — n_layers=8, experts=384
+         +, engram=(), dspark=0                                          
+      36 +# [ OK ] checkpoint names + expert fusion — 194 model params: 1
+         +78 direct + expert-fused, 274 unused (vision); byte-exact      
+      37 +# [ OK ] build -> prepare (meta experts) — 16 experts deferred 
+         +to meta, 14 buffers real                                       
+      38 +```                                                            
+      39  
+      40 +以下为等价的分步命令（排查时用）：                             
+      41 +                                                               
+      42 +```bash                                                        
+      43 +cd /workspace-verl/verl                                        
+      44 +                                                               
+      45  # 1. 引擎注册
+      46  python3 -c "from verl.workers.engine import EngineRegistry; pri
+          nt(EngineRegistry.get_engine_cls('language_model','fsdp_turbo_d
+          sv41'))"
+      47  # → FSDPTurboDSV41EngineWithLMHead
+
+  Thought for 3s, ran 1 shell command (ctrl+o to expand)
+
+● Update(wiki/worklog_dsv41_rl.md)
+  ⎿  Added 3 lines
+      133  
+      134  ## 4. 已验证内容（离线，无需 NPU）
+      135  
+      136 +> 一条命令跑完全部离线检查：`cd /workspace-verl/verl && python
+          +3 scripts/check_dsv41_offline.py`（当前 5/5 通过）。          
+      137 +> 下面表格是逐项记录。                                        
+      138 +                                                              
+      139  | 项 | 命令 | 结果 |
+      140  |---|---|---|
+      141  | 引擎注册 | `EngineRegistry.get_engine_cls('language_model','
+           fsdp_turbo_dsv41')` | ✓ 返回 `FSDPTurboDSV41EngineWithLMHead` 
+           |
+
+● Update(wiki/worklog_dsv41_rl.md)
+  ⎿  Added 1 line
+      49  
+      50  ### 1.3 新增脚本与数据
+      51  
+      52 +- `scripts/check_dsv41_offline.py`：**无需 NPU** 的离线自检 5  
+         +项（引擎注册 / HF config / 外部 config / 命名与融合 / build→pre
+         +pare），一条命令回归本次全部离线结论。                         
+      53  - `scripts/check_dsv41_fsdp_turbo_build.py`：**不依赖 Ray/verl 
+          trainer** 的 8 卡冒烟（build → FSDPTurbo 包装 → 分布式加载 → 内
+          存/设备分布报告 → 可选前向）。
+      54  - `examples/grpo_trainer/run_deepseek_v41_grpo_fsdp_turbo_npu.s
+          h`：GRPO 启动脚本。
+      55  - 数据：从 `/mnt/share/m00899630/dapo-math-17k.parquet`（179 万
+          条，标准 verl RL 格式：`data_source/prompt/ability/reward_model
+          /extra_info`）切出
+
+● Update(wiki/README.md)
+  ⎿  Added 2 lines, removed 1 line
+      23  | 3 | `verl/utils/model.py` | 修改 | 新增 `get_auto_config_with
+          _vllm_fallback()`（支持 `deepseek_v4` / `deepseek_v4.1`） |
+      24  | 4 | `verl/workers/config/model.py` | 修改 | `hf_config` 构造
+          改走上述 fallback |
+      25  | 5 | `examples/grpo_trainer/run_deepseek_v41_grpo_fsdp_turbo_n
+          pu.sh` | **重写** | 8 层权重 + 8 卡拓扑 + 修 hydra 语法 |
+      26 -| 6 | `scripts/check_dsv41_fsdp_turbo_build.py` | **新增** | 不
+         -依赖 Ray 的 8 卡构建/加载/前向冒烟 + 显存报告 |                
+      26 +| 6 | `scripts/check_dsv41_offline.py` | **新增** | 无需 NPU 的
+         +离线自检（5 项，当前全通过） |                                 
+      27 +| 6b | `scripts/check_dsv41_fsdp_turbo_build.py` | **新增** |  
+         +不依赖 Ray 的 8 卡构建/加载/前向冒烟 + 显存报告 |              
+      28  | 7 | `FSDPTurbo/fsdp_turbo/models/deepseek_v41/adapter.py` | 
+          修改 | `config_path` / `include_vision` / `max_seq_len` / `expe
+          rts_meta_init` 参数（默认行为不变） |
+      29  | 8 | `FSDPTurbo/fsdp_turbo/models/deepseek_v41/model.py` | 修
+          改 | `ModelArgs.experts_meta_init`；`MoE` 据此把专家建到 meta |
+      30  | 9 | `FSDPTurbo/fsdp_turbo/models/deepseek_v41/experts.py` | 
+          修改 | 支持 `device=` |
+
+  Thought for 14s, ran 1 shell command, recalled 1 memory, wrote 2 memories (ctrl+o to expand)
+
+● 离线阶段完成。以下是本次工作的完整汇报。
+
+  做了什么
+
+  核心目标：让 verl 能用 FSDPTurbo 训练、用 vllm-ascend 推理，对 8 层减层 
+  DeepSeek-V4.1 跑 GRPO。实现过程中发现方案与本地实况有 4
+  处关键差异，都必须动手改：
+
+  方案假设: 结构按 FSDPTurbo 内置 4 层 demo config
+  本地实况: 推理用 8 层权重（8 层/384 专家/无 engram）
+  处理: 训练侧支持外部 config（adapter.py 新增 config_path，HF text_config →
+  ModelArgs）
+  ────────────────────────────────────────
+  方案假设: 每卡构造整模型再分片
+  本地实况: 209GB / 111.4B 参数，单卡 64GB 放不下
+  处理: 专家张量 meta 构造 + DCP 分片加载（rank0 读盘，各 rank 只留分片）
+  ────────────────────────────────────────
+  方案假设: 原实现只回灌随机初始化的 state_dict
+  本地实况: actor/ref 起点与 rollout 不一致
+  处理: 实现 checkpoint 读取 + 专家融合（w1|w3 → gate_up_proj、w2 → down_proj）
+  ────────────────────────────────────────
+  方案假设: 权重流"原生支持"
+  本地实况: verl 的 unfuse_moe_params 只认 .mlp.experts.*；vLLM 要 per-expert
+  w1/w3/w2
+  处理: 补 .ffn.experts.* 分支，否则 vLLM 侧 KeyError
+
+  改动文件：verl 侧 5 个（引擎重写、unfuse 分支、config fallback、GRPO
+  脚本重写等）+ FSDPTurbo 侧 4 个（均可向后兼容）+ 2 个新脚本 + 数据切分（512/64
+  条 dapo-math，reward 走内置 math_dapo）。
+
+  修复的问题中，两个是离线就抓到的真机必崩 bug
+
+  1. prepare_deepseek_v41_model_for_fsdp 抛 Cannot copy out of meta tensor ——
+     该函数逐模块 .to(device)，而延迟到 meta 的专家张量不能迁移；原代码只对
+     engram 特判。已改为 "meta 则原样保留"，并用 CPU 全流程验证。
+  2. expert_ids_per_ep_rank 是普通属性不是 buffer —— meta
+     构造会留下未初始化数据，EP 派发会静默错乱。已在 FSDPTurbo 侧新增
+     refresh_expert_parallel_metadata()，加载后重建。
+
+  另外修了 hydra 语法（JSON blob 的 {} 无法解析、+ 前缀重复）、transformers 不认
+  deepseek_v4.1 的 config 加载、参考模型不接受 position_ids
+  的接口适配。逐条记录在 wiki。
+
+  已验证（离线 5/5 通过）
+
+  python3 scripts/check_dsv41_offline.py
+  [ OK ] engine registration / hf config / external config->ModelArgs
+  [ OK ] checkpoint names + expert fusion — 194 参数全覆盖，融合逐字节相等
+  [ OK ] build -> prepare (meta experts)
+  另有：FSDPTurbo 单测 18 passed、GRPO 脚本 --cfg job 组装通过、state_dict()
+  确认不含 buffer（同步载荷干净）。
+
+  阻塞与下一步
+
+  8 卡真机验证仍被 NPU 占用挡住：卡上是他容器的任务（PID 不在本容器命名空间，显
+  存两次采样完全不变），我不便终止。显存定量结论是每卡加载峰值 ~45–50GB（专家
+  27GB + 广播 18GB），部分空闲的卡放不下。
+
+  你发出信号后我按顺序执行：① torchrun 8 卡构建+加载+前向冒烟（含显存报告）→ ②
+  GRPO 端到端 → ③ 权重同步 logprob 一致性。
+
+  记录位置
+
+  - verl/wiki/worklog_dsv41_rl.md ——
+    工作记录/问题/修复/验证/剩余风险（本次主文档）
+  - verl/wiki/README.md、verification.md —— 改动盘点与验证步骤（已更新）
+  - 另注：仓库根目录有个 2026-09-17-110254-...txt（你之前 /export
+    的产物，未跟踪），如不需要可删。
+
+✻ Cooked for 40m 27s · done 1:04 PM
