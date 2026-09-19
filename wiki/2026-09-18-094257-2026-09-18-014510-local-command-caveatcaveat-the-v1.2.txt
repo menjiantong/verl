@@ -1,0 +1,1399 @@
+ ▐▛███▛█   Claude Code v2.1.271
+▝▜██████▀  deepseek-v4-flash · API Usage Billing
+  ▝▝ ▝▝    /workspace-verl
+
+
+❯ @2026-09-18-014510-local-command-caveatcaveat-the-messages-below.txt          
+  这是之前的对话，继续工作                                                      
+
+  Thought for 14s, read 2 files, listed 3 directories (ctrl+o to expand)
+  ⎿  Loaded verl/CLAUDE.md
+  ⎿  Loaded 2 skills from verl/.claude/skills
+  ⎿  2 skills available
+
+● Let me reconstruct the exact state of things before continuing.
+
+  Thought for 1m 0s, searched for 5 patterns, read 2 files, listed 2 directories, ran 8 shell commands (ctrl+o to expand)
+  ⎿  Loaded vllm/CLAUDE.md
+  ⎿  Loaded vllm/AGENTS.md
+  ⎿  Loaded 1 skill from vllm/.claude/skills
+  ⎿  1 skill available
+
+● Now let me read the vllm-ascend V4.1 model code that owns the destination
+  params.
+
+  Thought for 16s, searched for 4 patterns, read 2 files, ran 1 shell command (ctrl+o to expand)
+  ⎿  Loaded ../../../CLAUDE.md
+
+● Let me look at what names/shapes our side sends.
+
+  Thought for 25s, searched for 3 patterns, read 3 files, ran 3 shell commands (ctrl+o to expand)
+
+● Let me find what the log says right before the failure — which tensor was in
+  flight.
+
+  Thought for 1m 16s, searched for 6 patterns, read 4 files, ran 4 shell commands (ctrl+o to expand)
+
+● Let me look at vllm-ascend's own RL weight-transfer engine to see how it
+  handles this layout.
+
+  Thought for 1m 46s, searched for 6 patterns, read 4 files, listed 1 directory, ran 9 shell commands (ctrl+o to expand)
+
+● Let me assess the layerwise-reload machinery (the framework's supported path)
+  before choosing a fix.
+
+  Thought for 48s, searched for 3 patterns, read 1 file, listed 1 directory, ran 5 shell commands (ctrl+o to expand)
+
+● Root cause is now clear. Let me look at the integration file before patching.
+
+  Thought for 9s, ran 1 shell command (ctrl+o to expand)
+
+● Root cause established. Now let me implement the fix. First the helper module:
+
+  Thought for 5s, ran 2 shell commands (ctrl+o to expand)
+
+● Write(verl/verl/utils/vllm/npu_layerwise_reload.py)
+  ⎿  Wrote 68 lines to verl/verl/utils/vllm/npu_layerwise_reload.py
+       1 # Copyright 2025 Bytedance Ltd. and/or its affiliates
+       3 # Licensed under the Apache License, Version 2.0 (the "License")
+         ;
+       4 # you may not use this file except in compliance with the Licens
+       5 # You may obtain a copy of the License at
+       6 #
+       8 #
+       9 # Unless required by applicable law or agreed to in writing, sof
+         tware
+         IS,
+     … +84 lines (ctrl+o to expand)
+
+● Now wire it into the sync path:
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(verl/verl/workers/rollout/vllm_rollout/utils.py)
+  ⎿  Added 19 lines
+      266              for model in self._iter_all_models():
+      267                  restore_moe_expert_maps(model)
+      268  
+      269 +        # Ascend parameters hold the post-loading inference la
+          +yout once the engine is                                       
+      270 +        # up (the Ascend MoE transposes w13/w2, attention laye
+          +rs reshape their                                              
+      271 +        # weights), while the trainer streams checkpoint-layou
+          +t tensors. Load them                                          
+      272 +        # through vLLM's layerwise reload, which restores the 
+          +recorded pre-processing                                       
+      273 +        # layout and re-applies the transforms in step 3. The 
+          +quantization-specific                                         
+      274 +        # paths below bring their own prepare/finalize pair, a
+          +nd LoRA never sends base                                      
+      275 +        # weights, so those keep their existing handling.     
+      276 +        layerwise_reload = (                                  
+      277 +            is_npu_available                                  
+      278 +            and not self._is_qat_model                        
+      279 +            and not self._is_modelopt_qat                     
+      280 +            and not is_fp8_model(self.model_runner.vllm_config
+          +)                                                             
+      281 +            and not (peft_config and base_sync_done)          
+      282 +        )                                                     
+      283 +        if layerwise_reload:                                  
+      284 +            from verl.utils.vllm.npu_layerwise_reload import b
+          +egin_weight_reload                                            
+      285 +                                                              
+      286 +            begin_weight_reload(self._iter_all_models())      
+      287 +                                                              
+      288          if self._is_qat_model:
+      289              # QAT (compressed-tensors): Prepare for weight loa
+           ding BEFORE receiving any buckets
+      290              from verl.utils.qat import prepare_qat_for_load_we
+           ights
+
+● Now step 3 (finalize instead of the generic post-processing):
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(verl/verl/workers/rollout/vllm_rollout/utils.py)
+  ⎿  Added 4 lines
+      364  
+      365              for model, reload_state in quant_reload_states:
+      366                  process_quanted_weights_after_loading(model, r
+           eload_state)
+      367 +        elif layerwise_reload:                                
+      368 +            from verl.utils.vllm.npu_layerwise_reload import f
+          +inish_weight_reload                                           
+      369 +                                                              
+      370 +            finish_weight_reload(self._iter_all_models_with_co
+          +nfig())                                                       
+      371          else:
+      372              # Some post-load transforms are non-idempotent; ru
+           n once after all buckets.
+      373              from vllm.model_executor.model_loader.utils import
+            process_weights_after_loading
+
+  Thought for 41s, searched for 1 pattern, ran 7 shell commands (ctrl+o to expand)
+
+● Now the buffer-stability issue: the receiver's bucket buffer is reused as soon
+  as the callback returns, while layerwise reload holds tensors until a layer
+  completes. Let me handle that:
+  Read 1 file (ctrl+o to expand)
+
+● Update(verl/verl/workers/rollout/vllm_rollout/utils.py)
+  ⎿  Added 6 lines
+      336                  )
+      337                  lora_weights.clear()
+      338                  return
+      339 +            if layerwise_reload:                              
+      340 +                # Clone: layerwise reload buffers a layer's te
+          +nsors until that layer is                                     
+      341 +                # complete, which can span buckets, and the re
+          +ceiver reuses its bucket                                      
+      342 +                # buffer (and the sender's direct-send storage
+          +) as soon as this                                             
+      343 +                # callback returns.                           
+      344 +                weights = [(name, tensor.clone()) for name, te
+          +nsor in weights]                                              
+      345              self._update_weights(
+      346                  weights,
+      347                  peft_config=peft_config,
+
+  Thought for 10s, ran 2 shell commands (ctrl+o to expand)
+
+● Before the 20-minute run, let me validate the mechanism offline on CPU with a
+  toy module:
+
+● Write(/tmp/test_layerwise_reload.py)
+  ⎿  Wrote 93 lines to ../tmp/test_layerwise_reload.py
+       1 """Offline sanity check of vLLM's layerwise reload for the Ascen
+       2 
+       3 Mirrors what our rollout worker will do:
+       4   init:   record metadata -> create/load weights -> process_weig
+       5   sync:   initialize_layerwise_reload -> load checkpoint-layout 
+         tensors -> finalize_layerwise_reload
+         oaded values.
+       7 """
+       8 
+      10 import torch.nn as nn
+     … +105 lines (ctrl+o to expand)
+
+  Thought for 2s, ran 1 shell command (ctrl+o to expand)
+
+● Update(/tmp/test_layerwise_reload.py)
+  ⎿  Added 1 line, removed 1 line
+      50  
+      51  def checkpoint_tensors(model):
+      52      """Checkpoint layout, i.e. what the trainer streams during 
+          a sync."""
+      53 -    w13 = torch.arange(2 * 4 * 8, dtype=torch.float32).reshape(
+         -2, 8, 8) / 100                                                 
+      53 +    w13 = torch.arange(2 * 8 * 8, dtype=torch.float32).reshape(
+         +2, 8, 8) / 100                                                 
+      54      w2 = torch.arange(2 * 8 * 4, dtype=torch.float32).reshape(2
+          , 8, 4) / 100
+      55      return w13, w2
+      56  
+
+  Thought for 12s, ran 1 shell command (ctrl+o to expand)
+
+● The framework only re-applies transforms via quant_method; my toy needs a real
+  QuantizeMethodBase. Let me check the ABC:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Update(/tmp/test_layerwise_reload.py)
+  ⎿  Added 19 lines, removed 4 lines
+       9  import torch
+      10  import torch.nn as nn
+      11  
+      12 +from vllm.model_executor.layers.quantization.base_config import
+         + QuantizeMethodBase                                            
+      13  from vllm.model_executor.model_loader.reload import (
+      14      finalize_layerwise_reload,
+      15      initialize_layerwise_reload,
+     ...
+      22      param.data.copy_(loaded_weight)
+      23  
+      24  
+      25 +class ToyAscendMoEMethod(QuantizeMethodBase):                  
+      26 +    """Stands in for AscendUnquantizedFusedMoEMethod: transpose
+         +s w13/w2 after loading."""                                     
+      27 +                                                               
+      28 +    def create_weights(self, layer, *args, **kwargs):          
+      29 +        raise NotImplementedError                              
+      30 +                                                               
+      31 +    def apply(self, layer, *args, **kwargs):                   
+      32 +        raise NotImplementedError                              
+      33 +                                                               
+      34 +    def process_weights_after_loading(self, layer):            
+      35 +        # Non-idempotent, exactly like the Ascend MoE transpose
+         +.                                                              
+      36 +        layer.w13_weight.data = layer.w13_weight.data.transpose
+         +(1, 2).contiguous()                                            
+      37 +        layer.w2_weight.data = layer.w2_weight.data.transpose(1
+         +, 2).contiguous()                                              
+      38 +                                                               
+      39 +                                                               
+      40  class ToyAscendMoE(nn.Module):
+      41      """Stands in for RoutedExperts: fused w13 + w2, transposed 
+          after loading."""
+      42  
+      43      def __init__(self):
+      44          super().__init__()
+      29 -        self.quant_method = self                               
+      45 +        self.quant_method = ToyAscendMoEMethod()               
+      46          self.num_local_experts = 2
+      47          self.intermediate = 4
+      48          self.hidden = 8
+     ...
+      53          w2.weight_loader = default_loader
+      54          self.register_parameter("w2_weight", w2)
+      55  
+      40 -    def process_weights_after_loading(self, layer):            
+      41 -        layer.w13_weight.data = layer.w13_weight.data.transpose
+         -(1, 2).contiguous()                                            
+      42 -        layer.w2_weight.data = layer.w2_weight.data.transpose(1
+         -, 2).contiguous()                                              
+      56 +    def post_load(self):                                       
+      57 +        self.quant_method.process_weights_after_loading(self)  
+      58  
+      59  
+      60  class ToyModel(nn.Module):
+
+  Thought for 5s, ran 2 shell commands (ctrl+o to expand)
+
+● The offline round-trip passes. Now let me check state and launch a validation
+  run:
+
+  Thought for 8s, ran 2 shell commands (ctrl+o to expand)
+
+● Launching a validation run (random-init to skip the ~18 min checkpoint IO):
+
+  Thought for 5s, ran 1 shell command (ctrl+o to expand)
+
+● While the run proceeds, let me record the finding in the worklog:
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(verl/wiki/worklog_dsv41_rl.md)
+  ⎿  Added 8 lines
+      209  
+      210  > 至此 rollout 侧的启动路径（vLLM 引擎 → sleep → wake_up → 权
+           重同步入口）已经打通到 `update_weights` 之前。
+      211  
+      212 +| # | 现象 | 根因 | 修复 |                                    
+      213 +|---|---|---|---|                                             
+      214 +| G9 | 首次权重同步（`update_weights` → `model.load_weights(pa
+          +ram_updates)`）时 8 卡同时崩：`Invalid_Argument_Tensor_Input_S
+          +hape(EZ1007): ... The size of tensor self [2304, 4608] must ma
+          +tch the size of tensor src [2304, 5120]`，栈底为 `routed_exper
+          +ts.py::_load_w13` 的 `expert_data.copy_(loaded_weight)` | 引擎
+          +初始化时 `process_weights_after_loading` 把 Ascend 侧的参数换 
+          +成了**推理布局**：Ascend MoE 把融合专家权重转置（`w13_weight`:
+          + `[E, 2*inter, hidden]` → `[E, hidden, 2*inter]`，`w2_weight` 
+          +同理），attention 层还会 reshape（`kv_b_proj.weight` 变 3D + F
+          +RACTAL_ND）。而 `RoutedExperts.weight_loader` 与训练侧张量都按
+          + checkpoint 布局工作（单专家 `w1`/`w3` = `[inter, hidden]`）。
+          +在转置后的参数上，loader 对 `shard_dim=0`（此时是 `hidden=5120
+          +`）取 `shard_size=2560`，再被 `_narrow_expert_data_for_padding
+          +` 修剪到入参 dim0（2304），得到 `[2304, 4608]`（4608 = `2*inte
+          +r`）——与入参 `[2304, 5120]` 永久不匹配（`4608` 正好等于 `2*moe
+          +_intermediate_size`，是定位该问题的指纹） | 改用 vLLM 官方的**
+          +分层重载**：同步前 `initialize_layerwise_reload(model)`（各层 
+          +恢复到「`process_weights_after_loading` 之前」记录的布局并包裹
+          + loader），全部 bucket 收完后用 `finalize_layerwise_reload(mod
+          +el, model_config)` 取代原来的 `process_weights_after_loading` 
+          +（它按层重新执行后处理，再把结果写回原 tensor 存储，保住图/显 
+          +存引用）。这正是上游 CUDA IPC 权重传输引擎在 `start_weight_upd
+          +ate`/`finish_weight_update` 里做的同一对调用（vllm-ascend 的 N
+          +PU IPC 引擎这两个钩子是 no-op，所以照抄其它量化分支的做法在这 
+          +里行不通）。新增 `verl/utils/vllm/npu_layerwise_reload.py`，接
+          +入点 `verl/workers/rollout/vllm_rollout/utils.py` 的 step 1 / 
+          +step 3（限 NPU、非 QAT/FP8、非 LoRA） |                       
+      215 +                                                              
+      216 +> 附带修正（同一处）：分层重载会把一个层的张量缓存到该层收全为
+          +止（可能跨多个 bucket），而接收端 bucket buffer 与 direct-send
+          + 的 IPC 存储在本轮回调返回后立即被复用（发送端等 ack 即覆写同 
+          +一块 buffer），因此该路径下对入参做一次 `clone()`——与 LoRA 分 
+          +支（#6454）同样的处理。                                       
+      217 +                                                              
+      218 +> **离线验证**：`/tmp/test_layerwise_reload.py`（玩具模块：`Qu
+          +antizeMethodBase` + 非幂等转置）在 CPU 上跑通「初始化 → 后处理
+          +转置 → 分层重载 → 新值按转置布局落盘」的往返，证明该机制能把 c
+          +heckpoint 布局的权重装进后处理过的参数。真机验证见下。        
+      219 +                                                              
+      220  ---
+      221  
+      222  ## 5. 剩余风险与待办
+
+  Thought for 36s, ran 9 shell commands (ctrl+o to expand)
+
+● The random-init path is CPU-bound generating 209GB of random experts — slower
+  than the checkpoint read. Let me kill it and use the real checkpoint:
+
+  Thought for 14s, ran 5 shell commands (ctrl+o to expand)
+
+● While that runs, let me add a repo test for the new helper:
+
+● Write(verl/verl/tests/utils/test_npu_layerwise_reload_on_cpu.py)
+  ⎿  Wrote 154 lines to
+     verl/verl/tests/utils/test_npu_layerwise_reload_on_cpu.py
+       1 # Copyright 2026 Bytedance Ltd. and/or its affiliates
+       3 # Licensed under the Apache License, Version 2.0 (the "License")
+         ;
+       4 # you may not use this file except in compliance with the Licens
+       5 # You may obtain a copy of the License at
+       6 #
+       8 #
+       9 # Unless required by applicable law or agreed to in writing, sof
+         tware
+         IS,
+     … +183 lines (ctrl+o to expand)
+
+  Thought for 14s, listed 1 directory, ran 3 shell commands (ctrl+o to expand)
+
+● 3/3 tests pass. Checking the run:
+
+  Thought for 23s, read 1 file, ran 5 shell commands (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
+
+● Background shell command didn't finish before the previous session ended
+
+  Thought for 3s, ran 1 shell command (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ /export                                                                       
+  ⎿  Conversation exported to: /workspace-verl/2026-09-18-060927-2026-09-18-0145
+     10-local-command-caveatcaveat-the-1.1.txt
+
+❯ 继续                                                                          
+  Thought for 6s, ran 1 shell command (ctrl+o to expand)
+
+● The previous session's teardown killed the run (log stops at 04:17, no
+  processes). Let me check for any error, then relaunch detached so it survives:
+
+  Thought for 3s, ran 1 shell command (ctrl+o to expand)
+
+● NPUs are free. Relaunching in its own session so it survives teardown:
+
+  Thought for 12s, ran 1 shell command (ctrl+o to expand)
+
+● Run relaunched in its own session (log:
+  logs/deepseek_v41-8layer-20260918_061627.log). Waiting for the engines to load
+  and reach the weight sync:
+
+  Thought for 3s, read 1 file, ran 1 shell command (ctrl+o to expand)
+  ⎿  Loaded verl/CLAUDE.md
+  ⎿  Loaded 2 skills from verl/.claude/skills
+
+● Update(verl/wiki/worklog_dsv41_rl.md)
+  ⎿  Added 2 lines
+      248  python3 -c "from verl.workers.engine import EngineRegistry; pr
+           int(EngineRegistry.get_engine_cls('language_model','fsdp_turbo
+           _dsv41'))"
+      249  env DEVICE=npu bash examples/grpo_trainer/run_deepseek_v41_grp
+           o_fsdp_turbo_npu.sh --cfg job | tail -5
+      250  python3 -m pytest /workspace-verl/FSDPTurbo/tests/unit_tests/m
+           odels/test_deepseek_v41.py -q
+      251 +# G9 修复的 CPU 回归（分层重载：后处理过的参数接受 checkpoint 
+          +布局的权重）                                                  
+      252 +PYTHONPATH=/workspace-verl/vllm python3 -m pytest tests/utils/
+          +test_npu_layerwise_reload_on_cpu.py -q                        
+      253  
+      254  # 真机 8 卡冒烟（NPU 空闲时）
+      255  cd /workspace-verl/verl
+  ⎿  2 skills available
+
+  Thought for 20s, ran 5 shell commands (ctrl+o to expand)
+
+● Real progress — expert weights now load; the failure moved to a different
+  layer's kernel-tensor restore. Let me find which parameter:
+
+  Thought for 40s, searched for 4 patterns, ran 4 shell commands (ctrl+o to expand)
+
+● Let me identify the parameter by scanning the checkpoint headers (cheap —
+  headers only):
+
+  Thought for 28s, searched for 1 pattern, listed 1 directory, ran 1 shell command (ctrl+o to expand)
+
+● Let me instrument the layerwise reload (temporary, revertible) to reveal the
+  parameter and all shape mismatches in one run:
+
+  Read 1 file (ctrl+o to expand)
+  ⎿  Loaded vllm/CLAUDE.md
+  ⎿  Loaded vllm/AGENTS.md
+  ⎿  Loaded 1 skill from vllm/.claude/skills
+  ⎿  1 skill available
+
+● Update(vllm/vllm/model_executor/model_loader/reload/layerwise.py)
+  ⎿  Added 2 lines
+      373      # Copy processed values into original tensor storage (pres
+           erves cudagraph refs)
+      374      # this code is a no-op if not reloading (because kernel te
+           nsors is empty)
+      375      if info.kernel_tensors is not None:
+      376 +        if os.environ.get("VLLM_RELOAD_DEBUG"):               
+      377 +            _reload_debug_dump(layer, info)                   
+      378          _copy_and_restore_kernel_tensors(layer, info)
+      379  
+      380      info.reset()
+
+● Update(vllm/vllm/model_executor/model_loader/reload/layerwise.py)
+  ⎿  Added 29 lines, removed 1 line
+      394      return getattr(tensor, "weight_loader", default_weight_loa
+           der)
+      395  
+      396  
+      397 +def _reload_debug_dump(layer: torch.nn.Module, info: LayerRelo
+          +adingInfo):                                                   
+      398 +    """TEMPORARY diagnostic: report kernel vs reloaded shapes 
+          +per parameter."""                                             
+      399 +    parameters, buffers = info.kernel_tensors or ({}, {})     
+      400 +    for name, kernel in parameters.items():                   
+      401 +        try:                                                  
+      402 +            reloaded = getattr(layer, name)                   
+      403 +        except AttributeError:                                
+      404 +            print(f"[reload-debug] {type(layer).__name__}.{nam
+          +e}: MISSING after reload", flush=True)                        
+      405 +            continue                                          
+      406 +        kernel_shape = tuple(kernel.shape)                    
+      407 +        reloaded_shape = tuple(reloaded.shape)                
+      408 +        flag = "OK " if kernel_shape == reloaded_shape else "M
+          +ISMATCH"                                                      
+      409 +        print(                                                
+      410 +            f"[reload-debug] {flag} {type(layer).__module__}.{
+          +type(layer).__name__}.{name}: "                               
+      411 +            f"kernel {kernel_shape} reloaded {reloaded_shape}"
+          +,                                                             
+      412 +            flush=True,                                       
+      413 +        )                                                     
+      414 +    _ = buffers                                               
+      415 +                                                              
+      416 +                                                              
+      417  def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, i
+           nfo: LayerReloadingInfo):
+      418      """Copy processed values into original kernel tensor stora
+           ge and restore
+      419      kernel tensor references on the layer. Preserves cudagraph
+            references."""
+     ...
+      422      non_persistent = info.kernel_non_persistent_buffers
+      423      loaded_tensor_names = {name for name, _ in info.loaded_wei
+           ghts}
+      424      for name, param in parameters.items():
+      405 -        param.data.copy_(getattr(layer, name))                
+      425 +        reloaded = getattr(layer, name)                       
+      426 +        if tuple(param.shape) != tuple(reloaded.shape):       
+      427 +            print(                                            
+      428 +                f"[reload-debug] SKIP {type(layer).__name__}.{
+          +name}: kernel {tuple(param.shape)} "                          
+      429 +                f"reloaded {tuple(reloaded.shape)}",          
+      430 +                flush=True,                                   
+      431 +            )                                                 
+      432 +            continue                                          
+      433 +        param.data.copy_(reloaded)                            
+      434      for name, buffer in buffers.items():
+      435          if name not in layer._buffers:
+      436              continue
+
+  Thought for 3s, ran 1 shell command (ctrl+o to expand)
+
+● Update(vllm/vllm/model_executor/model_loader/reload/layerwise.py)
+  ⎿  Added 1 line
+      1  # SPDX-License-Identifier: Apache-2.0
+      2  # SPDX-FileCopyrightText: Copyright contributors to the vLLM pro
+         ject
+      3  import inspect
+      4 +import os                                                       
+      5  from collections.abc import Callable
+      6  from functools import wraps
+      7  from weakref import WeakKeyDictionary, WeakSet
+
+  Thought for 1m 19s, searched for 5 patterns, ran 10 shell commands (ctrl+o to expand)
+
+● Two runs collided — Run B (06:16, setsid) was still alive holding the NPUs.
+  Let me inspect both logs:
+
+  Thought for 3s, ran 1 shell command (ctrl+o to expand)
+
+● Run C died because Run B's orphaned workers still held the NPUs. Cleaning up
+  all leftovers:
+
+  Thought for 4s, ran 1 shell command (ctrl+o to expand)
+
+● Cleanup done (NPUs free — that kill list was broad and included idle Ray
+  workers from our dead runs; I'll flag it in my summary). Relaunching the
+  instrumented run:
+
+  Thought for 1m 31s, searched for 2 patterns, ran 7 shell commands (ctrl+o to expand)
+
+● Let me read the Ascend TP-weight-switch mechanism — it looks central to how RL
+  reloads are meant to work here:
+
+  Thought for 18s, searched for 1 pattern, ran 2 shell commands (ctrl+o to expand)
+● Meanwhile, let me implement the revised fix (targeted layout revert + the
+  Ascend loaders' own reload handling):
+
+● Write(verl/verl/utils/vllm/npu_layerwise_reload.py)
+  ⎿  Added 36 lines, removed 42 lines
+      12  # See the License for the specific language governing permissio
+          ns and
+      13  # limitations under the License.
+      14  
+      15 -"""Ascend weight sync: load checkpoint-layout tensors into post
+         --loaded parameters.                                            
+      15 +"""Ascend weight sync: put the fused MoE expert weights back in
+         +to checkpoint layout.                                          
+      16  
+      17 -``process_weights_after_loading`` leaves the Ascend model in it
+         -s inference layout,                                            
+      18 -which is not the layout the checkpoint (and therefore the train
+         -er) speaks. The                                                
+      19 -fused MoE expert weights are the clearest case: the Ascend MoE 
+         -method transposes                                              
+      20 -``w13_weight`` from ``[E, 2 * intermediate, hidden]`` to ``[E, 
+         -hidden, 2 *                                                    
+      21 -intermediate]`` (and ``w2_weight`` from ``[E, hidden, intermedi
+         -ate]`` to ``[E,                                                
+      22 -intermediate, hidden]``), while ``RoutedExperts.weight_loader``
+         - and the trainer's                                             
+      23 -per-expert ``w1``/``w3``/``w2`` tensors are both in checkpoint 
+         -orientation. Loading                                           
+      24 -straight into the transposed parameter narrows the wrong dimens
+         -ion: the loader                                                
+      25 -takes the first half of ``hidden`` and then trims it to the inc
+         -oming                                                          
+      26 -``intermediate``, so the copy cannot match and the engine dies 
+         -with a shape error                                             
+      27 -during the first weight sync. Attention layers have their own p
+         -ost-loading                                                    
+      28 -reshapes, so this is not specific to the MoE.                  
+      17 +``AscendUnquantizedFusedMoEMethod.process_weights_after_loading
+         +`` transposes the fused                                        
+      18 +expert weights into the inference layout -- ``w13_weight`` from
+         + ``[E, 2 * intermediate,                                       
+      19 +hidden]`` to ``[E, hidden, 2 * intermediate]``, ``w2_weight`` f
+         +rom ``[E, hidden,                                              
+      20 +intermediate]`` to ``[E, intermediate, hidden]``. ``RoutedExper
+         +ts.weight_loader`` and                                         
+      21 +the trainer's per-expert ``w1``/``w3``/``w2`` tensors are both 
+         +in checkpoint                                                  
+      22 +orientation, so loading a sync bucket into the transposed param
+         +eter narrows the wrong                                         
+      23 +dimension (half of ``hidden`` instead of ``intermediate``) and 
+         +the copy fails with a                                          
+      24 +shape error on the first weight sync.                          
+      25  
+      30 -vLLM's layerwise reload is the supported way through: it restor
+         -es each layer to the                                           
+      31 -layout recorded before ``process_weights_after_loading`` ran, s
+         -treams the incoming                                            
+      32 -weights into that layout, and re-applies every post-loading tra
+         -nsform before                                                  
+      33 -copying the result back into the original tensor storage (which
+         - also keeps the                                                
+      34 -storage addresses that graphs and sleep/wake bookkeeping depend
+         - on). The upstream                                             
+      35 -CUDA IPC weight-transfer engine drives the same pair from      
+      36 -``start_weight_update``/``finish_weight_update``.              
+      26 +Ascend's other linears handle a reload themselves: their loader
+         +s accept the checkpoint                                        
+      27 +layout and re-apply whatever layout the kernel wants (``AscendC
+         +olumnParallelLinear``                                          
+      28 +reshapes ``wo_a`` to ``[n_local_groups, ., o_lora_rank]`` in pl
+         +ace), and the runtime                                          
+      29 +performs the TP-weight switch from the layer's own state, which
+         + is why only the MoE                                           
+      30 +parameters need to be reverted here. vLLM re-runs ``process_wei
+         +ghts_after_loading``                                           
+      31 +after the sync (see ``update_weights_from_ipc`` step 3), which 
+         +transposes the experts                                         
+      32 +back into the inference layout.                                
+      33  """
+      34  
+      35  import logging
+     ...
+      37  logger = logging.getLogger(__file__)
+      38  
+      39  
+      44 -def begin_weight_reload(models) -> None:                       
+      45 -    """Put ``models`` into their pre-``process_weights_after_lo
+         -ading`` layout.                                                
+      40 +def restore_expert_checkpoint_layout(models) -> int:           
+      41 +    """Undo the Ascend MoE expert transpose on every layer of `
+         +`models``.                                                     
+      42  
+      47 -    Must be called before the trainer's tensors are loaded; eve
+         -ry call must be                                                
+      48 -    paired with :func:`finish_weight_reload`. Idempotent for al
+         -ready-prepared                                                 
+      49 -    layers, so a retried sync is safe.                         
+      43 +    Returns the number of modules whose parameters were reverte
+         +d. Modules whose expert                                        
+      44 +    weights are already in checkpoint layout (or that are not f
+         +used-MoE modules at all)                                       
+      45 +    are left untouched, so calling this repeatedly is safe.    
+      46      """
+      51 -    from vllm.model_executor.model_loader.reload import initial
+         -ize_layerwise_reload                                           
+      52 -                                                               
+      47 +    reverted = 0                                               
+      48      for model in models:
+      54 -        initialize_layerwise_reload(model)                     
+      55 -    logger.info("Layerwise reload initialized for weight sync")
+      56 -                                                               
+      57 -                                                               
+      58 -def finish_weight_reload(models_with_config) -> None:          
+      59 -    """Re-apply the post-loading transforms and restore the inf
+         -erence layout.                                                 
+      60 -                                                               
+      61 -    ``models_with_config`` yields ``(model, model_config)`` pai
+         -rs, matching the                                               
+      62 -    signature ``finalize_layerwise_reload`` expects.           
+      63 -    """                                                        
+      64 -    from vllm.model_executor.model_loader.reload import finaliz
+         -e_layerwise_reload                                             
+      65 -                                                               
+      66 -    for model, model_config in models_with_config:             
+      67 -        finalize_layerwise_reload(model, model_config)         
+      68 -    logger.info("Layerwise reload finalized for weight sync")  
+      49 +        for module in model.modules():                         
+      50 +            w13 = getattr(module, "w13_weight", None)          
+      51 +            w2 = getattr(module, "w2_weight", None)            
+      52 +            if w13 is None or w2 is None or w13.dim() != 3 or w
+         +2.dim() != 3:                                                  
+      53 +                continue                                       
+      54 +            # Inference layout: w13 [E, hidden, 2i], w2 [E, i, 
+         +hidden]; the checkpoint                                        
+      55 +            # layout pairs w13.shape[2] with w2.shape[1] instea
+         +d.                                                             
+      56 +            if w13.shape[1] == w2.shape[2] and w13.shape[2] == 
+         +2 * w2.shape[1]:                                               
+      57 +                module.w13_weight.data = w13.data.transpose(1, 
+         +2).contiguous()                                                
+      58 +                module.w2_weight.data = w2.data.transpose(1, 2)
+         +.contiguous()                                                  
+      59 +                reverted += 1                                  
+      60 +    if reverted:                                               
+      61 +        logger.info("Ascend MoE: reverted %d fused expert weigh
+         +ts to checkpoint layout", reverted)                            
+      62 +    return reverted                                            
+
+  Thought for 12s, searched for 1 pattern, ran 1 shell command (ctrl+o to expand)
+
+● Update(verl/verl/workers/rollout/vllm_rollout/utils.py)
+  ⎿  Added 9 lines, removed 17 lines
+      266              for model in self._iter_all_models():
+      267                  restore_moe_expert_maps(model)
+      268  
+      269 -        # Ascend parameters hold the post-loading inference la
+          -yout once the engine is                                       
+      270 -        # up (the Ascend MoE transposes w13/w2, attention laye
+          -rs reshape their                                              
+      271 -        # weights), while the trainer streams checkpoint-layou
+          -t tensors. Load them                                          
+      272 -        # through vLLM's layerwise reload, which restores the 
+          -recorded pre-processing                                       
+      273 -        # layout and re-applies the transforms in step 3. The 
+          -quantization-specific                                         
+      274 -        # paths below bring their own prepare/finalize pair, a
+          -nd LoRA never sends base                                      
+      275 -        # weights, so those keep their existing handling.     
+      276 -        layerwise_reload = (                                  
+      277 -            is_npu_available                                  
+      278 -            and not self._is_qat_model                        
+      279 -            and not self._is_modelopt_qat                     
+      280 -            and not is_fp8_model(self.model_runner.vllm_config
+          -)                                                             
+      281 -            and not (peft_config and base_sync_done)          
+      282 -        )                                                     
+      283 -        if layerwise_reload:                                  
+      284 -            from verl.utils.vllm.npu_layerwise_reload import b
+          -egin_weight_reload                                            
+      269 +        # Ascend leaves the fused MoE expert weights in a tran
+          +sposed inference layout                                       
+      270 +        # (w13 [E, hidden, 2*inter], w2 [E, inter, hidden]); t
+          +he expert loaders and the                                     
+      271 +        # trainer's per-expert tensors are checkpoint layout, 
+          +so revert before the load.                                    
+      272 +        # The Ascend linears re-apply their own layouts while 
+          +loading (wo_a, ...) and                                       
+      273 +        # step 3 re-runs process_weights_after_loading, which 
+          +transposes the experts                                        
+      274 +        # back for the kernels.                               
+      275 +        if is_npu_available and not (peft_config and base_sync
+          +_done):                                                       
+      276 +            from verl.utils.vllm.npu_expert_layout import rest
+          +ore_expert_checkpoint_layout                                  
+      277  
+      286 -            begin_weight_reload(self._iter_all_models())      
+      278 +            restore_expert_checkpoint_layout(self._iter_all_mo
+          +dels())                                                       
+      279  
+      280          if self._is_qat_model:
+      281              # QAT (compressed-tensors): Prepare for weight loa
+           ding BEFORE receiving any buckets
+
+● Update(verl/verl/workers/rollout/vllm_rollout/utils.py)
+  ⎿  Removed 6 lines
+      328                  )
+      329                  lora_weights.clear()
+      330                  return
+      331 -            if layerwise_reload:                              
+      332 -                # Clone: layerwise reload buffers a layer's te
+          -nsors until that layer is                                     
+      333 -                # complete, which can span buckets, and the re
+          -ceiver reuses its bucket                                      
+      334 -                # buffer (and the sender's direct-send storage
+          -) as soon as this                                             
+      335 -                # callback returns.                           
+      336 -                weights = [(name, tensor.clone()) for name, te
+          -nsor in weights]                                              
+      331              self._update_weights(
+      332                  weights,
+      333                  peft_config=peft_config,
+
+● Update(verl/verl/workers/rollout/vllm_rollout/utils.py)
+  ⎿  Removed 4 lines
+      356  
+      357              for model, reload_state in quant_reload_states:
+      358                  process_quanted_weights_after_loading(model, r
+           eload_state)
+      359 -        elif layerwise_reload:                                
+      360 -            from verl.utils.vllm.npu_layerwise_reload import f
+          -inish_weight_reload                                           
+      361 -                                                              
+      362 -            finish_weight_reload(self._iter_all_models_with_co
+          -nfig())                                                       
+      359          else:
+      360              # Some post-load transforms are non-idempotent; ru
+           n once after all buckets.
+      361              from vllm.model_executor.model_loader.utils import
+            process_weights_after_loading
+
+● Now rewrite the CPU test for the layout revert:
+
+● Write(verl/tests/utils/test_npu_expert_layout_on_cpu.py)
+  ⎿  Wrote 126 lines to verl/tests/utils/test_npu_expert_layout_on_cpu.py
+       1 # Copyright 2026 Bytedance Ltd. and/or its affiliates
+       3 # Licensed under the Apache License, Version 2.0 (the "License")
+         ;
+       4 # you may not use this file except in compliance with the Licens
+       5 # You may obtain a copy of the License at
+       6 #
+       8 #
+       9 # Unless required by applicable law or agreed to in writing, sof
+         tware
+         IS,
+     … +148 lines (ctrl+o to expand)
+
+  Thought for 4s, ran 1 shell command (ctrl+o to expand)
+
+● Update(verl/tests/utils/test_npu_expert_layout_on_cpu.py)
+  ⎿  Added 13 lines, removed 5 lines
+      114      torch.testing.assert_close(experts.w2_weight.data, new_w2.
+           transpose(1, 2).contiguous())
+      115  
+      116  
+      117 -def test_loader_shape_mismatch_is_what_the_revert_avoids():   
+      118 -    """The transposed parameter cannot take a checkpoint-layou
+          -t expert slice."""                                            
+      117 +def test_loader_copy_fails_on_the_inference_layout():         
+      118 +    """The failure the revert avoids: the loader's slice does 
+          +not fit the transpose."""                                     
+      119      model = _ToyModel()
+      120      experts = model.layers["experts"]
+      121      experts.process_weights_after_loading()
+      122  
+      123 -    slice_w13 = torch.zeros(INTERMEDIATE, HIDDEN)             
+      123 +    # RoutedExperts._load_w13 narrows the fused (dim 0) half a
+          +nd then copies the                                            
+      124 +    # [intermediate, hidden] checkpoint slice into it. On the 
+          +inference layout the                                          
+      125 +    # narrowed view is [E, intermediate, hidden] while the sli
+          +ce is [E, hidden,                                             
+      126 +    # intermediate], which cannot broadcast -- the sync dies h
+          +ere without the revert.                                       
+      127 +    narrowed = experts.w13_weight.data[:, :INTERMEDIATE]      
+      128      with pytest.raises(RuntimeError):
+      125 -        # Mirrors RoutedExperts._load_w13's narrow-then-copy o
+          -n the inference layout.                                       
+      126 -        experts.w13_weight.data[:, :INTERMEDIATE].copy_(slice_
+          -w13)                                                          
+      129 +        narrowed.copy_(torch.zeros(NUM_EXPERTS, HIDDEN, INTERM
+          +EDIATE))                                                      
+      130 +                                                              
+      131 +    restore_expert_checkpoint_layout([model])                 
+      132 +    experts.w13_weight.data[:NUM_EXPERTS, :INTERMEDIATE].copy_
+          +(                                                             
+      133 +        torch.zeros(NUM_EXPERTS, INTERMEDIATE, HIDDEN)        
+      134 +    )                                                         
+
+  Thought for 11s, ran 2 shell commands (ctrl+o to expand)
+
+● The current in-flight run uses the layerwise path I've now replaced; let me
+  stop it and launch the revised fix (careful, targeted kill this time):
+
+  Thought for 13s, ran 3 shell commands (ctrl+o to expand)
+
+● While the run proceeds, let me correct the worklog to reflect the final fix:
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(verl/wiki/worklog_dsv41_rl.md)
+  ⎿  Added 3 lines, removed 3 lines
+      211  
+      212  | # | 现象 | 根因 | 修复 |
+      213  |---|---|---|---|
+      214 -| G9 | 首次权重同步（`update_weights` → `model.load_weights(pa
+          -ram_updates)`）时 8 卡同时崩：`Invalid_Argument_Tensor_Input_S
+          -hape(EZ1007): ... The size of tensor self [2304, 4608] must ma
+          -tch the size of tensor src [2304, 5120]`，栈底为 `routed_exper
+          -ts.py::_load_w13` 的 `expert_data.copy_(loaded_weight)` | 引擎
+          -初始化时 `process_weights_after_loading` 把 Ascend 侧的参数换 
+          -成了**推理布局**：Ascend MoE 把融合专家权重转置（`w13_weight`:
+          - `[E, 2*inter, hidden]` → `[E, hidden, 2*inter]`，`w2_weight` 
+          -同理），attention 层还会 reshape（`kv_b_proj.weight` 变 3D + F
+          -RACTAL_ND）。而 `RoutedExperts.weight_loader` 与训练侧张量都按
+          - checkpoint 布局工作（单专家 `w1`/`w3` = `[inter, hidden]`）。
+          -在转置后的参数上，loader 对 `shard_dim=0`（此时是 `hidden=5120
+          -`）取 `shard_size=2560`，再被 `_narrow_expert_data_for_padding
+          -` 修剪到入参 dim0（2304），得到 `[2304, 4608]`（4608 = `2*inte
+          -r`）——与入参 `[2304, 5120]` 永久不匹配（`4608` 正好等于 `2*moe
+          -_intermediate_size`，是定位该问题的指纹） | 改用 vLLM 官方的**
+          -分层重载**：同步前 `initialize_layerwise_reload(model)`（各层 
+          -恢复到「`process_weights_after_loading` 之前」记录的布局并包裹
+          - loader），全部 bucket 收完后用 `finalize_layerwise_reload(mod
+          -el, model_config)` 取代原来的 `process_weights_after_loading` 
+          -（它按层重新执行后处理，再把结果写回原 tensor 存储，保住图/显 
+          -存引用）。这正是上游 CUDA IPC 权重传输引擎在 `start_weight_upd
+          -ate`/`finish_weight_update` 里做的同一对调用（vllm-ascend 的 N
+          -PU IPC 引擎这两个钩子是 no-op，所以照抄其它量化分支的做法在这 
+          -里行不通）。新增 `verl/utils/vllm/npu_layerwise_reload.py`，接
+          -入点 `verl/workers/rollout/vllm_rollout/utils.py` 的 step 1 / 
+          -step 3（限 NPU、非 QAT/FP8、非 LoRA） |                       
+      214 +| G9 | 首次权重同步（`update_weights` → `model.load_weights(pa
+          +ram_updates)`）时 8 卡同时崩：`Invalid_Argument_Tensor_Input_S
+          +hape(EZ1007): ... The size of tensor self [2304, 4608] must ma
+          +tch the size of tensor src [2304, 5120]`，栈底为 `routed_exper
+          +ts.py::_load_w13` 的 `expert_data.copy_(loaded_weight)` | 引擎
+          +初始化时 `process_weights_after_loading` 把 Ascend 侧的参数换 
+          +成了**推理布局**：Ascend MoE 把融合专家权重转置（`w13_weight`:
+          + `[E, 2*inter, hidden]` → `[E, hidden, 2*inter]`，`w2_weight` 
+          +同理）。而 `RoutedExperts.weight_loader` 与训练侧张量都按 chec
+          +kpoint 布局工作（单专家 `w1`/`w3` = `[inter, hidden]`）。在转 
+          +置后的参数上，loader 对 `shard_dim=0`（此时是 `hidden=5120`） 
+          +取 `shard_size=2560`，再被 `_narrow_expert_data_for_padding`  
+          +修剪到入参 dim0（2304），得到 `[2304, 4608]`（4608 = `2*inter`
+          +）——与入参 `[2304, 5120]` 永久不匹配（`4608` 正好等于 `2*moe_i
+          +ntermediate_size`，是定位该问题的指纹） | 同步前把融合专家权重
+          +**换回 checkpoint 布局**：新增 `verl/utils/vllm/npu_expert_lay
+          +out.py::restore_expert_checkpoint_layout`（按 `w13.shape[1] ==
+          + w2.shape[2] and w13.shape[2] == 2*w2.shape[1]` 识别推理布局，
+          +`transpose(1, 2).contiguous()` 回退，幂等），接入 `verl/worker
+          +s/rollout/vllm_rollout/utils.py` step 1（仅 NPU、非 LoRA）；st
+          +ep 3 原有的 `process_weights_after_loading` 会把转置再打回去，
+          +其它参数一律交给各层自己的 loader |                           
+      215  
+      216 -> 附带修正（同一处）：分层重载会把一个层的张量缓存到该层收全为
+          -止（可能跨多个 bucket），而接收端 bucket buffer 与 direct-send
+          - 的 IPC 存储在本轮回调返回后立即被复用（发送端等 ack 即覆写同 
+          -一块 buffer），因此该路径下对入参做一次 `clone()`——与 LoRA 分 
+          -支（#6454）同样的处理。                                       
+      216 +> **弯路记录（避免重蹈）**：先按 vLLM 上游 CUDA IPC 引擎的做法
+          +改用官方的**分层重载**（同步前 `initialize_layerwise_reload`，
+          +收完后 `finalize_layerwise_reload` 代替 `process_weights_after
+          +_loading`；vllm-ascend 的 HCCL 权重传输引擎正是这么做的，而 NP
+          +U IPC 引擎的 start/finish 是 no-op）。专家权重确实装进去了（G9
+          + 的 shape 错误消失），但立刻卡在下一个参数：分层重载把每个参数
+          +恢复成**模型构造时**的形状（`record_metadata_for_reloading` 记
+          +录），而 Ascend 的线性层是在 **weight_loader 里就地换布局**的—
+          +—例如 `vllm_ascend/ops/linear.py` 的 `wo_a`：checkpoint `[8192
+          +, 4096]` → 每 rank `[1024, 4096]` → `.view(n_local_groups, o_l
+          +ora_rank, -1).transpose(2, 1)` → `[1, 4096, 1024]`，重放后与 k
+          +ernel 张量（`[1024, 4096]`）维度不一致，报 `self [1024, 4096] 
+          +must match src [1, 4096, 1024]`。**结论**：vllm-ascend 的线性 
+          +层/注意力本来就按「推理布局下重载」设计（`wo_a` 的 else 分支注
+          +释即 "In RL update flows, wo_a can be loaded again after being
+          + transformed…"，`mla_v1` 的 `if not hasattr(self, "W_UV")` 也 
+          +保证重复后处理是 copy 而非重建），真正装不下的只有融合 MoE 的 
+          +转置，因此最终只回退 MoE。                                    
+      217  
+      218 -> **离线验证**：`/tmp/test_layerwise_reload.py`（玩具模块：`Qu
+          -antizeMethodBase` + 非幂等转置）在 CPU 上跑通「初始化 → 后处理
+          -转置 → 分层重载 → 新值按转置布局落盘」的往返，证明该机制能把 c
+          -heckpoint 布局的权重装进后处理过的参数。真机验证见下。        
+      218 +> 附带修正（若日后仍要启用分层重载）：该机制会把一个层的张量缓
+          +存到该层收全为止（可能跨 bucket），而接收端 bucket buffer 与 d
+          +irect-send 的 IPC 存储在回调返回后立即被复用（发送端等 ack 即 
+          +覆写同一块 buffer），必须对入参做 `clone()`——与 LoRA 分支（#64
+          +54）同样的处理。                                              
+      219  
+      220  ---
+      221  
+
+  Thought for 14s, ran 4 shell commands (ctrl+o to expand)
+
+● The run reached the sync again with a new failure — let me read it:
+
+  Thought for 12s, ran 1 shell command (ctrl+o to expand)
+
+● The MoE revert worked but OOM'd on the .contiguous() copy — vLLM's pool leaves
+  only ~1.8 GiB free. Since a transposed view needs no allocation (and step 3's
+  transpose-back is also copy-free), let me use views:
+
+● Update(verl/verl/utils/vllm/npu_expert_layout.py)
+  ⎿  Added 7 lines, removed 2 lines
+      54              # Inference layout: w13 [E, hidden, 2i], w2 [E, i, 
+          hidden]; the checkpoint
+      55              # layout pairs w13.shape[2] with w2.shape[1] instea
+          d.
+      56              if w13.shape[1] == w2.shape[2] and w13.shape[2] == 
+          2 * w2.shape[1]:
+      57 -                module.w13_weight.data = w13.data.transpose(1, 
+         -2).contiguous()                                                
+      58 -                module.w2_weight.data = w2.data.transpose(1, 2)
+         -.contiguous()                                                  
+      57 +                # Views on purpose: one layer's w13 is 2.11 GiB
+         + and the rollout engine                                        
+      58 +                # has already filled its pool, so materialising
+         + a contiguous copy runs                                        
+      59 +                # out of memory. The weight loaders narrow and 
+         +copy into strided                                              
+      60 +                # tensors, and process_weights_after_loading tr
+         +ansposes the same                                              
+      61 +                # storage back (also copy-free), so no copy is 
+         +needed anywhere.                                               
+      62 +                module.w13_weight.data = w13.data.transpose(1, 
+         +2)                                                             
+      63 +                module.w2_weight.data = w2.data.transpose(1, 2)
+      64                  reverted += 1
+      65      if reverted:
+      66          logger.info("Ascend MoE: reverted %d fused expert weigh
+          ts to checkpoint layout", reverted)
+
+  Thought for 1m 2s, ran 6 shell commands (ctrl+o to expand)
+
+● Let me look at how the sync sequences with engine sleep/wake (the memory
+  question):
+
+  Thought for 1m 35s, searched for 1 pattern, ran 4 shell commands (ctrl+o to expand)
+
+● The trainer-side export OOMs because it all-gathers a whole fused expert
+  tensor (18.1 GiB) per layer while the rollout engine holds its weights. Let me
+  make the export stream one expert block at a time:
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(verl/verl/workers/engine/fsdp/utils.py)
+  ⎿  Added 63 lines, removed 30 lines
+       87      return sharding_strategy
+       88  
+       89  
+       90 +def split_fused_expert_tensor(name: str, tensor: torch.Tensor,
+          + first_expert_id: int = 0):                                   
+       91 +    """Expand one packed expert tensor into vLLM's per-expert 
+          +checkpoint keys.                                              
+       92 +                                                              
+       93 +    ``name`` ends with the packed parameter name (``...experts
+          +.gate_up_proj`` or                                            
+       94 +    ``...experts.down_proj``) and ``tensor`` carries ``[num_ex
+          +perts, ...]`` rows.                                           
+       95 +    ``first_expert_id`` is the global id of ``tensor[0]``, so 
+          +callers that stream the                                       
+       96 +    packed parameter in blocks (see the DSV41 engine's expert 
+          +export) keep the global                                       
+       97 +    expert numbering that vLLM's loader maps onto its local ex
+          +perts.                                                        
+       98 +                                                              
+       99 +    Returns None when ``name`` is not a packed expert paramete
+          +r, so callers can fall                                        
+      100 +    back to streaming the tensor as-is.                       
+      101 +    """                                                       
+      102 +    if tensor.dim() != 3:                                     
+      103 +        return None                                           
+      104 +                                                              
+      105 +    if name.endswith(".mlp.experts.gate_up_proj"):            
+      106 +        gate, up = tensor.chunk(2, dim=1)                     
+      107 +        base = name.removesuffix(".gate_up_proj")             
+      108 +        return [                                              
+      109 +            entry                                             
+      110 +            for expert_id in range(tensor.size(0))            
+      111 +            for entry in (                                    
+      112 +                (f"{base}.{first_expert_id + expert_id}.gate_p
+          +roj.weight", gate[expert_id].contiguous()),                   
+      113 +                (f"{base}.{first_expert_id + expert_id}.up_pro
+          +j.weight", up[expert_id].contiguous()),                       
+      114 +            )                                                 
+      115 +        ]                                                     
+      116 +                                                              
+      117 +    if name.endswith(".mlp.experts.down_proj"):               
+      118 +        base = name.removesuffix(".down_proj")                
+      119 +        return [                                              
+      120 +            (f"{base}.{first_expert_id + expert_id}.down_proj.
+          +weight", tensor[expert_id].contiguous())                      
+      121 +            for expert_id in range(tensor.size(0))            
+      122 +        ]                                                     
+      123 +                                                              
+      124 +    # FSDP-Turbo's DeepSeek-V4.1 backbone packs the routed exp
+          +erts the same way under                                       
+      125 +    # ``ffn.experts`` but names the halves the way the checkpo
+          +int does (w1/w3/w2): vLLM                                     
+      126 +    # loads V4 checkpoints one expert at a time, so emitting t
+          +hose keys keeps the live                                      
+      127 +    # sync on the same path as a from-disk load.              
+      128 +    if name.endswith(".ffn.experts.gate_up_proj"):            
+      129 +        gate, up = tensor.chunk(2, dim=1)                     
+      130 +        base = name.removesuffix(".gate_up_proj")             
+      131 +        return [                                              
+      132 +            entry                                             
+      133 +            for expert_id in range(tensor.size(0))            
+      134 +            for entry in (                                    
+      135 +                (f"{base}.{first_expert_id + expert_id}.w1.wei
+          +ght", gate[expert_id].contiguous()),                          
+      136 +                (f"{base}.{first_expert_id + expert_id}.w3.wei
+          +ght", up[expert_id].contiguous()),                            
+      137 +            )                                                 
+      138 +        ]                                                     
+      139 +                                                              
+      140 +    if name.endswith(".ffn.experts.down_proj"):               
+      141 +        base = name.removesuffix(".down_proj")                
+      142 +        return [                                              
+      143 +            (f"{base}.{first_expert_id + expert_id}.w2.weight"
+          +, tensor[expert_id].contiguous())                             
+      144 +            for expert_id in range(tensor.size(0))            
+      145 +        ]                                                     
+      146 +                                                              
+      147 +    return None                                               
+      148 +                                                              
+      149 +                                                              
+      150  def unfuse_moe_params(weights, model_type: str | None = None):
+      151      """Expand Transformers 5 packed MoE expert tensors to vLLM
+            checkpoint keys.
+      152  
+     ...
+      166              yield name, tensor
+      167              continue
+      168  
+      109 -        if name.endswith(".mlp.experts.gate_up_proj") and tens
+          -or.dim() == 3:                                                
+      110 -            gate, up = tensor.chunk(2, dim=1)                 
+      111 -            base = name.removesuffix(".gate_up_proj")         
+      112 -            for expert_id in range(tensor.size(0)):           
+      113 -                yield f"{base}.{expert_id}.gate_proj.weight", 
+          -gate[expert_id].contiguous()                                  
+      114 -                yield f"{base}.{expert_id}.up_proj.weight", up
+          -[expert_id].contiguous()                                      
+      169 +        split = split_fused_expert_tensor(name, tensor)       
+      170 +        if split is not None:                                 
+      171 +            yield from split                                  
+      172              continue
+      173  
+      117 -        if name.endswith(".mlp.experts.down_proj") and tensor.
+          -dim() == 3:                                                   
+      118 -            base = name.removesuffix(".down_proj")            
+      119 -            for expert_id in range(tensor.size(0)):           
+      120 -                yield f"{base}.{expert_id}.down_proj.weight", 
+          -tensor[expert_id].contiguous()                                
+      121 -            continue                                          
+      122 -                                                              
+      123 -        # FSDP-Turbo's DeepSeek-V4.1 backbone packs the routed
+          - experts the same way                                         
+      124 -        # under ``ffn.experts`` but names the halves the way t
+          -he checkpoint does                                            
+      125 -        # (w1/w3/w2): vLLM loads V4 checkpoints one expert at 
+          -a time, so emitting                                           
+      126 -        # those keys keeps the live sync on the same path as a
+          - from-disk load.                                              
+      127 -        if name.endswith(".ffn.experts.gate_up_proj") and tens
+          -or.dim() == 3:                                                
+      128 -            gate, up = tensor.chunk(2, dim=1)                 
+      129 -            base = name.removesuffix(".gate_up_proj")         
+      130 -            for expert_id in range(tensor.size(0)):           
+      131 -                yield f"{base}.{expert_id}.w1.weight", gate[ex
+          -pert_id].contiguous()                                         
+      132 -                yield f"{base}.{expert_id}.w3.weight", up[expe
+          -rt_id].contiguous()                                           
+      133 -            continue                                          
+      134 -                                                              
+      135 -        if name.endswith(".ffn.experts.down_proj") and tensor.
+          -dim() == 3:                                                   
+      136 -            base = name.removesuffix(".down_proj")            
+      137 -            for expert_id in range(tensor.size(0)):           
+      138 -                yield f"{base}.{expert_id}.w2.weight", tensor[
+          -expert_id].contiguous()                                       
+      139 -            continue                                          
+      140 -                                                              
+      174          yield name, tensor
+
+  Thought for 11s, ran 3 shell commands (ctrl+o to expand)
+
+● Update(verl/verl/workers/engine/fsdp/utils.py)
+  ⎿  Added 1 line, removed 1 line
+      87      return sharding_strategy
+      88  
+      89  
+      90 -def split_fused_expert_tensor(name: str, tensor: torch.Tensor, 
+         -first_expert_id: int = 0):                                     
+      90 +def split_fused_expert_tensor(name: str, tensor, first_expert_i
+         +d: int = 0):                                                   
+      91      """Expand one packed expert tensor into vLLM's per-expert c
+          heckpoint keys.
+      92  
+      93      ``name`` ends with the packed parameter name (``...experts.
+          gate_up_proj`` or
+
+● Now the parent-side export hook:
+● Update(verl/verl/workers/engine/fsdp/transformer_impl.py)
+  ⎿  Added 1 line, removed 6 lines
+      1025          if peft_config is not None and base_sync_done:
+      1026              per_tensor_param = params.items()
+      1027          else:
+      1028 -            device = get_device_id()  # used when fsdp2 set c
+           -pu_offload_policy                                            
+      1028              per_tensor_param = (
+      1030 -                (                                            
+      1031 -                    name,                                    
+      1032 -                    param.to(device, non_blocking=True).full_
+           -tensor() if isinstance(param, DTensor) else param,           
+      1033 -                )                                            
+      1034 -                for name, param in params.items()            
+      1029 +                entry for name, param in params.items() for e
+           +ntry in self._export_param(name, param)                      
+      1030              )
+      1031              per_tensor_param = unfuse_moe_params(per_tensor_p
+            aram, self.model_config.hf_config.model_type)
+      1032  
+
+  Thought for 4s (ctrl+o to expand)
+
+● Update(verl/verl/workers/engine/fsdp/transformer_impl.py)
+  ⎿  Added 12 lines
+      974          gen, _ = self.get_per_tensor_param_shard()
+      975          return hf_delta_export(gen, self._delta_shard_snap, se
+           lf._hf_delta_entry), None
+      976  
+      977 +    def _export_param(self, name: str, param) -> Generator[tup
+          +le[str, torch.Tensor], None, None]:                           
+      978 +        """Yield the tensors a weight sync streams for one par
+          +ameter.                                                       
+      979 +                                                              
+      980 +        The default materializes the parameter as-is, all-gath
+          +ering DTensor shards onto                                     
+      981 +        the local device. Engines override this to stream a pa
+          +rameter in smaller pieces                                     
+      982 +        (see the DeepSeek-V4.1 engine's expert weights).      
+      983 +        """                                                   
+      984 +        if isinstance(param, DTensor):                        
+      985 +            yield name, param.to(get_device_id(), non_blocking
+          +=True).full_tensor()                                          
+      986 +        else:                                                 
+      987 +            yield name, param                                 
+      988 +                                                              
+      989      def get_per_tensor_param(self, layered_summon=False, base_
+           sync_done=False, **kwargs):
+      990          log_gpu_memory_usage("Before load_fsdp_model_to_gpu", 
+           logger=logger)
+      991  
+
+● Now the DSV41 override that streams experts block by block:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Update(verl/verl/workers/engine/fsdp/fsdp_turbo_dsv41_impl.py)
+  ⎿  Added 32 lines
+      213      device=["npu", "cuda"],
+      214  )
+      215  class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead
+           ):
+      216 +    # Fused expert parameters, packed over the global expert d
+          +imension.                                                     
+      217 +    _FUSED_EXPERT_SUFFIXES = (".ffn.experts.gate_up_proj", ".f
+          +fn.experts.down_proj")                                        
+      218 +                                                              
+      219 +    def _export_param(self, name, param):                     
+      220 +        """Stream fused expert parameters one EP shard at a ti
+          +me.                                                           
+      221 +                                                              
+      222 +        The default export all-gathers a packed expert tensor 
+          +``[384, 4608, 5120]``                                         
+      223 +        (18.1 GiB) onto every rank before unfusing it into per
+          +-expert keys, which does                                      
+      224 +        not fit next to the rollout engine's weights in the sa
+          +me HBM. Gathering one                                         
+      225 +        expert block at a time keeps the peak at a single bloc
+          +k (2.26 GiB) while                                            
+      226 +        emitting the same per-expert keys, numbered with the g
+          +lobal expert ids. Blocks                                      
+      227 +        that are not DTensor-sharded (or that are not expert p
+          +arameters) take the                                           
+      228 +        default path.                                         
+      229 +        """                                                   
+      230 +        from torch.distributed.tensor import DTensor          
+      231 +                                                              
+      232 +        from .utils import split_fused_expert_tensor          
+      233 +                                                              
+      234 +        if not name.endswith(self._FUSED_EXPERT_SUFFIXES) or n
+          +ot isinstance(param, DTensor) or param.dim() != 3:            
+      235 +            yield from super()._export_param(name, param)     
+      236 +            return                                            
+      237 +                                                              
+      238 +        block = param.to_local().shape[0]                     
+      239 +        if block <= 0 or param.shape[0] % block or block == pa
+          +ram.shape[0]:                                                 
+      240 +            yield from super()._export_param(name, param)     
+      241 +            return                                            
+      242 +                                                              
+      243 +        for first_expert_id in range(0, param.shape[0], block)
+          +:                                                             
+      244 +            block_tensor = param.narrow(0, first_expert_id, bl
+          +ock)                                                          
+      245 +            materialized = block_tensor.to(device_of(param), n
+          +on_blocking=True).full_tensor()                               
+      246 +            yield from split_fused_expert_tensor(name, materia
+          +lized, first_expert_id=first_expert_id)                       
+      247 +                                                              
+      248      def _build_module(self):
+      249          # Keep verl's Qwen VLM monkey-patch guard the same way
+            FSDPTurboEngine
+      250          # does: do not slice the text model before FSDP-Turbo'
+           s own CP split.
+
+  Thought for 3s, searched for 1 pattern (ctrl+o to expand)
+
+● Update(verl/verl/workers/engine/fsdp/fsdp_turbo_dsv41_impl.py)
+  ⎿  Added 1 line, removed 1 line
+      242  
+      243          for first_expert_id in range(0, param.shape[0], block)
+           :
+      244              block_tensor = param.narrow(0, first_expert_id, bl
+           ock)
+      245 -            materialized = block_tensor.to(device_of(param), n
+          -on_blocking=True).full_tensor()                               
+      245 +            materialized = block_tensor.to(get_device_id(), no
+          +n_blocking=True).full_tensor()                                
+      246              yield from split_fused_expert_tensor(name, materia
+           lized, first_expert_id=first_expert_id)
+      247  
+      248      def _build_module(self):
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Update(verl/verl/workers/engine/fsdp/fsdp_turbo_dsv41_impl.py)
+  ⎿  Added 1 line
+      53  
+      54  from ..base import EngineRegistry
+      55  from .fsdp_turbo_impl import FSDPTurboEngineWithLMHead
+      56 +from ...utils.device import get_device_id                      
+      57  
+      58  logger = logging.getLogger(__name__)
+      59  
+
+  Thought for 11s, ran 1 shell command (ctrl+o to expand)
+
+● Update(verl/verl/workers/engine/fsdp/fsdp_turbo_dsv41_impl.py)
+  ⎿  Removed 1 line
+      53  
+      54  from ..base import EngineRegistry
+      55  from .fsdp_turbo_impl import FSDPTurboEngineWithLMHead
+      56 -from ...utils.device import get_device_id                      
+      56  
+      57  logger = logging.getLogger(__name__)
+      58  
+
+● Update(verl/verl/workers/engine/fsdp/fsdp_turbo_dsv41_impl.py)
+  ⎿  Added 2 lines
+      229          """
+      230          from torch.distributed.tensor import DTensor
+      231  
+      232 +        from verl.utils.device import get_device_id           
+      233 +                                                              
+      234          from .utils import split_fused_expert_tensor
+      235  
+      236          if not name.endswith(self._FUSED_EXPERT_SUFFIXES) or n
+           ot isinstance(param, DTensor) or param.dim() != 3:
+
+● Now compile-check and add a CPU test for the splitter:
+
+  Thought for 3s, ran 1 shell command (ctrl+o to expand)
+
+● Update(verl/verl/workers/engine/fsdp/transformer_impl.py)
+  ⎿  Added 1 line, removed 1 line
+      974          gen, _ = self.get_per_tensor_param_shard()
+      975          return hf_delta_export(gen, self._delta_shard_snap, se
+           lf._hf_delta_entry), None
+      976  
+      977 -    def _export_param(self, name: str, param) -> Generator[tup
+          -le[str, torch.Tensor], None, None]:                           
+      977 +    def _export_param(self, name: str, param):                
+      978          """Yield the tensors a weight sync streams for one par
+           ameter.
+      979  
+      980          The default materializes the parameter as-is, all-gath
+           ering DTensor shards onto
+
+  Thought for 16s, ran 4 shell commands (ctrl+o to expand)
+
+● While it runs, let me extend the existing MoE converter test to cover the
+  offset path:
+
+  Read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● Update(verl/tests/workers/rollout/test_vllm_moe_param_converter_on_cpu.py)
+  ⎿  Added 1 line, removed 1 line
+      15  
+      16  import torch
+      17  
+      18 -from verl.workers.engine.fsdp.utils import unfuse_moe_params   
+      18 +from verl.workers.engine.fsdp.utils import split_fused_expert_t
+         +ensor, unfuse_moe_params                                       
+      19  
+      20  
+      21  def _collect(weights, model_type):
+
+● Update(verl/tests/workers/rollout/test_vllm_moe_param_converter_on_cpu.py)
+  ⎿  Added 31 lines
+       67      assert converted[1][1] is down
+       68      assert converted[0][1].shape == (2, 8, 6)
+       69      assert converted[1][1].shape == (2, 3, 8)
+       70 +                                                              
+       71 +                                                              
+       72 +def test_expert_block_keeps_global_expert_numbering():        
+       73 +    """The DSV41 engine streams one EP block at a time; ids mu
+          +st stay global.                                               
+       74 +                                                              
+       75 +    vLLM maps the name's expert id onto the local expert slot,
+          + so a block that is not                                       
+       76 +    the first one has to emit the ids it actually carries.    
+       77 +    """                                                       
+       78 +    gate_up = torch.randn(2, 8, 6)                            
+       79 +    down = torch.randn(2, 6, 3)                               
+       80 +                                                              
+       81 +    converted = (                                             
+       82 +        split_fused_expert_tensor("model.layers.0.ffn.experts.
+          +gate_up_proj", gate_up, first_expert_id=48)                   
+       83 +        + split_fused_expert_tensor("model.layers.0.ffn.expert
+          +s.down_proj", down, first_expert_id=48)                       
+       84 +    )                                                         
+       85 +                                                              
+       86 +    assert [name for name, _ in converted] == [               
+       87 +        "model.layers.0.ffn.experts.48.w1.weight",            
+       88 +        "model.layers.0.ffn.experts.48.w3.weight",            
+       89 +        "model.layers.0.ffn.experts.49.w1.weight",            
+       90 +        "model.layers.0.ffn.experts.49.w3.weight",            
+       91 +        "model.layers.0.ffn.experts.48.w2.weight",            
+       92 +        "model.layers.0.ffn.experts.49.w2.weight",            
+       93 +    ]                                                         
+       94 +    torch.testing.assert_close(converted[0][1], gate_up[0, :4]
+          +)                                                             
+       95 +    torch.testing.assert_close(converted[1][1], gate_up[0, 4:]
+          +)                                                             
+       96 +    torch.testing.assert_close(converted[4][1], down[0])      
+       97 +                                                              
+       98 +    # Non-expert tensors are left to the caller (the engine st
+          +reams them as-is).                                            
+       99 +    assert split_fused_expert_tensor("model.layers.0.self_attn
+          +.q_proj.weight", gate_up) is None                             
+      100 +    assert split_fused_expert_tensor("model.layers.0.ffn.exper
+          +ts.gate_up_proj", gate_up[0]) is None                         
+
+  Thought for 43s, ran 10 shell commands (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?

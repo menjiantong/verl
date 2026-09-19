@@ -1,0 +1,361 @@
+ ▐▛███▛█   Claude Code v2.1.271
+▝▜██████▀  deepseek-v4-flash · API Usage Billing
+  ▝▝ ▝▝    /workspace-verl
+
+
+❯ @2026-09-18-014510-local-command-caveatcaveat-the-messages-below.txt          
+  这是之前的对话，继续工作                                                      
+
+  Thought for 14s, read 2 files, listed 3 directories (ctrl+o to expand)
+  ⎿  Loaded verl/CLAUDE.md
+  ⎿  Loaded 2 skills from verl/.claude/skills
+  ⎿  2 skills available
+
+● Let me reconstruct the exact state of things before continuing.
+
+  Thought for 1m 0s, searched for 5 patterns, read 2 files, listed 2 directories, ran 8 shell commands (ctrl+o to expand)
+  ⎿  Loaded vllm/CLAUDE.md
+  ⎿  Loaded vllm/AGENTS.md
+  ⎿  Loaded 1 skill from vllm/.claude/skills
+  ⎿  1 skill available
+
+● Now let me read the vllm-ascend V4.1 model code that owns the destination
+  params.
+
+  Thought for 16s, searched for 4 patterns, read 2 files, ran 1 shell command (ctrl+o to expand)
+  ⎿  Loaded ../../../CLAUDE.md
+
+● Let me look at what names/shapes our side sends.
+
+  Thought for 25s, searched for 3 patterns, read 3 files, ran 3 shell commands (ctrl+o to expand)
+
+● Let me find what the log says right before the failure — which tensor was in
+  flight.
+
+  Thought for 1m 16s, searched for 6 patterns, read 4 files, ran 4 shell commands (ctrl+o to expand)
+
+● Let me look at vllm-ascend's own RL weight-transfer engine to see how it
+  handles this layout.
+
+  Thought for 1m 46s, searched for 6 patterns, read 4 files, listed 1 directory, ran 9 shell commands (ctrl+o to expand)
+
+● Let me assess the layerwise-reload machinery (the framework's supported path)
+  before choosing a fix.
+
+  Thought for 48s, searched for 3 patterns, read 1 file, listed 1 directory, ran 5 shell commands (ctrl+o to expand)
+
+● Root cause is now clear. Let me look at the integration file before patching.
+
+  Thought for 9s, ran 1 shell command (ctrl+o to expand)
+
+● Root cause established. Now let me implement the fix. First the helper module:
+
+  Thought for 5s, ran 2 shell commands (ctrl+o to expand)
+
+● Write(verl/verl/utils/vllm/npu_layerwise_reload.py)
+  ⎿  Wrote 68 lines to verl/verl/utils/vllm/npu_layerwise_reload.py
+       1 # Copyright 2025 Bytedance Ltd. and/or its affiliates
+       3 # Licensed under the Apache License, Version 2.0 (the "License")
+         ;
+       4 # you may not use this file except in compliance with the Licens
+       5 # You may obtain a copy of the License at
+       6 #
+       8 #
+       9 # Unless required by applicable law or agreed to in writing, sof
+         tware
+         IS,
+     … +84 lines (ctrl+o to expand)
+
+● Now wire it into the sync path:
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(verl/verl/workers/rollout/vllm_rollout/utils.py)
+  ⎿  Added 19 lines
+      266              for model in self._iter_all_models():
+      267                  restore_moe_expert_maps(model)
+      268  
+      269 +        # Ascend parameters hold the post-loading inference la
+          +yout once the engine is                                       
+      270 +        # up (the Ascend MoE transposes w13/w2, attention laye
+          +rs reshape their                                              
+      271 +        # weights), while the trainer streams checkpoint-layou
+          +t tensors. Load them                                          
+      272 +        # through vLLM's layerwise reload, which restores the 
+          +recorded pre-processing                                       
+      273 +        # layout and re-applies the transforms in step 3. The 
+          +quantization-specific                                         
+      274 +        # paths below bring their own prepare/finalize pair, a
+          +nd LoRA never sends base                                      
+      275 +        # weights, so those keep their existing handling.     
+      276 +        layerwise_reload = (                                  
+      277 +            is_npu_available                                  
+      278 +            and not self._is_qat_model                        
+      279 +            and not self._is_modelopt_qat                     
+      280 +            and not is_fp8_model(self.model_runner.vllm_config
+          +)                                                             
+      281 +            and not (peft_config and base_sync_done)          
+      282 +        )                                                     
+      283 +        if layerwise_reload:                                  
+      284 +            from verl.utils.vllm.npu_layerwise_reload import b
+          +egin_weight_reload                                            
+      285 +                                                              
+      286 +            begin_weight_reload(self._iter_all_models())      
+      287 +                                                              
+      288          if self._is_qat_model:
+      289              # QAT (compressed-tensors): Prepare for weight loa
+           ding BEFORE receiving any buckets
+      290              from verl.utils.qat import prepare_qat_for_load_we
+           ights
+
+● Now step 3 (finalize instead of the generic post-processing):
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(verl/verl/workers/rollout/vllm_rollout/utils.py)
+  ⎿  Added 4 lines
+      364  
+      365              for model, reload_state in quant_reload_states:
+      366                  process_quanted_weights_after_loading(model, r
+           eload_state)
+      367 +        elif layerwise_reload:                                
+      368 +            from verl.utils.vllm.npu_layerwise_reload import f
+          +inish_weight_reload                                           
+      369 +                                                              
+      370 +            finish_weight_reload(self._iter_all_models_with_co
+          +nfig())                                                       
+      371          else:
+      372              # Some post-load transforms are non-idempotent; ru
+           n once after all buckets.
+      373              from vllm.model_executor.model_loader.utils import
+            process_weights_after_loading
+
+  Thought for 41s, searched for 1 pattern, ran 7 shell commands (ctrl+o to expand)
+
+● Now the buffer-stability issue: the receiver's bucket buffer is reused as soon
+  as the callback returns, while layerwise reload holds tensors until a layer
+  completes. Let me handle that:
+  Read 1 file (ctrl+o to expand)
+
+● Update(verl/verl/workers/rollout/vllm_rollout/utils.py)
+  ⎿  Added 6 lines
+      336                  )
+      337                  lora_weights.clear()
+      338                  return
+      339 +            if layerwise_reload:                              
+      340 +                # Clone: layerwise reload buffers a layer's te
+          +nsors until that layer is                                     
+      341 +                # complete, which can span buckets, and the re
+          +ceiver reuses its bucket                                      
+      342 +                # buffer (and the sender's direct-send storage
+          +) as soon as this                                             
+      343 +                # callback returns.                           
+      344 +                weights = [(name, tensor.clone()) for name, te
+          +nsor in weights]                                              
+      345              self._update_weights(
+      346                  weights,
+      347                  peft_config=peft_config,
+
+  Thought for 10s, ran 2 shell commands (ctrl+o to expand)
+
+● Before the 20-minute run, let me validate the mechanism offline on CPU with a
+  toy module:
+
+● Write(/tmp/test_layerwise_reload.py)
+  ⎿  Wrote 93 lines to ../tmp/test_layerwise_reload.py
+       1 """Offline sanity check of vLLM's layerwise reload for the Ascen
+       2 
+       3 Mirrors what our rollout worker will do:
+       4   init:   record metadata -> create/load weights -> process_weig
+       5   sync:   initialize_layerwise_reload -> load checkpoint-layout 
+         tensors -> finalize_layerwise_reload
+         oaded values.
+       7 """
+       8 
+      10 import torch.nn as nn
+     … +105 lines (ctrl+o to expand)
+
+  Thought for 2s, ran 1 shell command (ctrl+o to expand)
+
+● Update(/tmp/test_layerwise_reload.py)
+  ⎿  Added 1 line, removed 1 line
+      50  
+      51  def checkpoint_tensors(model):
+      52      """Checkpoint layout, i.e. what the trainer streams during 
+          a sync."""
+      53 -    w13 = torch.arange(2 * 4 * 8, dtype=torch.float32).reshape(
+         -2, 8, 8) / 100                                                 
+      53 +    w13 = torch.arange(2 * 8 * 8, dtype=torch.float32).reshape(
+         +2, 8, 8) / 100                                                 
+      54      w2 = torch.arange(2 * 8 * 4, dtype=torch.float32).reshape(2
+          , 8, 4) / 100
+      55      return w13, w2
+      56  
+
+  Thought for 12s, ran 1 shell command (ctrl+o to expand)
+
+● The framework only re-applies transforms via quant_method; my toy needs a real
+  QuantizeMethodBase. Let me check the ABC:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Update(/tmp/test_layerwise_reload.py)
+  ⎿  Added 19 lines, removed 4 lines
+       9  import torch
+      10  import torch.nn as nn
+      11  
+      12 +from vllm.model_executor.layers.quantization.base_config import
+         + QuantizeMethodBase                                            
+      13  from vllm.model_executor.model_loader.reload import (
+      14      finalize_layerwise_reload,
+      15      initialize_layerwise_reload,
+     ...
+      22      param.data.copy_(loaded_weight)
+      23  
+      24  
+      25 +class ToyAscendMoEMethod(QuantizeMethodBase):                  
+      26 +    """Stands in for AscendUnquantizedFusedMoEMethod: transpose
+         +s w13/w2 after loading."""                                     
+      27 +                                                               
+      28 +    def create_weights(self, layer, *args, **kwargs):          
+      29 +        raise NotImplementedError                              
+      30 +                                                               
+      31 +    def apply(self, layer, *args, **kwargs):                   
+      32 +        raise NotImplementedError                              
+      33 +                                                               
+      34 +    def process_weights_after_loading(self, layer):            
+      35 +        # Non-idempotent, exactly like the Ascend MoE transpose
+         +.                                                              
+      36 +        layer.w13_weight.data = layer.w13_weight.data.transpose
+         +(1, 2).contiguous()                                            
+      37 +        layer.w2_weight.data = layer.w2_weight.data.transpose(1
+         +, 2).contiguous()                                              
+      38 +                                                               
+      39 +                                                               
+      40  class ToyAscendMoE(nn.Module):
+      41      """Stands in for RoutedExperts: fused w13 + w2, transposed 
+          after loading."""
+      42  
+      43      def __init__(self):
+      44          super().__init__()
+      29 -        self.quant_method = self                               
+      45 +        self.quant_method = ToyAscendMoEMethod()               
+      46          self.num_local_experts = 2
+      47          self.intermediate = 4
+      48          self.hidden = 8
+     ...
+      53          w2.weight_loader = default_loader
+      54          self.register_parameter("w2_weight", w2)
+      55  
+      40 -    def process_weights_after_loading(self, layer):            
+      41 -        layer.w13_weight.data = layer.w13_weight.data.transpose
+         -(1, 2).contiguous()                                            
+      42 -        layer.w2_weight.data = layer.w2_weight.data.transpose(1
+         -, 2).contiguous()                                              
+      56 +    def post_load(self):                                       
+      57 +        self.quant_method.process_weights_after_loading(self)  
+      58  
+      59  
+      60  class ToyModel(nn.Module):
+
+  Thought for 5s, ran 2 shell commands (ctrl+o to expand)
+
+● The offline round-trip passes. Now let me check state and launch a validation
+  run:
+
+  Thought for 8s, ran 2 shell commands (ctrl+o to expand)
+
+● Launching a validation run (random-init to skip the ~18 min checkpoint IO):
+
+  Thought for 5s, ran 1 shell command (ctrl+o to expand)
+
+● While the run proceeds, let me record the finding in the worklog:
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(verl/wiki/worklog_dsv41_rl.md)
+  ⎿  Added 8 lines
+      209  
+      210  > 至此 rollout 侧的启动路径（vLLM 引擎 → sleep → wake_up → 权
+           重同步入口）已经打通到 `update_weights` 之前。
+      211  
+      212 +| # | 现象 | 根因 | 修复 |                                    
+      213 +|---|---|---|---|                                             
+      214 +| G9 | 首次权重同步（`update_weights` → `model.load_weights(pa
+          +ram_updates)`）时 8 卡同时崩：`Invalid_Argument_Tensor_Input_S
+          +hape(EZ1007): ... The size of tensor self [2304, 4608] must ma
+          +tch the size of tensor src [2304, 5120]`，栈底为 `routed_exper
+          +ts.py::_load_w13` 的 `expert_data.copy_(loaded_weight)` | 引擎
+          +初始化时 `process_weights_after_loading` 把 Ascend 侧的参数换 
+          +成了**推理布局**：Ascend MoE 把融合专家权重转置（`w13_weight`:
+          + `[E, 2*inter, hidden]` → `[E, hidden, 2*inter]`，`w2_weight` 
+          +同理），attention 层还会 reshape（`kv_b_proj.weight` 变 3D + F
+          +RACTAL_ND）。而 `RoutedExperts.weight_loader` 与训练侧张量都按
+          + checkpoint 布局工作（单专家 `w1`/`w3` = `[inter, hidden]`）。
+          +在转置后的参数上，loader 对 `shard_dim=0`（此时是 `hidden=5120
+          +`）取 `shard_size=2560`，再被 `_narrow_expert_data_for_padding
+          +` 修剪到入参 dim0（2304），得到 `[2304, 4608]`（4608 = `2*inte
+          +r`）——与入参 `[2304, 5120]` 永久不匹配（`4608` 正好等于 `2*moe
+          +_intermediate_size`，是定位该问题的指纹） | 改用 vLLM 官方的**
+          +分层重载**：同步前 `initialize_layerwise_reload(model)`（各层 
+          +恢复到「`process_weights_after_loading` 之前」记录的布局并包裹
+          + loader），全部 bucket 收完后用 `finalize_layerwise_reload(mod
+          +el, model_config)` 取代原来的 `process_weights_after_loading` 
+          +（它按层重新执行后处理，再把结果写回原 tensor 存储，保住图/显 
+          +存引用）。这正是上游 CUDA IPC 权重传输引擎在 `start_weight_upd
+          +ate`/`finish_weight_update` 里做的同一对调用（vllm-ascend 的 N
+          +PU IPC 引擎这两个钩子是 no-op，所以照抄其它量化分支的做法在这 
+          +里行不通）。新增 `verl/utils/vllm/npu_layerwise_reload.py`，接
+          +入点 `verl/workers/rollout/vllm_rollout/utils.py` 的 step 1 / 
+          +step 3（限 NPU、非 QAT/FP8、非 LoRA） |                       
+      215 +                                                              
+      216 +> 附带修正（同一处）：分层重载会把一个层的张量缓存到该层收全为
+          +止（可能跨多个 bucket），而接收端 bucket buffer 与 direct-send
+          + 的 IPC 存储在本轮回调返回后立即被复用（发送端等 ack 即覆写同 
+          +一块 buffer），因此该路径下对入参做一次 `clone()`——与 LoRA 分 
+          +支（#6454）同样的处理。                                       
+      217 +                                                              
+      218 +> **离线验证**：`/tmp/test_layerwise_reload.py`（玩具模块：`Qu
+          +antizeMethodBase` + 非幂等转置）在 CPU 上跑通「初始化 → 后处理
+          +转置 → 分层重载 → 新值按转置布局落盘」的往返，证明该机制能把 c
+          +heckpoint 布局的权重装进后处理过的参数。真机验证见下。        
+      219 +                                                              
+      220  ---
+      221  
+      222  ## 5. 剩余风险与待办
+
+  Thought for 36s, ran 9 shell commands (ctrl+o to expand)
+
+● The random-init path is CPU-bound generating 209GB of random experts — slower
+  than the checkpoint read. Let me kill it and use the real checkpoint:
+
+  Thought for 14s, ran 5 shell commands (ctrl+o to expand)
+
+● While that runs, let me add a repo test for the new helper:
+
+● Write(verl/verl/tests/utils/test_npu_layerwise_reload_on_cpu.py)
+  ⎿  Wrote 154 lines to
+     verl/verl/tests/utils/test_npu_layerwise_reload_on_cpu.py
+       1 # Copyright 2026 Bytedance Ltd. and/or its affiliates
+       3 # Licensed under the Apache License, Version 2.0 (the "License")
+         ;
+       4 # you may not use this file except in compliance with the Licens
+       5 # You may obtain a copy of the License at
+       6 #
+       8 #
+       9 # Unless required by applicable law or agreed to in writing, sof
+         tware
+         IS,
+     … +183 lines (ctrl+o to expand)
+
+  Thought for 14s, listed 1 directory, ran 3 shell commands (ctrl+o to expand)
+
+● 3/3 tests pass. Checking the run:
+
+  Thought for 23s, read 1 file, ran 5 shell commands (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
+
+● Background shell command didn't finish before the previous session ended
+
+  Thought for 3s, ran 1 shell command (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
