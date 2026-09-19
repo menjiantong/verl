@@ -45,10 +45,13 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
+
+from verl.utils.device import get_device_id
 
 from ..base import EngineRegistry
 from .fsdp_turbo_impl import FSDPTurboEngineWithLMHead
@@ -63,6 +66,16 @@ _MODEL_PREFIX = "model."
 # Fallback sequence length: covers prompt+response of the GRPO config; only sizes the
 # RoPE tables and the per-layer attention scratch caches.
 _DEFAULT_MAX_SEQ_LEN = 8192
+
+
+def _log_rank0(message: str, *args) -> None:
+    """Report progress from rank 0.
+
+    Workers run under Ray with a WARNING-level root logger, and a 209GB checkpoint load
+    gives no other feedback for minutes, so print explicitly instead of logging.
+    """
+    if dist.get_rank() == 0:
+        print(f"[fsdp_turbo_dsv41] {message % args if args else message}", flush=True)
 
 
 def _config_path_from_model_path(model_path: str) -> Path:
@@ -202,6 +215,74 @@ def refresh_dsv41_expert_metadata(module, device) -> None:
     device=["npu", "cuda"],
 )
 class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
+    # Fused expert parameters, packed over the global expert dimension.
+    _FUSED_EXPERT_SUFFIXES = (".ffn.experts.gate_up_proj", ".ffn.experts.down_proj")
+
+    def _export_param(self, name, param):
+        """Stream fused expert parameters one EP shard at a time.
+
+        The default export all-gathers a packed expert tensor ``[384, 4608, 5120]``
+        (18.1 GiB) onto every rank before unfusing it into per-expert keys, which does
+        not fit next to the rollout engine's weights in the same HBM. Gathering one
+        expert block at a time keeps the peak at a single block (2.26 GiB) while
+        emitting the same per-expert keys, numbered with the global expert ids. Blocks
+        that are not DTensor-sharded (or that are not expert parameters) take the
+        default path.
+
+        With ``offload_policy`` (parameters on the CPU) that gather is also *slow*:
+        measured at 80 s per sync on a 14 GB model (~2% of that for the actual
+        transfer and load), which grows to ~920 s on the production 114 GB checkpoint.
+        ``VERL_DSV41_LOCAL_EXPERT_EXPORT=1`` switches to streaming *only this rank's*
+        experts straight out of the local shard, which needs no collective at all. In
+        the colocated layout the receiving engine rank holds the same expert range --
+        the ZMQ endpoint pairs trainer rank i with engine rank i, and both sides shard
+        the expert dimension contiguously by rank -- so the other seven eighths of the
+        gather are waste. A wrong pairing cannot pass unnoticed: the engine would load
+        the wrong experts and ``training/rollout_probs_diff_*`` /
+        ``training/rollout_actor_probs_pearson_corr`` would jump from ~1e-2 / ~0.98 to
+        O(1) / ~0.5.
+        """
+        from torch.distributed.tensor import DTensor
+
+        from .utils import split_fused_expert_tensor
+
+        if not name.endswith(self._FUSED_EXPERT_SUFFIXES) or not isinstance(param, DTensor) or param.dim() != 3:
+            yield from super()._export_param(name, param)
+            return
+
+        local = param.to_local()
+        if local.shape[0] <= 0 or param.shape[0] % local.shape[0] or local.shape[0] == param.shape[0]:
+            yield from super()._export_param(name, param)
+            return
+
+        if os.environ.get("VERL_DSV41_LOCAL_EXPERT_EXPORT") == "1":
+            yield from self._export_local_experts(name, param)
+            return
+
+        for first_expert_id in range(0, param.shape[0], local.shape[0]):
+            block_tensor = param.narrow(0, first_expert_id, local.shape[0])
+            materialized = block_tensor.to(get_device_id(), non_blocking=True).full_tensor()
+            yield from split_fused_expert_tensor(name, materialized, first_expert_id=first_expert_id)
+
+    def _export_local_experts(self, name, param):
+        """Emit only the experts this rank's shard owns, with their global ids."""
+        from torch.distributed.tensor import Shard
+
+        from .utils import split_fused_expert_tensor
+
+        local = param.to_local()
+        shard_mesh_dims = [
+            d for d, placement in enumerate(param.placements) if isinstance(placement, Shard) and placement.dim == 0
+        ]
+        if len(shard_mesh_dims) != 1 or local.shape[0] * param.device_mesh.size(shard_mesh_dims[0]) != param.shape[0]:
+            # Not a single contiguous shard over the expert dim: keep the generic path.
+            yield from super()._export_param(name, param)
+            return
+
+        first_expert_id = param.device_mesh.get_coordinate()[shard_mesh_dims[0]] * local.shape[0]
+        materialized = local.to(get_device_id(), non_blocking=True)
+        yield from split_fused_expert_tensor(name, materialized, first_expert_id=first_expert_id)
+
     def _build_module(self):
         # Keep verl's Qwen VLM monkey-patch guard the same way FSDPTurboEngine
         # does: do not slice the text model before FSDP-Turbo's own CP split.
@@ -282,9 +363,10 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
         from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
         checkpoint_dir = Path(self._dsv41_model_path())
+        _log_rank0("materializing %d parameters from %s (experts deferred to meta)", len(param_meta), checkpoint_dir)
+        started = time.time()
         if os.environ.get("VERL_DSV41_RANDOM_INIT", "0") == "1":
-            if dist.get_rank() == 0:
-                logger.warning("VERL_DSV41_RANDOM_INIT=1: skipping checkpoint weights, deferring experts at N(0, 0.02).")
+            _log_rank0("VERL_DSV41_RANDOM_INIT=1: skipping checkpoint weights, deferring experts at N(0, 0.02)")
             full_state = _random_state_dict(param_meta) if dist.get_rank() == 0 else {}
         elif dist.get_rank() == 0:
             # Only rank 0 reads the checkpoint; the broadcast below feeds every other rank.
@@ -294,9 +376,8 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
                     f"Checkpoint {checkpoint_dir} is missing {len(report['missing'])} tensors the training model "
                     f"needs, e.g. {report['missing'][:5]}."
                 )
-            logger.info(
-                "DeepSeek-V4.1 checkpoint loaded from %s (%d tensors; %d checkpoint tensors not used, e.g. vision tower).",
-                checkpoint_dir,
+            _log_rank0(
+                "checkpoint read: %d tensors (%d checkpoint tensors unused, e.g. vision tower)",
                 len(full_state),
                 len(report["skipped"]),
             )
@@ -310,6 +391,7 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
         )
         set_model_state_dict(module, full_state, options=options)
         del full_state
+        _log_rank0("parameters materialized in %.1fs", time.time() - started)
 
         # Buffers are built with real values (only parameters were deferred) but on
         # the host: attention tables and scratch caches must follow the parameters'

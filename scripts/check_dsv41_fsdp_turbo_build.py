@@ -139,6 +139,9 @@ def main():
         if rank == 0:
             print(f"[check] {message}", flush=True)
 
+    def log_rank(message):
+        print(f"[check][rank{rank}] {message}", flush=True)
+
     config = build_fsdp_turbo_config(args)
     init_parallel_state(config)
 
@@ -194,12 +197,18 @@ def main():
         entry["devices"].add(str(local.device))
         if entry["sample"] is None:
             entry["sample"] = f"{name} {tuple(local.shape)} {local.dtype}"
-    for kind, entry in sorted(report.items()):
-        log(
-            f"  {kind}: {entry['count']} params, {entry['bytes'] / 2**30:.2f} GiB/rank on {sorted(entry['devices'])}"
-            f" | e.g. {entry['sample']}"
-        )
-    log(f"accelerator memory allocated: {torch.npu.memory_allocated() / 2**30:.2f} GiB" if torch.npu.is_available() else "")
+    if rank == 0:
+        for kind, entry in sorted(report.items()):
+            log(
+                f"  {kind}: {entry['count']} params, {entry['bytes'] / 2**30:.2f} GiB/rank on {sorted(entry['devices'])}"
+                f" | e.g. {entry['sample']}"
+            )
+    total_gib = sum(entry["bytes"] for entry in report.values()) / 2**30
+    try:
+        allocated = torch.npu.memory_allocated() / 2**30
+    except Exception:  # noqa: BLE001 - cuda builds have no torch.npu
+        allocated = torch.cuda.memory_allocated() / 2**30
+    log_rank(f"parameters {total_gib:.2f} GiB this rank, accelerator allocated {allocated:.2f} GiB")
 
     if args.forward:
         log("running one forward pass (batch=1, seq=8)")
@@ -213,10 +222,12 @@ def main():
         model.eval()
         input_ids = torch.randint(3, 1000, (1, 8), device=device)
         attention_mask = torch.ones_like(input_ids)
+        # No position_ids: the V4.1 reference forward indexes RoPE by absolute position and
+        # rejects that input (the engine strips it in `prepare_model_inputs`).
         with torch.no_grad():
-            output = model(input_ids=input_ids, attention_mask=attention_mask, position_ids=None)
+            output = model(input_ids=input_ids, attention_mask=attention_mask)
         logits = output.logits
-        log(f"forward ok: logits {tuple(logits.shape)} dtype={logits.dtype}")
+        log(f"forward ok: logits {tuple(logits.shape)} dtype={logits.dtype} absmax={logits.abs().max().item():.4f}")
 
     dist.barrier()
     dist.destroy_process_group()
