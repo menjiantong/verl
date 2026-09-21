@@ -339,6 +339,17 @@ python3 make_random_ckpt_dsv41_4layers.py --config config.dsv41_4layer.bf16.json
 > 注意开关有两个写法，二者等价：脚本层的 `LOCAL_EXPERT_EXPORT=1` 或引擎层的 `VERL_DSV41_LOCAL_EXPERT_EXPORT=1`（脚本已做 fallback；脚本层变量优先，只设其一即可）。
 
 
+## 4.5 训推一致性专项（2026-09-20，详见 [work_log/worklog_dsv41_train_infer_consistency.md](work_log/worklog_dsv41_train_infer_consistency.md)）
+
+对「`rollout_actor_probs_pearson_corr` 只有 0.95–0.98、`kl 0.10–0.19`」做了逐阶段数值分桶（新夹具 + 双侧 dump + 引擎 worker extension），结论：
+
+- **权重无问题**：引擎持有的参数与 checkpoint 逐张量一致（672 项抽查 664 项精确匹配，其余是未覆盖的 vision 塔）。
+- **差异从第 0 层注意力核内部开始**（embedding / attn_norm / q 投影完全一致，注意力输出差 0.34%，逐 token 均匀），随后被未训练模型逐层放大约 40 倍，最终隐状态相对误差 14% → 逐 token logprob 噪声 σ≈0.32–0.53 nats、均值≈0、argmax 一致率约 79%。该 σ 用 `KL≈0.5σ²` 正好解释线上 `kl 0.10–0.19`，`probs_diff_max 0.46–0.77` 对应约 21% 的 argmax 翻转位置。
+- **引擎自身 decode↔prefill 一致性很好**（0.05–0.14 nats），开启 `rl_config.enable_batch_invariant=true` 后 ≤0.006 nats（已写入启动脚本）。
+- **两条"对齐内核"路线均不可行**：训练侧 eager 注意力改 fp32 无端到端收益；训练侧启用融合 SparseFlashMla 被 A2/A3 稠密布局约束堵死（`cmp_mask_mode`/`cmp_ratio=4`）。
+- 另发现训练侧 padded/rmpad 路径的 **label roll 会跨样本回绕**（每序列 1 个响应 token 的 logprob 错，±0.03–0.10 nats/序列），建议单独修复。
+- 新增工具链 `scripts/dsv41_consistency/`（夹具/dump/参数校验/四种对比）、`VERL_DSV41_DUMP_BATCH` 落盘开关。
+
 ## 5. 剩余风险与待办
 
 | 风险/待办 | 说明 | 建议 |

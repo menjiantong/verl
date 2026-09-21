@@ -250,6 +250,15 @@ ROLLOUT=(
     # RL weight updates need weight_nz_mode=0 (FRACTAL_NZ breaks synced-weight precision);
     # rl_config.enabled sets that (and disables expandable segments) on the Ascend side.
     "${VLLM_ADDITIONAL_CONFIG_ROOT}.rl_config.enabled=true"
+    # Train/inference consistency: the rollout logprobs are produced by token-by-token
+    # decode against a paged KV cache in a dynamically composed batch, while the trainer
+    # recomputes them in one padded forward. Batch-invariant kernels remove the engine's
+    # own batch-composition dependence (see wiki/worklog: the engine's decode-vs-prefill
+    # gap on identical tokens is measured with and without this flag).
+    # `enable_training_consistency` additionally switches to the FA3 backend, which only
+    # supports non-MLA/non-SFA attention, so it stays off for V4.1 (its MLA + sparse
+    # attention must keep the plugin backend).
+    "${VLLM_ADDITIONAL_CONFIG_ROOT}.rl_config.enable_batch_invariant=true"
 )
 
 TRAINER=(
