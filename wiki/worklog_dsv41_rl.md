@@ -362,6 +362,8 @@ python3 make_random_ckpt_dsv41_4layers.py --config config.dsv41_4layer.bf16.json
 - 稠密：2.65B / 8 ≈ 0.33B ≈ 0.7GB/卡（FSDP 分片，可 CPU offload）。
 - 加载广播：单个 3D 专家张量 18.1GB（`384×4608×5120` bf16）**每卡瞬时**，DCP 逐 tensor 广播，同一时刻只有一个。
 - 因此加载峰值 ≈ **45–50GB/卡**；训练/rollout 阶段靠 `offload_policy` + vLLM sleep 与 27GB 专家常驻共存。
+
+
 | 权重同步峰值 | `get_per_tensor_param` 会对每个专家 DTensor 做 `full_tensor()`（18GB/次上卡），再 unfuse | 观察真机显存；必要时用 bucketed 传输/降低并发 |
 | 训练吞吐 | V4.1 参考注意力在 NPU 上走 `indexed_sparse_attention_torch`（eager，非 fused DSA）；`use_remove_padding=False` 走 padded | 先正确后快；后续评估 `use_sparse_flash_attn=True` / packed 路径 |
 | 稠密参数导出仍走 offload/all-gather 路径 | 专家之外（embed/head/attention/mlp，约 1GB/rank）仍按 `_export_param` 默认实现 `param.to(device).full_tensor()`，在 CPU-offloaded DTensor 上做 all-gather；scaled32 实测这部分的传输量约 3 GiB/rank、折合约 3–5s | 若日后仍是瓶颈：需要按**单个参数**对齐 FSDP 分片与引擎 TP 分片（embedding/head 两侧都是 dim0 连续切分，但 loader 还会再 narrow，不能直接送分片）；或按 G13 的思路让引擎回报所需分片 |

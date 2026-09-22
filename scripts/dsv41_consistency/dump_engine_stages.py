@@ -36,6 +36,11 @@ def parse_args():
     ap.add_argument("--tp", type=int, default=8)
     ap.add_argument("--ep", type=int, default=8)
     ap.add_argument("--max-model-len", type=int, default=2048)
+    ap.add_argument("--mem-util", type=float, default=0.9,
+                    help="gpu_memory_utilization; the vLLM worker refuses to start when the "
+                         "free NPU memory is below this fraction of the device total, and every "
+                         "card here carries a few GiB of other tenants' resident allocations, so "
+                         "0.9 can fail by a few hundred MiB (see worklog §10).")
     ap.add_argument("--lengths", default="", help="Comma separated subset of fixture lengths.")
     ap.add_argument("--skip-stages", action="store_true", help="Only dump params + logprobs.")
     ap.add_argument("--skip-params", action="store_true")
@@ -69,7 +74,7 @@ def main():
         enable_expert_parallel=args.ep > 1,
         enforce_eager=True,
         max_model_len=args.max_model_len,
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=args.mem_util,
         enable_prefix_caching=False,
         enable_chunked_prefill=True,
         max_num_batched_tokens=args.max_model_len,

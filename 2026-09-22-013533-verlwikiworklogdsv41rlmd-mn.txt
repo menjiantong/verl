@@ -1,0 +1,1746 @@
+ ▐▛███▛█   Claude Code v2.1.271
+▝▜██████▀  deepseek-v4-flash · API Usage Billing
+  ▝▝ ▝▝    /workspace-verl/verl
+
+
+❯ @verl/wiki/worklog_dsv41_rl.md 这是我之前的工作记录，看下为                   
+  /mnt/share/m00899630/weights/                                                 
+  这个文件下的几个权重的区别？为什么生成了这几个权重。                          
+  ⎿  Read verl/wiki/worklog_dsv41_rl.md (411 lines)
+  ⎿  Loaded verl/CLAUDE.md
+  ⎿  Loaded 2 skills from verl/.claude/skills
+  ⎿  2 skills available
+
+  Thought for 2s (ctrl+o to expand)
+
+● 我来看一下这个权重目录的实际情况，并与工作记录对应。
+
+  Thought for 1m 34s, searched for 1 pattern, read 3 files, listed 7 directories, ran 16 shell commands (ctrl+o to expand)
+
+● 看完了。四个目录的关系和"为什么会有这四个"完全能从工作记录 +
+  现场实测对上，我顺手把权重做了实测采样，结论如下。
+
+  一张表看清四个权重
+
+  目录: DeepSeek-V4.1-Flash-8layer-random
+  大小 / 分片: 209 GB / 18 片
+  层数: 8
+  routed 专家: 384
+  初始化（实测）: U(−1,1)：absmax 恰为 1.0、std≈0.577
+  生成时间（谁生成）: 09-17 01:34–03:48，uid 9007（非本容器 root）
+  用途: 起始参照物，scripts/run_vllm2.sh 就是 serve 这份
+  ────────────────────────────────────────
+  目录: DeepSeek-V4.1-Flash-4layer-random
+  大小 / 分片: 106 GB / 22 片
+  层数: 4
+  routed 专家: 384
+  初始化（实测）: N(0,1)：std=1.0、absmax 4.4–5.7
+  生成时间（谁生成）: 09-18 10:56→11:14（18 min，seed 1234）
+  用途: G11：8 层在 62GB 卡上 update_actor OOM，先跑通链路
+  ────────────────────────────────────────
+  目录: DeepSeek-V4.1-Flash-4layer-scaled
+  大小 / 分片: 106 GB / 22 片
+  层数: 4
+  routed 专家: 384
+  初始化（实测）: fan-in scaled：线性 std=1/√fan_in≈0.0140、norm
+  增益=1.0、bias/attn_sink/HC=0、head ×4（std 0.0556）
+  生成时间（谁生成）: 09-19 02:34–02:42
+  用途: G12：N(0,1) 下所有 logprob 指标是
+  nan，换成"数值像样"的随机权重做同步判读
+  ────────────────────────────────────────
+  目录: DeepSeek-V4.1-Flash-4layer-scaled32
+  大小 / 分片: 14 GB / 3 片
+  层数: 4
+  routed 专家: 32
+  初始化（实测）: 同 scaled 配方（seed 也相同）
+  生成时间（谁生成）: 09-19 02:34
+  用途: 快速迭代：一步 25–74s，用来调 G13 的本地专家导出
+
+  为什么是这四个（一条决策链）
+
+  1. 8layer-random 是最初的参照：真实 V4.1-Flash 取 8 层 +
+     随机权重（209GB），训练结构与推理结构对它对齐（§0、§2.1）。它是 U(−1,1)
+     填充，不是本仓库 make_random_ckpt_dsv41_4layers.py 生成的（那个脚本是
+     N(0,1)），而且属主是别的用户 —— 属于外部输入。
+  2. 4layer-random 是 G11 的产物：8 层下 vLLM 权重 28.6GB +
+     训练侧优化器状态/激活在 62GB 卡上放不下（Tried to allocate 6.33 GiB … 49.95
+     GiB already allocated），所以砍半层数。生成记录在 /mnt/share/m00899630/wor
+     k_place/dsv41-4layer-random-weights/{generate.log,worklog.md}：与 8
+     层逐张量比对 4972 张量 0 差异，8 层多出的 4696 个恰为 layers.4–7；config 与
+     8 层只差 num_hidden_layers 和 compress_ratios 两项。注意它是 V2——V1 没带
+     vision，这次特意把 vision/aligner/image_* 完整加回以对齐 8 层惯例。
+  3. 4layer-scaled 是 G12 的产物：N(0,1) 让 logits ~N(0,71)，softmax 近
+     one-hot，training_log_ppl 325.5、entropy 0.102，bf16 指数溢出 → 全指标
+     nan，无法判断同步对不对。于是给生成器加了 --init 
+     scaled（make_random_ckpt_dsv41_4layers.py:83-104）：矩阵
+     1/√fan_in、norm=1、bias/sink/HC=0、--head-gain 4（top-1 概率≈0.4）。实测
+     scaled 后 diff_mean 0.012、pearson 0.967、kl 0.123。
+  4. 4layer-scaled32 是纯速度工具：唯一区别是 n_routed_experts 32 vs 384（我
+     diff 了两份生成 config，只差这一行），14GB
+     让"改代码→验证"的循环从分钟级降到秒级；G13 的导出优化、以及 4.4
+     的数值对照表里的小尺度数据都是它跑出来的。全尺寸结论最后在 384
+     专家那份上复核（18s/次同步，pearson 0.90–0.92）。
+
+  一个容易踩的细节：scaled32 不是 scaled 的前 32 个专家
+
+  生成器按 sorted(state_dict) 顺序、用同一个 seed=1234 的 generator
+  连续抽随机数（make_random_ckpt_dsv41_4layers.py:141）。我逐张量比对了两份
+  scaled：layers.0 的专家 0、1、10 逐字节相同，从 专家 11 起全部不同 ——
+  分叉点正好是排序序里只存在于 384 版的下一个键（experts.100.*，字典序落在
+  experts.10.* 与 experts.11.* 之间），它多消耗了随机流，之后所有张量（含 layer
+  3、含 gate.weight）都错位。所以两者是"同配方同种子、统计等价"，不能当作同一模
+  型的截断 来比对数值。
+
+  两点提醒
+
+  - DeepSeek-V4.1-Flash-4layer-scaled/ 里有个 .config.json.swp（mtime 今天 
+    09:37），但 config.json 本体仍是 09-19 02:42 —— 说明有人今天用 vim 打开过它
+    、没有保存（进程已不在，是残留锁文件）。要动这个目录前先确认一下，别被 stale
+    swap 坑了。
+  - 这四份全部是 bf16 随机权重，机器上还没有真实（fp8 专家 +
+    quantization_config）的 V4.1-Flash 权重；§5
+    里"真实权重尚未验证"这条仍然成立，切换只需 MODEL_PATH=（层数/专家数全由
+    config.json 驱动）。
+
+✻ Baked for 7m 55s · done Sunday 9:47 AM
+
+❯ scale32 是32个专家？                                                          
+
+  Thought for 4s (ctrl+o to expand)
+
+● 是的，32 个 routed experts（其余结构不变）。三处实测都对得上：
+
+  ┌───────────────────────────────────┬────────────────────────┬───────────┐
+  │               检查                │ 8layer / 4layer-random │ scaled32  │
+  │                                   │        / scaled        │           │
+  ├───────────────────────────────────┼────────────────────────┼───────────┤
+  │ config.json →                     │ 384                    │ 32        │
+  │ text_config.n_routed_experts      │                        │           │
+  ├───────────────────────────────────┼────────────────────────┼───────────┤
+  │ layers.N.ffn.gate.bias 形状       │ (384,)                 │ (32,)     │
+  ├───────────────────────────────────┼────────────────────────┼───────────┤
+  │ 每层专家张量数                    │ 1152 =                 │ 96 = 32×3 │
+  │                                   │ 384×3（w1/w2/w3）      │           │
+  ├───────────────────────────────────┼────────────────────────┼───────────┤
+  │ index 总张量 / 大小               │ 4972 / 113.7 GB        │ 748 /     │
+  │                                   │                        │ 14.0 GB   │
+  └───────────────────────────────────┴────────────────────────┴───────────┘
+
+  不变的：n_shared_experts=1、n_activated_experts=6（每 token 选 6
+  个）、moe_inter_dim=2304（单个专家大小一样，所以省下的纯粹是专家个数）、层数
+  4、hidden 5120。
+
+  两点随之而来的性质：
+
+  - 8 卡 EP=8 时每 rank 4 个专家（384 版是 48 个）——G13
+    里"本地专家导出"路径最早就是在它上面验证的（导出 80s → 0.048s、每 rank 传输
+    12.14 GiB → 4.76 GiB），后来在 384 专家的全尺寸上复核。
+  - 激活比例变高：6/32 = 18.75%，而真实配置是 6/384 = 1.56%。所以它跑出来的吞吐/
+    路由行为不代表全尺寸（这也正是它只用来做快速迭代、最终结论都在 384
+    专家版上复核的原因）；用它判断"权重同步是否数值正确"仍然有效（错的配对会给出
+    O(1) 落差），但不要用它评估性能。
+
+  另外提醒一句：如上一轮所说，scaled32 与 scaled 虽然同 seed 同配方，但从
+  experts.11 起随机流就错位了，所以它是独立生成的一份 32 专家权重，不是 scaled
+  的前 32 个专家截断。
+
+✻ Sautéed for 6s · done Sunday 9:50 AM
+
+❯ 再次说明下N(0, 1)的分布为何不行，没看明白，可以详细点。                       
+
+  Thought for 31s (ctrl+o to expand)
+
+● 我把"为什么 N(0,1) 不行"从公式到实测逐层拆开。先做一个可复现的小实验（用真实
+  checkpoint 里的张量）：
+
+  Thought for 14s, ran 1 shell command (ctrl+o to expand)
+
+● 核心机制实测出来了，我再确认两个结构细节（末层是否有 norm、SwiGLU
+  是否截断），这决定了放大倍数怎么收场：
+
+  Thought for 22s, searched for 2 patterns, ran 3 shell commands (ctrl+o to expand)
+
+● 好，从头讲清楚。结论一句话：N(0,1) 的填充让每个线性层把激活放大 71.6 
+  倍，最后把 logits 顶到 σ≈71 
+  的量级，超出数值链路能表示/能判读的范围。下面从公式一步步推到实测指标。
+
+  ---
+
+  第 1 步：一层线性层对"幅度"做了什么
+
+  一个线性层 y = W x，W 形状 [out, fan_in]，元素 iid、方差 Var(w)；输入 x
+  的每个元素 RMS = σ（即 E[x_j²] = σ²）：
+
+  Var(y_i) = Σ_j Var(w_ij)·E[x_j²] = fan_in · Var(w) · σ²
+  =>  RMS(y) = σ · √(fan_in · Var(w))
+
+  fan_in = 5120（hidden_size，所有矩阵乘的 fan_in 都约在这个量级：5120 或
+  2304）。
+
+  - 训练好的模型：Var(w) ≈ 1/fan_in → RMS(y) = σ，每层"原样传递"幅度。
+  - N(0,1) 填充：Var(w) = 1 → RMS(y) = σ · √5120 = σ · 71.6。
+
+  即：每过一层线性层，幅度乘 71.6。这不是"权重有点大"的问题，而是——真模型里
+  1/√fan_in 这个因子是被刻意放进去的（和 Xavier/He
+  初始化同一个道理：让残差流停在一个 O(1) 的不动点上），N(0,1)
+  恰好把它整个丢掉了。
+
+  实测（layers.0 的真实张量，单位 RMS 输入）：
+
+  ┌─────────────┬────────────────────┬──────────────────┬──────────┐
+  │             │  gate.weight std   │ 专家 w1 输出 RMS │ 放大倍数 │
+  ├─────────────┼────────────────────┼──────────────────┼──────────┤
+  │ N(0,1) ckpt │ 1.0006             │ 73.20            │ 73.2×    │
+  ├─────────────┼────────────────────┼──────────────────┼──────────┤
+  │ scaled ckpt │ 0.01398 (=1/√5120) │ 1.02             │ 1.0×     │
+  └─────────────┴────────────────────┴──────────────────┴──────────┘
+
+  第 2 步：这个放大在网内怎么传导
+
+  - 中间层：残差流 h ← h + block(h)，每个 block 的输出都是 ~73
+    倍量级的成分。它没有一路炸到 71.6⁴，是因为有几个天然封顶：SwiGLU 被
+    swiglu_limit=10 截断（model.py:845-847）、Hyper-Connections 的混合系数过
+    sigmoid（有界）、MoE 是归一化的 top-6 凸组合。但残差流 RMS 已经涨到几十。
+  - 路由（决定 6/384 选谁）也被放大：实测 384 个 gate logits std=73.25, 
+    min=−178.8, max=+235.7（scaled 版是 std=1.01, min=−3.2, 
+    max=+3.0）。路由本来该由 token 内容以 ±3 的差距决定；现在被 ±200
+    的随机投影主导，任何 O(1) 的数值扰动（bf16 舍入、不同 kernel）都会让选中的 6
+    个专家整体换一批。
+  - 末层：logits = self.head(self.norm(h))（model.py:1269）。注意这个 self.norm
+    是最终的 RMSNorm，它把残差流归一化回单位 RMS——所以中间涨到几十并不会直接传到
+    logits。真正决定 logits 尺度的是 head 自己的权重尺度：
+
+  RMS(logits) = √5120 × std(head.weight)
+
+  ┌────────────────────┬────────────────┬──────────────────────────────────┐
+  │     head 权重      │      std       │            logits RMS            │
+  ├────────────────────┼────────────────┼──────────────────────────────────┤
+  │ N(0,1)             │ 1.0            │ 71.6（实测 σ≈71，最大 ≈ 4.85σ ≈  │
+  │                    │                │ 344）                            │
+  ├────────────────────┼────────────────┼──────────────────────────────────┤
+  │ scaled + head-gain │ 4/√5120 =      │ 4.0（实测 absmax 18.56 ≈         │
+  │  4                 │ 0.0559         │ 4.85×4）                         │
+  └────────────────────┴────────────────┴──────────────────────────────────┘
+
+  第 3 步：σ≈71 的 logits 触发三个致命后果
+
+  (1) softmax 变成 one-hot，采样退化。 词表 129280，最大 logit ≈ 4.85σ ≈
+  344，top-1 与次高之间实测差 ~165 nats。exp(165) 是个 1e72 量级的数 → 概率全是
+  0 或 1，熵实测 0.102（正常应 ~5）。没有探索、没有梯度信号可言。
+
+  (2) exp 路径溢出 → nan/inf。 浮点（含 bf16，指数范围同 fp32）的安全上界是
+  ln(3.39e38) = 88.7。logprob 内核要对未做 max 平移的 logits 取 exp，exp(336)
+  直接 inf → 随后 inf/inf → nan。这正好解释 G12
+  那一整片异常：rollout_probs_diff_* : nan、rollout_corr/training_ppl: 
+  inf、kl/k3_kl: nan、actor/grad_norm: nan，以及"采样没取 argmax 而是返回任意
+  token"（softmax 输出被污染成 NaN，采样器给不出有意义的分布）。training_log_ppl
+  325.5 就是"任意 token 相对最大 logit 的 NLL"——和 344 这个最大 logit
+  是同一个数。
+
+  (3) 判据失效——这才是必须重做的真正原因。 我们生成随机权重不是为了训练出什么，
+  而是把它当标尺去回答一个问题："权重同步对不对"。§4.4 的判据是：同步正确 →
+  两侧对同一 token 的 logprob 只差 bf16
+  噪声（~1e-2）；同步错位（专家错绑/布局没回退）→ O(1)~O(10)
+  的落差。这个判据要求标尺满足三件事，N(0,1) 一条都不满足：
+
+  ┌──────────────────────────────┬──────────────────────────────────────────┐
+  │             要求             │          N(0,1) ckpt 的实际情况          │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ 数值链路在范围内，能出数     │ ✗ exp(336) → nan/inf                     │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ 基线 logprob 是              │ ✗ 基线 325 nats，1~10 的落差被完全淹没   │
+  │ O(1)，落差才看得见           │                                          │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ 对数值噪声不敏感、可复现     │ ✗ 路由 logits                            │
+  │                              │ σ=73，选中的专家会因舍入而整体翻转       │
+  └──────────────────────────────┴──────────────────────────────────────────┘
+
+  第 3 条尤其隐蔽：即使不溢出，也不可用。因为"同步错了"和"噪声让路由翻了"这两种
+  情况给出的都是大幅 logprob 差异，无法区分。
+
+  第 4 步：--init scaled 就是逐项把上面这些补回来
+
+  make_random_ckpt_dsv41_4layers.py:83-104：
+
+  参数类别: 矩阵（attn/mlp/expert/gate/head）
+  randn 模式: N(0,1)
+  scaled 模式: N(0, 1/√fan_in)
+  为什么: 每层保 RMS，不掉进 71× 放大
+  ────────────────────────────────────────
+  参数类别: RMSNorm 增益
+  randn 模式: N(0,1)（实测 std≈0.58~1.0）
+  scaled 模式: 恒等于 1
+  为什么: 它是乘性系数，语义上初值必须是
+  1；随机值等于给每个通道一个随机音量+随机翻号
+  ────────────────────────────────────────
+  参数类别: *.bias / attn_sink / HC base|scale
+  randn 模式: N(0,1)
+  scaled 模式: 0
+  为什么: 这些量的"中性值"就是 0（sink 加在注意力 logits 上；HC 过
+  sigmoid(mix·scale+base)）；填随机值是给路由/注意力注入固定随机偏置
+  ────────────────────────────────────────
+  参数类别: head.weight
+  randn 模式: 同其他
+  scaled 模式: 额外 ×--head-gain=4
+  为什么: logits ~ N(0,4)：采样不退化（熵≈5）、exp
+  安全（e^19.4=2.7e8）、又足够"尖锐"（top-1 概率≈0.4，接近真实模型）
+
+  实测对照（G12 vs 4.4）：
+
+  ┌────────────────────────────────────┬─────────────┬─────────────┐
+  │                指标                │ N(0,1) 权重 │ scaled 权重 │
+  ├────────────────────────────────────┼─────────────┼─────────────┤
+  │ 路由 logits std / 峰谷             │ 73 / 415    │ 1 / 6       │
+  ├────────────────────────────────────┼─────────────┼─────────────┤
+  │ actor/entropy                      │ 0.102       │ 5.02        │
+  ├────────────────────────────────────┼─────────────┼─────────────┤
+  │ training_log_ppl / rollout_log_ppl │ inf / nan   │ 5.21 / 5.09 │
+  ├────────────────────────────────────┼─────────────┼─────────────┤
+  │ rollout_probs_diff_mean            │ nan         │ 0.0122      │
+  ├────────────────────────────────────┼─────────────┼─────────────┤
+  │ pearson_corr                       │ nan         │ 0.967       │
+  ├────────────────────────────────────┼─────────────┼─────────────┤
+  │ rollout_corr/kl                    │ nan         │ 0.123       │
+  ├────────────────────────────────────┼─────────────┼─────────────┤
+  │ actor/grad_norm                    │ nan         │ 0.0（有限） │
+  └────────────────────────────────────┴─────────────┴─────────────┘
+
+  所以关键不是"随机权重好不好看"，而是"这份随机权重必须落在一个真模型的活动量级
+  上" —— 只有那样，权重同步、专家配对、布局回退这些我们要验证的东西才在正常数值
+  范围内工作，且"错了"会以清晰可辨的方式暴露出来。同样的道理对 8
+  层那份也成立：它是 U(−1,1) 填充（absmax 恰为 1.0、std 0.577），等效放大
+  0.577×√5120 ≈ 
+  41×，属于同一类问题，只是当时用它做的是链路/显存验证，还没进入数值判读阶段。
+
+✻ Baked for 2m 43s · done Sunday 9:54 AM
+
+❯ @verl/wiki/work_log/DeepSeek-V4.1-Flash-4layer-scaled32-20260919_025432.log   
+  这是我之前的运行记录，看下寻推一致的问题。分析下哪里可能存在训推不一致，先给  
+  出方案。                                                                      
+
+  Thought for 2m 6s, searched for 2 patterns, read 5 files, listed 2 directories, ran 13 shell commands (ctrl+o to expand)
+
+● 读完了这份日志（3561 行，scaled32，跑了 6 步）。先把现象结构化，再给方案。
+
+  ---
+
+  一、日志里能读出什么（把现象量化）
+
+  ┌──────────────────────────┬────────────────────┬──────────────────────────┐
+  │     指标（step 1→6）     │        数值        │           含义           │
+  ├──────────────────────────┼────────────────────┼──────────────────────────┤
+  │                          │                    │ |p_actor −               │
+  │ rollout_probs_diff_mean  │ 0.010–0.016        │ p_rollout|，概率空间差异 │
+  │                          │                    │  1%                      │
+  ├──────────────────────────┼────────────────────┼──────────────────────────┤
+  │ rollout_probs_diff_max   │ 0.46–0.77          │ 个别 token 两侧概率差    │
+  │                          │                    │ 40×mean                  │
+  ├──────────────────────────┼────────────────────┼──────────────────────────┤
+  │ pearson_corr             │ 0.95–0.98          │ 未达 worklog 定的 >0.99  │
+  ├──────────────────────────┼────────────────────┼──────────────────────────┤
+  │ rollout_corr/kl / k3_kl  │ 0.10–0.19 /        │ E[log π_roll − log       │
+  │                          │ 0.10–0.15          │ π_train]，两个估计器一致 │
+  ├──────────────────────────┼────────────────────┼──────────────────────────┤
+  │ training/rollout_log_ppl │ 5.10 vs 4.99       │ 训练侧困惑度总是更高     │
+  ├──────────────────────────┼────────────────────┼──────────────────────────┤
+  │ log_ppl_diff / _min      │ 0.098–0.195 /      │ 每条序列都同号（全为正） │
+  │                          │ 0.024–0.048        │                          │
+  ├──────────────────────────┼────────────────────┼──────────────────────────┤
+  │ ppl_ratio                │ 1.10–1.25          │ 训练侧系统性更"平"       │
+  ├──────────────────────────┼────────────────────┼──────────────────────────┤
+  │ chi2_seq                 │ −1.0（恒为钳位值） │ 每条序列 Σ log ρ < −10   │
+  │                          │                    │ nats                     │
+  ├──────────────────────────┼────────────────────┼──────────────────────────┤
+  │ actor/entropy、grad_norm │ 4.94 / 0.0         │ 随机权重 reward 全       │
+  │                          │                    │ −1，无梯度信号（正常）   │
+  └──────────────────────────┴────────────────────┴──────────────────────────┘
+
+  由此得到 5 个结构性结论（比绝对值更重要）：
+
+  - F1 方向一致 → 不是对称舍入噪声。 bf16
+    数值噪声应该是零均值、序列间符号随机；而 log_ppl_diff_min > 0，128
+    条序列全部是"训练侧 logprob 更低"。这说明存在系统性偏移，不是噪声底。
+  - F2 重尾 → 存在离散跳变。 diff_max/mean ≈ 
+    40，说明除了一个连续小偏移，还有少量 token
+    出现大跳变——这是选择类事件（专家选择、稀疏索引选择）翻转的特征。
+  - F3 序列级累积。 chi2_seq 被钳在 −1（Σ log ρ ≈ 128×0.1 = −12.8 <
+    −10），偏差在序列尺度上稳定累积。
+  - F4 偏差随规模恶化。 scaled32（32 专家）：kl ≈ 0.11、pearson 0.97；同样 4 层
+    scaled 配方的全尺寸（384 专家）：kl ≈ 0.38、pearson 0.90–0.92。专家数 ×12 → 
+    偏差 ×3.5，这是很强的指向性（MoE 路径，或随序列长度变化的注意力路径）。
+  - F5 两侧计算"模式"根本不同。 rollout 侧 logprob 来自 decode（KV cache + SFA
+    fused 稀疏算子，且第 1 个 response token 来自 prefill
+    那一次前向）；训练侧来自整段 prefill + eager 
+    参考实现。这两个差异必须分开验证——现在的指标把二者混在一起了。
+
+  二、不一致可能出在哪里（按证据吻合度排序）
+
+  #: 1
+  位置: MoE 路由选择
+  机制: 训练侧 gate 在 fp32/bf16 下的 sqrtsoftplus 打分 + top-6 边界近平局
+  预期特征: 离散跳变、随专家数恶化
+  与 F1–F4: F2 ✔ F4 ✔
+  ────────────────────────────────────────
+  #: 2
+  位置: MoE 输出/归约 dtype
+  机制: 6 专家输出累加、EP all-to-all（mc2 fullmesh_v2）的归约顺序/精度
+  预期特征: 连续系统性小偏移
+  与 F1–F4: F1 ✔ F3 ✔
+  ────────────────────────────────────────
+  #: 3
+  位置: 注意力压缩分支
+  机制: 训练参考：ratio>1 时先升 fp32 再 softmax 门控池化；partial group
+  不可见（model.py:504-529）。推理侧 compressor.py
+  的可见性（floor/ceil）、池化精度、compress_rope_theta=160000 位置语义
+  预期特征: 位置相关偏移，序列尾部最明显
+  与 F1–F4: F1 ✔ F3 ✔
+  ────────────────────────────────────────
+  #: 4
+  位置: indexer / candidate 两级 top-k
+  机制: index_topk=512、candidate_topk_blocks=2048、tie-break、score 的
+  dtype（训练 eager vs 推理 fused _select_sparse_indices）
+  预期特征: 离散跳变、长序列更明显
+  与 F1–F4: F2 ✔ F4（部分）
+  ────────────────────────────────────────
+  #: 5
+  位置: 滑动窗口边界
+  机制: 训练 window_size=128 环形缓冲（get_window_topk_idxs）vs 推理
+  ori_win_left
+   = window_size-1
+  预期特征: 连续小偏移
+  与 F1–F4: F1（部分）
+  ────────────────────────────────────────
+  #: 6
+  位置: HC (Hyper-Connections)
+  机制: 训练：sinkhorn 20 次迭代、fp32；推理侧实现/精度未知；迭代会放大小差异
+  预期特征: 连续系统性偏移
+  与 F1–F4: F1 ✔
+  ────────────────────────────────────────
+  #: 7
+  位置: swiglu_limit=10.0 截断
+  机制: 若只有单侧生效，超阈值处出现大跳变
+  预期特征: 稀疏大跳变
+  与 F1–F4: F2（部分）
+  ────────────────────────────────────────
+  #: 8
+  位置: 权重同步残留
+  机制: 布局回退/TP 分片/local-expert 配对
+  预期特征: 错位会 O(1)，当前 0.01 量级基本排除——但未做权重级终判
+  与 F1–F4: —
+  ────────────────────────────────────────
+  #: 9
+  位置: decode vs prefill（推理侧独有）
+  机制: KV cache 逐 token 写入 + decode 专用 kernel
+  预期特征: 随位置/长度增长
+  与 F1–F4: F1 ✔ F3 ✔
+  ────────────────────────────────────────
+  #: 10
+  位置: 采样后处理
+  机制: temperature=1.0、generation_config.json 覆盖（日志已确认生效）
+  预期特征: —
+  与 F1–F4: 低
+
+  ▎ 注意：F1 的方向（推理侧更"尖锐"、训练侧更"平"）本身就是线索——它更像是"训练侧
+  ▎ 比推理侧看到了更多上下文/更软的注意力"（候选 3/5/9），或"推理侧累加更接近 
+  ▎ fp32"（候选 2/6）。仅靠现有日志无法定案，必须做下面的对照实验。
+
+  三、方案（分 5 步，每步都有判据；按"先排除最大分支、成本最低"排序）
+
+  Step 0｜per-token 落盘，把现象从"标量"变成"曲线"（改 ~20 行 + 跑 1 步）
+
+  在 verl/utils/debug/metrics.py::calculate_debug_metrics 旁加一个开关，把
+  (seq_idx, token_pos, rollout_logprob, actor_logprob, diff) 落成 npz。判据：
+  - diff 在 response 第 1 个 token 明显不同 → 指向 prefill vs decode（F5/候选
+    9）；
+  - diff 随绝对位置/序列长度单调增长 → 指向窗口/压缩/索引（候选 3/4/5）；
+  - 符号分布 + |diff| 分位（p50/p99/max）→ 区分"连续偏移"（候选
+    2/6）与"离散跳变"（候选 1/4/7）。
+
+  Step 1｜权重级终判：引擎侧 checksum（与 Step 0 同一次运行）
+
+  给引擎加只读 RPC：对指名参数算 checksum/absmax，与训练侧同名参数逐一比对（覆盖
+  embed/head 的 TP 分片、MoE 布局回退双向幂等、local-expert
+  配对）。判据：全部一致 → 后续全部聚焦前向数值；任一不一致 →
+  直接定位，不用再做后面的实验。这一步是 worklog §4.4
+  早就写好的"若日后判读为同步有问题"分支，现在正好该做。
+
+  Step 2｜teacher-forcing 的 prefill-to-prefill logits 对比（脚本级，不需 
+  RL，最省）
+
+  把整段 prompt+response 当作 prompt 喂给 vLLM 并取 prompt_logprobs（一次 
+  prefill 算完所有位置），同时训练侧用 check_dsv41_fsdp_turbo_build.py
+  的路径对同一份 input_ids 前向、dump
+  logits。这样得到"同一模式、同一输入"的逐位置对比，把 decode 路径和 engine
+  差异彻底分开。判据：prefill-vs-prefill 的 |Δlog p| 若 ≪ 0.10 → 主因在 decode
+  路径（候选 9）；若仍在 0.10 量级 → 主因在共享的语义/数值差异，进 Step 3。
+
+  Step 3｜模块二分（用 Step 2 的 harness，一次只留一个变量）
+
+  按顺序做，每一步都能独立定案：
+  1. embed+head 单算（跳过所有 layer）→ 分离 head GEMM / TP 分片；
+  2. 逐层 hidden 对比（两侧 dump 同名张量）→ 找到第一层出现显著差异的位置；
+  3. 注意力子路径：把 index_topk/candidate 关掉、窗口放开到全覆盖、单独打印
+     compressed 可见位置集合与池化结果 → 验证候选 3/4/5；
+  4. MoE 子路径：两侧 dump 每 token 的 top-6 expert id（直接比，是否翻转）+
+     专家输出累加 dtype + swiglu 截断是否两侧生效 → 验证候选 1/2/7（这是 F4
+     的头号嫌疑）；
+  5. HC：sinkhorn 迭代次数与精度对齐 → 候选 6。
+
+  Step 4｜判读与两种收尾（先定门槛，再看结果）
+
+  建议门槛：prefill-vs-prefill 的 |Δlog p| mean < 1e-3、p99 < 1e-2（纯 dtype
+  噪声）；decode 路径 mean < 0.02。当前 0.10 明显超标。
+  - 收尾 (a)：定位到可修的语义差异（窗口边界、partial group
+    可见性、截断缺失、dtype 提升）→ 修 + 用同一套 dump 复验；
+  - 收尾 (b)：定位到不可消除的 kernel 近似（SFA 融合算子的稀疏选择无法与 eager
+    逐位对齐）→ 把 RL 的修正真正打开：现在 rollout_correction 里 rollout_is: 
+    None、rollout_rs: None，只有 metrics 在算、没有实际纠偏；打开 IS/RS + 设 KL
+    阈值告警，而不是继续追数值。
+
+  Step 3.5（并行、低成本）｜真实权重到位后的基线复测
+
+  现在所有结论都在随机权重上。真实权重是 fp8 专家 + 
+  quantization_config，反量化路径会引入第三类差异（推理 fp8 vs 训练反量化
+  bf16），KL 里会再叠一层。所以顺序是：先在小权重上定位（Step 0–3）→ 再用同一套 
+  dump 在真实权重上复测，否则两边的差异混在一起分不开。
+
+  ---
+
+  建议的起点：Step 0 + Step 1 合并成一次运行（scaled32、TRAIN_BSZ=8 / SAMPLE_N=2
+  / MAX_RESPONSE_LEN=128，冷启动 ~20 min + 1 步 ~30–75s），因为它一次性回答"是
+  同步问题还是前向问题"这个最大的分支。要我现在开始实现 Step 0/1 的落盘开关和
+  checksum RPC 吗？
+
+✻ Worked for 5m 7s · done Sunday 10:03 AM
+
+❯ 继续分析，比如现在是attn可能有不一致，layers.0.attn。你可以在这一步直接让训练 
+  复用推理的权重/推理复用训练的权重，然后看看后续的步骤还有没有差异，如果没有了 
+  ，说明这就是这里的问题。同时做好工作记录。遇到的问题，报错，修改，执行的记录  
+  ，统统都要记录下来。                                                          
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ 继续，同时注意下可以/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-4layer-s 
+  caled32 /mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-4layer-scaled        
+  使用这两个权重，8层的我删掉了。还有验证后可以杀掉进程，避免占长时间用显存资源 
+  。如果没有显存，那么等待下，一直没有可以结束。做好工作记录。我后续再找机器。  
+
+❯ 继续                                                                          
+
+  Thought for 28s (ctrl+o to expand)
+
+● 明白。我按你的思路来：让推理侧直接用训练侧同源的那份 
+  checkpoint（绕过同步路径），在 teacher-forcing / prefill 模式下逐层对比 logits
+  与中间激活 —— 如果差异消失，说明问题在同步/加载路径；如果差异还在，就沿着
+  layers.0.attn 往下二分。先查环境占用，同时建工作记录文件。
+
+  Thought for 22s, ran 3 shell commands (ctrl+o to expand)
+
+● NPU 情况良好：chip 2–15（NPU 1–7）完全空闲，chip 0/1 只有别的租户的小进程（各
+  ~3–5GB）。主机内存 2.4TB
+  可用。先建工作记录，再看现有冒烟脚本的构建路径以便复用。
+
+● Write(wiki/worklog_dsv41_train_infer_consistency.md)
+  ⎿  Wrote 66 lines to wiki/worklog_dsv41_train_infer_consistency.md
+      1 # DeepSeek-V4.1 训推一致性排查工作记录（2026-09-21 起）
+      3 > 目标：定位 GRPO 链路里 **训练侧（FSDPTurbo/verl engine）与推理
+        侧（vLLM-ascend）对同一批 token 的 logprob 存在 ~0.10 nats 系统性
+        偏差**的根因。
+         与 `work_log/DeepSeek-V4.1-Flash-4layer-scaled32-20260919_025432
+        .log`。
+        条追加，不删改。**
+      6 
+      7 ---
+      9 ## 0. 已知事实（来自 2026-09-19 的 scaled32 6 步日志）
+     … +86 lines (ctrl+o to expand)
+
+  Thought for 17s, read 1 file, ran 4 shell commands (ctrl+o to expand)  ⎿  Loaded verl/CLAUDE.md
+  ⎿  Loaded 2 skills from verl/.claude/skills
+  ⎿  2 skills available
+
+● 关键发现：GRPO 脚本里已经有
+  rl_config.enable_batch_invariant=true，注释还提到"net engine 的
+  decode-vs-prefill gap 已测过"。先确认这个开关在那次 02:54
+  的运行里是否已生效，并找出已有的测量记录。
+
+  Thought for 8s, ran 4 shell commands (ctrl+o to expand)
+
+● 这个任务之前已经有过一轮实质工作，并且有现成的工作记录和夹具脚本。先读完再决定
+  从哪里接续（同时我建重名文件要清理）。
+
+  Thought for 10s, read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● 上一轮工作已经把问题定位到"第 0 层注意力核内部、权重相同"，并且验证了权重级一
+  致。你的这个想法正好是因果验证的关键一步：把引擎侧第 0 层注意力的输出嫁接进训
+  练侧前向，看后续层是否还对不上。先读现有夹具脚本，确认接口。
+
+  Thought for 42s, searched for 1 pattern, read 4 files, listed 2 directories, ran 3 shell commands (ctrl+o to expand)
+
+● 现在实现"嫁接"实验：把引擎侧第 0 层注意力的输出灌进训练侧前向，看下游是否还分
+  叉。这是对你思路的直接实现，也是判定"种子是否就在 layers.0.attn"的因果实验。
+
+● Write(scripts/dsv41_consistency/graft_trainer_stages.py)
+  ⎿  Wrote 310 lines to scripts/dsv41_consistency/graft_trainer_stages.py
+       1 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Re
+       2 #
+       3 # Licensed under the Apache License, Version 2.0 (the "License")
+       4 # you may not use this file except in compliance with the Licens
+         e.
+       6 #
+       7 #     http://www.apache.org/licenses/LICENSE-2.0
+       9 # Unless required by applicable law or agreed to in writing, sof
+         tware
+         IS,
+     … +375 lines (ctrl+o to expand)
+
+  Thought for 6s (ctrl+o to expand)
+
+● Update(scripts/dsv41_consistency/graft_trainer_stages.py)
+  ⎿  Added 3 lines, removed 2 lines
+      239              graft = parse_variant(variant, n_layers)
+      240              stage_sink: dict[str, torch.Tensor] = {}
+      241              original_sink: dict[str, torch.Tensor] = {}
+      242 -            dt.install_attention_op_hooks(torch, stage_sink, a
+          -rgs.max_elements)                                             
+      243 -                                                              
+      242 +            # No install_attention_op_hooks() here on purpose:
+          + its wrapper closes over the first                            
+      243 +            # call's sink, so across variants the attn-op entr
+          +ies would land in the wrong file.                             
+      244 +            # Those captures already exist in the staged train
+          +er dump.                                                      
+      245              handles = []
+      246              # 1) record the module's own (pre-graft) output, 2
+           ) replace it, 3) dump the result:
+      247              # forward hooks run in registration order, so the 
+           dump hooks added by install_hooks()
+
+  Thought for 8s, ran 2 shell commands (ctrl+o to expand)
+
+● Write(scripts/dsv41_consistency/sh/run_graft_trainer.sh)
+  ⎿  Wrote 15 lines to scripts/dsv41_consistency/sh/run_graft_trainer.sh
+       1 set -xeuo pipefail
+       3 export HCCL_CONNECT_TIMEOUT=1500
+       4 # chips 2..9 (NPU 1..4) were free when the run started; chips 0/
+       5 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-2,
+         3,4,5,6,7,8,9}
+       7 export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
+       8 export PYTHONPATH=/workspace-verl/vllm:/workspace-verl/vllm-asce
+         PYTHONPATH:-}
+       9 cd /workspace-verl/verl
+         nsistency/graft_trainer_stages.py \
+     … +11 lines (ctrl+o to expand)
+
+  Thought for 2s, ran 1 shell command (ctrl+o to expand)
+
+● 任务已在后台启动。等它跑的同时，把这一轮的方案与执行记录追加到已有工作记录里。
+
+  Thought for 12s, searched for 2 patterns, ran 2 shell commands (ctrl+o to expand)
+
+● 我的 bug：named_modules() 迭代的是 (name, module) 元组，不能直接
+  name.startswith。修掉，并加上"替换钩子确实生效"的断言（顺便：模型加载只用了
+  7.8s，迭代很快）。
+
+● Update(scripts/dsv41_consistency/graft_trainer_stages.py)
+  ⎿  Added 7 lines, removed 1 line
+      209      still_meta = [name for name, parameter in model.named_para
+           meters() if parameter.is_meta]
+      210      assert not still_meta, f"parameters left on meta: {still_m
+           eta[:5]}"
+      211  
+      212 -    n_layers = sum(1 for name in model.named_modules() if name
+          -.startswith("model.layers.") and name.count(".") == 2)        
+      212 +    module_names = {name for name, _ in model.named_modules()}
+      213 +    n_layers = sum(1 for name in module_names if name.startswi
+          +th("model.layers.") and name.count(".") == 2)                 
+      214      log(f"n_layers={n_layers}")
+      215  
+      216 +    def find_module(key: str):                                
+      217 +        if key not in module_names:                           
+      218 +            raise SystemExit(f"module {key!r} not found in the
+          + wrapped model")                                              
+      219 +        return model.get_submodule(key)                       
+      220 +                                                              
+      221      with open(args.fixture) as f:
+      222          fixture = json.load(f)
+      223      lengths = [int(x) for x in args.lengths.split(",") if x]
+
+● Update(scripts/dsv41_consistency/graft_trainer_stages.py)
+  ⎿  Added 3 lines, removed 1 line
+      252              # 1) record the module's own (pre-graft) output, 2
+           ) replace it, 3) dump the result:
+      253              # forward hooks run in registration order, so the 
+           dump hooks added by install_hooks()
+      254              # below see the grafted value, while `original_sin
+           k` keeps the reference.
+      255 +            fired: dict[str, int] = {}                        
+      256              for trainer_key in graft:
+      256 -                module = model.get_submodule(trainer_key)     
+      257 +                module = find_module(trainer_key)             
+      258  
+      259                  def record(_module, _inputs, output, key=train
+           er_key):
+      260                      payload = dt.to_cpu_fp32(output, args.max_
+           elements)
+     ...
+      265                      grafted = engine_stage(engine, engine_key)
+           .to(device=output.device, dtype=output.dtype)
+      266                      if grafted.numel() != output.numel():
+      267                          raise SystemExit(f"{key}: engine {tupl
+           e(grafted.shape)} vs trainer {tuple(output.shape)}")
+      268 +                    fired[key] = fired.get(key, 0) + 1        
+      269                      return grafted.reshape(output.shape)
+      270  
+      271                  handles.append(module.register_forward_hook(re
+           cord))
+
+● Update(scripts/dsv41_consistency/graft_trainer_stages.py)
+  ⎿  Added 3 lines
+      284              logits = output.logits.float()
+      285              logprobs = torch.log_softmax(logits, dim=-1)
+      286              next_logprobs = logprobs[0, :-1].gather(-1, input_
+           ids[0, 1:].unsqueeze(-1)).squeeze(-1)
+      287 +            expected_hits = {key: 1 for key in graft}         
+      288 +            if fired != expected_hits:                        
+      289 +                raise SystemExit(f"graft hooks did not fire as
+          + expected: fired={fired} expected={expected_hits}")           
+      290              if rank == 0:
+      291                  report = summarize(variant, stage_sink, engine
+           , length, scored, next_logprobs.cpu(), log)
+      292                  reports[variant] = report
+
+  Thought for 4s (ctrl+o to expand)
+
+● Update(scripts/dsv41_consistency/graft_trainer_stages.py)
+  ⎿  Added 3 lines, removed 2 lines
+      134              engine_tensor = engine_stage(engine, ENGINE_KEYS[m
+           odule].format(i=index))
+      135              if tensor.numel() != engine_tensor.numel():
+      136                  continue
+      137 -            report[trainer_key] = describe(engine_tensor, tens
+          -or)                                                           
+      137 +            # same convention as compare_stages.py: rel_err = 
+          +||engine - trainer|| / ||trainer||                            
+      138 +            report[trainer_key] = describe(tensor, engine_tens
+          +or)                                                           
+      139      if "model.norm" in stages:
+      139 -        report["model.norm"] = describe(engine_stage(engine, "
+          -language_model.model.norm"), stages["model.norm"])            
+      140 +        report["model.norm"] = describe(stages["model.norm"], 
+          +engine_stage(engine, "language_model.model.norm"))            
+      141      delta = (next_logprobs - scored).float()
+      142      report["__logprob__"] = {
+      143          "mean": delta.mean().item(),
+
+  Thought for 24s, ran 2 shell commands (ctrl+o to expand)
+
+● 嫁接实验出结果了，而且信息量很大。先读精确数字，再补一组"MoE 单独嫁接"的对照。
+
+  Thought for 21s, ran 2 shell commands (ctrl+o to expand)
+
+● 关键结果出来了：把每一层的 MoE 输出换成引擎的值后，最终隐状态误差从 12.9% → 
+  0.48%，logprob 噪声 σ 0.56 → 0.024（13×）；再叠上注意力输出则为 0.10% / 0.013 
+  nats。这说明分叉不只是"注意力种子"，MoE
+  路径是量的主要来源。先取全量数字，并离线量化各模块对残差流的贡献。
+
+  Thought for 15s, ran 2 shell commands (ctrl+o to expand)
+
+● 数字很关键（all.ffn 单独就把 σ 从 0.56 压到
+  0.024，比只对齐注意力更有效）。这提示"每层最后一次写残差流的是
+  MoE"。先量化各模块对残差流的写入强度，同时跑第三组对照（只嫁接最后一层）。
+
+  Thought for 51s, ran 11 shell commands (ctrl+o to expand)
+
+● 路由选择也验证一致（layer 0 的 top-6 专家两侧完全相同，logits 差 0.6%
+  同量级）。现在把三次运行的完整表格汇总（各次运行的 report.json
+  会互相覆盖，但每个变体的 .pt 都在，离线重建）：
+
+● Write(scripts/dsv41_consistency/summarize_graft.py)  ⎿  Wrote 91 lines to scripts/dsv41_consistency/summarize_graft.py
+       1 """Rebuild the full graft-variant table from the saved dumps.
+       3 Each ``graft_trainer_stages.py`` run writes one ``graft_len<L>_<
+         variant>.pt`` per variant
+         run. This script reads all
+       5 ``*.pt`` dumps instead, recomputes every variant against the eng
+       6 table (so results from several runs can be combined without re-r
+         unning anything).
+       8 Usage:
+       9     python3 scripts/dsv41_consistency/summarize_graft.py --lengt
+      10 """
+     … +104 lines (ctrl+o to expand)
+
+  Thought for 12s, ran 1 shell command (ctrl+o to expand)
+
+● 完整表格重建完成，两次长度结论一致。现在把这些结果写进工作记录（用户的明确要求
+  ）。
+
+● Update(wiki/work_log/worklog_dsv41_train_infer_consistency.md)
+  ⎿  Added 6 lines
+      22  
+      23  > 一句话：**这是两套内核数值近似的固有差异（种子在注意力，放大
+          在未训练模型 + head-gain 4），不是链路 bug。** 想进一步逼近必须
+          让训练侧用上与引擎相同的算子（受 A2/A3 布局限制，见 §4.2），否
+          则只能在 RL 侧用 IS/裁剪吸收这一量级。
+      24  
+      25 +> **2026-09-21 补充（嫁接实验，见 §9）**——上面这条结论需要修正 
+         +一处重点：                                                     
+      26 +> 11. **用"把引擎侧输出灌进训练侧前向"的因果实验逐模块归因**： 
+         +把每层的 attn 输出换成引擎的 → σ 0.56→0.217（2.6×）；把每层的 *
+         +*MoE 输出**换成引擎的 → σ 0.56→**0.024（23×）**；两者都换 → σ *
+         +*0.0127**、最终隐状态 rel_err **0.10%**（≈ 剩余 HC/RMSNorm/head
+         + 的数值地板）。**量的主要来源是 MoE 路径，不是注意力**（注意力 
+         +是"种子"：它先错，再由 MoE 逐层放大）。                        
+      27 +> 12. **单层嫁接几乎无效**（只换第 3 层 attn：σ 无变化；只换第 
+         +3 层 MoE：1.6×）——误差是逐层累积的，不是某一层单独造成的。     
+      28 +> 13. **路由选择两侧一致**：layer 0 的 router logits 差 0.6%（ 
+         +同量级），**top-6 专家集合逐个 token 完全相同** → 再次确认是纯 
+         +数值差异，不是离散选择错误。                                   
+      29 +> 14. 修正后的行动优先级：**想缩小训推差，先对齐 MoE 路径**（gr
+         +ouped matmul / 专家累加 / 路由权重算术 / all-to-all 归约），其 
+         +次才是注意力核。                                               
+      30 +                                                               
+      31  ---
+      32  
+      33  ## 1. 方法与工具（本次新建）
+
+● Update(wiki/work_log/worklog_dsv41_train_infer_consistency.md)
+  ⎿  Added 2 lines
+      40  | `scripts/dsv41_consistency/dsv41_dump_extension.py` | vLLM **
+          worker extension**（`worker_extension_cls` 注入）：`dsv41_param
+          _stats`（参数指纹）、`dsv41_hook_begin/end`（模块钩子 + 猴子补
+          丁：eager 注意力实现、`DeepseekV41DecoderLayer.hc_pre/hc_post/r
+          ms_norm_cast`、Ascend MoE router） |
+      41  | `scripts/dsv41_consistency/check_engine_params.py` | **权重级
+          校验**：把引擎参数（含 TP/EP 分片、NZ/转置等布局变换）映射回 ch
+          eckpoint 张量并比较 `std/absmax/mean` |
+      42  | `scripts/dsv41_consistency/compare_stages.py` / `compare_atte
+          ntion.py` / `compare_logprobs.py` / `compare_routing.py` | 训练
+          侧 vs 引擎侧逐阶段/逐算子/logprob/路由对比 |
+      43 +| `scripts/dsv41_consistency/graft_trainer_stages.py` + `sh/run
+         +_graft_trainer.sh` | **嫁接实验**（§9）：把引擎侧指定层的 `self
+         +_attn`/`mlp` 输出灌进训练侧前向（`--variants baseline,0.attn,al
+         +l.ffn,all.attn+all.ffn,...`），逐变体输出下游 rel_err 与 logpro
+         +b Δ |                                                          
+      44 +| `scripts/dsv41_consistency/summarize_graft.py` | 把多次嫁接运
+         +行的 `*.pt` 汇总成一张表（`report_len*.json` 会被后一次运行覆盖
+         +，故以 `.pt` 为准重建） |                                      
+      45  
+      46  **与真实 RL 的对应关系**：夹具走**同一段 token**、同一权重、同
+          一拓扑（TP=8/EP=8），因此可以直接对比「训练侧重算」与「引擎侧前
+          向」。唯一差别是 RL 用的 rollout logprob 来自**decode**（我在引
+          擎侧另做了 decode-vs-prefill 自一致性测量来覆盖这一点，见 §3.4
+          ）。
+      47  
+
+  Thought for 2s (ctrl+o to expand)
+
+● Update(wiki/work_log/worklog_dsv41_train_infer_consistency.md)
+  ⎿  Added 117 lines
+      277  - `HCCL_HOST_SOCKET_PORT_RANGE=60000-60050` / `HCCL_NPU_SOCKET
+           _PORT_RANGE=61000-61050` 必须显式设置，否则与机器上其它任务争
+           默认端口（`Bind_IP_Port ... port 16666 already bound`）。
+      278  - `vLLM` 离线 `LLM()` 需要 `VLLM_WORKER_MULTIPROC_METHOD=spawn
+           `（fork 子进程里 `torch.set_num_threads` 会崩：`pool INTERNAL 
+           ASSERT FAILED ... Invalid thread pool`）。
+      279  - 后台任务用 `setsid` 启动，避免前台命令超时被杀时连带 SIGTERM
+           。
+      280 +                                                              
+      281 +---                                                           
+      282 +                                                              
+      283 +## 9. 嫁接实验：把引擎侧输出灌进训练侧前向（2026-09-21）      
+      284 +                                                              
+      285 +### 9.1 要回答的问题                                          
+      286 +                                                              
+      287 +§3.1 的逐阶段 rel_err 只能说明"谁先错、谁更大"，**不能区分**下
+          +面两种情形：                                                  
+      288 +                                                              
+      289 +- (a) 只有少数模块是"种子"，其余模块的差异都是把种子放大出来的
+          +；                                                            
+      290 +- (b) 每个模块都在贡献自己的差异，最后叠加。                  
+      291 +                                                              
+      292 +**嫁接（graft）** 能直接区分：把引擎侧某个模块的输出**替换**到
+          +训练侧前向里，再往下跑。如果下游（含最终 logprob）随之对齐 →  
+          +该模块（及其上游）就是分歧来源；如果下游照旧漂移 → 剩下的模块 
+          +自己在贡献。                                                  
+      293 +                                                              
+      294 +### 9.2 实现                                                  
+      295 +                                                              
+      296 +`scripts/dsv41_consistency/graft_trainer_stages.py`（构建/加载
+          +路径与 `dump_trainer_stages.py` 完全一致）：                  
+      297 +                                                              
+      298 +1. 从引擎 dump（`engine_stages_len<L>_rank0.pt`）取出该层的 `l
+          +anguage_model.model.layers.{i}.self_attn` / `...mlp`（fp32、形
+          +状 `[S, 5120]`）；                                            
+      299 +2. 训练侧同一模块注册**三个钩子**（注册顺序即执行顺序）：     
+      300 +   a. 记录钩子 → 保存"未嫁接的原始输出"（`stages_pre_graft`） 
+          +；                                                            
+      301 +   b. 替换钩子 → 返回引擎张量（`to(device, dtype=输出 dtype)` 
+          +，即 bf16；`reshape` 到训练侧 `[1,S,5120]`）；                
+      302 +   c. `dump_trainer_stages.install_hooks` 的 dump 钩子 → 记录*
+          +*嫁接后**的值（所以被嫁接模块的 rel_err 必为 0，是自检）；    
+      303 +3. 每个变体都断言"替换钩子恰好触发一次"，否则报错；           
+      304 +4. 变体：`baseline`（不嫁接，与 §3.1 对照）、`0.attn`、`0.ffn`
+          +、`0.attn+0.ffn`、`all.attn`、`all.ffn`、`all.attn+all.ffn`、`
+          +3.ffn`、`2.ffn+3.ffn`、`3.attn`。                             
+      305 +                                                              
+      306 +输出：`/mnt/share/m00899630/dsv41/dump/graft/graft_len<L>_<var
+          +iant>.pt` + 每个变体的即时摘要行。                            
+      307 +                                                              
+      308 +### 9.3 执行记录                                              
+      309 +                                                              
+      310 +```bash                                                       
+      311 +# 三次运行（每次 ~2.5 min：模型构建+加载 7.8s，之后每个变体一 
+          +次前向）                                                      
+      312 +setsid bash scripts/dsv41_consistency/sh/run_graft_trainer.sh 
+          +> /tmp/dump_graft2.log 2>&1 &                                 
+      313 +#   → variants baseline,0.attn,0.attn+0.ffn,all.attn   (length
+          +s 64,200)                                                     
+      314 +setsid bash /tmp/run_graft2.sh > /tmp/dump_graft3.log 2>&1 &  
+          + # baseline,0.ffn,all.ffn,all.attn+all.ffn                    
+      315 +setsid bash /tmp/run_graft3.sh > /tmp/dump_graft4.log 2>&1 &  
+          + # baseline,3.ffn,2.ffn+3.ffn,3.attn                          
+      316 +python3 scripts/dsv41_consistency/summarize_graft.py --lengths
+          + 64,200 --per-stage                                           
+      317 +```                                                           
+      318 +                                                              
+      319 +**遇到的问题与修复**：                                        
+      320 +                                                              
+      321 +| # | 现象 | 根因 | 修复 |                                    
+      322 +|---|---|---|---|                                             
+      323 +| 1 | 首次运行全部 rank 崩：`AttributeError: 'tuple' object ha
+          +s no attribute 'startswith'` | 我写成了 `for name in model.nam
+          +ed_modules()` —— 它 yield 的是 `(name, module)` 元组 | 改成 `f
+          +or name, _ in model.named_modules()`；同时把子模块查找换成先建
+          + `module_names` 集合再 `get_submodule`，并加"替换钩子必须恰好 
+          +触发一次"的断言 |                                             
+      324 +| 2 | `report_len<L>.json` 被后一次运行覆盖 | 脚本按长度写单文
+          +件 | 数据未丢（每个变体的 `.pt` 都在）→ 新增 `summarize_graft.
+          +py` 从 `.pt` 重建全表 |                                       
+      325 +                                                              
+      326 +**控制项**：`baseline` 变体复现了 2026-09-20 那份独立 dump 的 
+          +全部数字（`0.attn=0.0057 / 0.ffn=0.0644 / 1.attn=0.0445 / … / 
+          +model.norm=0.1434`，Δlogp σ=0.3181；len=200：`0.1294 / 0.5596`
+          +）→ 前向是确定性的，跨运行可比。                              
+      327 +                                                              
+      328 +### 9.4 结果                                                  
+      329 +                                                              
+      330 +`σ` = 逐位置 Δlogp（训练侧 − 引擎侧，63/199 个 teacher-forced 
+          +位置）的标准差；`norm rel` = `model.norm` 输出相对引擎的 rel_e
+          +rr；`|Δ|mean/p99/max` 单位 nats。                             
+      331 +                                                              
+      332 +**len = 200**（prompt 200 token，滑窗 128 / 压缩 KV / index_to
+          +pk 全部激活）                                                 
+      333 +                                                              
+      334 +| 变体 | norm rel | Δmean | **σ** | \|Δ\|mean | p99 | max |   
+      335 +|---|---|---|---|---|---|---|                                 
+      336 +| baseline | 0.1294 | −0.0134 | **0.5596** | 0.2966 | 2.760 | 
+          +3.314 |                                                       
+      337 +| `3.attn` | 0.1277 | −0.0170 | 0.5613 | 0.2902 | 2.900 | 3.21
+          +6 |                                                           
+      338 +| `0.attn` | 0.0727 | −0.0081 | 0.3250 | 0.1354 | 1.593 | 2.32
+          +0 |                                                           
+      339 +| `3.ffn` | 0.0940 | −0.0201 | 0.3500 | 0.2042 | 1.534 | 1.685
+          + |                                                            
+      340 +| `2.ffn+3.ffn` | 0.0593 | −0.0068 | 0.2379 | 0.1316 | 0.953 |
+          + 1.475 |                                                      
+      341 +| `0.ffn` | 0.0586 | −0.0174 | 0.1750 | 0.0867 | 0.859 | 0.919
+          + |                                                            
+      342 +| `all.attn` | 0.0592 | −0.0076 | 0.2172 | 0.0890 | 0.960 | 1.
+          +467 |                                                         
+      343 +| `all.ffn` | **0.0048** | +0.0003 | **0.0243** | 0.0189 | 0.0
+          +64 | 0.073 |                                                  
+      344 +| `all.attn+all.ffn` | **0.0010** | +0.0009 | **0.0127** | 0.0
+          +095 | 0.046 | 0.053 |                                         
+      345 +                                                              
+      346 +**len = 64**（同结论，量级略小）                              
+      347 +                                                              
+      348 +| 变体 | norm rel | Δmean | **σ** | \|Δ\|mean | p99 | max |   
+      349 +|---|---|---|---|---|---|---|                                 
+      350 +| baseline | 0.1434 | +0.0350 | **0.3181** | 0.2065 | 0.971 | 
+          +1.266 |                                                       
+      351 +| `3.attn` | 0.1406 | +0.0666 | 0.3406 | 0.2216 | 1.185 | 1.22
+          +4 |                                                           
+      352 +| `3.ffn` | 0.1074 | +0.0087 | 0.2804 | 0.1854 | 0.832 | 0.959
+          + |                                                            
+      353 +| `2.ffn+3.ffn` | 0.0691 | −0.0577 | 0.3309 | 0.1707 | 1.327 |
+          + 1.785 |                                                      
+      354 +| `0.attn+0.ffn` | 0.0646 | +0.0553 | 0.2448 | 0.1207 | 1.150 
+          +| 1.387 |                                                     
+      355 +| `0.attn` | 0.0479 | +0.0427 | 0.2761 | 0.1170 | 1.390 | 1.48
+          +9 |                                                           
+      356 +| `0.ffn` | 0.0427 | −0.0049 | 0.1134 | 0.0657 | 0.419 | 0.685
+          + |                                                            
+      357 +| `all.attn` | 0.0424 | +0.0152 | 0.0935 | 0.0561 | 0.426 | 0.
+          +440 |                                                         
+      358 +| `all.ffn` | **0.0054** | +0.0022 | **0.0273** | 0.0222 | 0.0
+          +58 | 0.064 |                                                  
+      359 +| `all.attn+all.ffn` | **0.0010** | −0.0003 | **0.0142** | 0.0
+          +103 | 0.043 | 0.050 |                                         
+      360 +                                                              
+      361 +**逐阶段 rel_err（len=200，节选）**——注意"未嫁接的模块，其输入
+          +被上游嫁接对齐后，误差会自己变小"，这正是区分"种子"和"放大"的 
+          +地方：                                                        
+      362 +                                                              
+      363 +| 变体 | 0.attn | 0.ffn | 1.attn | 1.ffn | 2.ffn | 3.ffn |    
+      364 +|---|---|---|---|---|---|---|                                 
+      365 +| baseline | 0.0057 | 0.0519 | 0.0435 | 0.1100 | 0.1651 | 0.20
+          +38 |                                                          
+      366 +| `0.attn` | 0 | **0.0178** | 0.0119 | 0.0518 | 0.0974 | 0.117
+          +4 |                                                           
+      367 +| `all.attn` | 0 | 0.0178 | 0 | 0.0472 | 0.0779 | 0.0963 |    
+      368 +| `0.ffn` | 0.0057 | 0 | **0.0062** | 0.0419 | 0.0781 | 0.0970
+          + |                                                            
+      369 +| `all.ffn` | 0.0057 | 0 | 0.0062 | 0 | 0 | 0 |               
+      370 +| `all.attn+all.ffn` | 0 | 0 | 0 | 0 | 0 | 0 |                
+      371 +| （module.norm） | `0.attn`→0.0727 / `all.attn`→0.0592 / `0.f
+          +fn`→0.0586 / **`all.ffn`→0.0048** / **both→0.0010** | | | | | 
+          +|                                                             
+      372 +                                                              
+      373 +### 9.5 解读                                                  
+      374 +                                                              
+      375 +1. **两个栈在"给定相同模块输入"时的固有数值差是同一量级**：lay
+          +er 0 的 attention 输出在**输入完全一致**（embed/attn_norm rel_
+          +err = 0）下差 **0.57%**；MoE 输出在输入被对齐后差 **0.58%**（`
+          +0.attn` 变体的 `0.ffn`=0.0058）。所以不存在"某一侧某个算子坏了
+          +"的情况。                                                     
+      376 +2. **但对最终 logprob 的贡献差 9 倍**：全层对齐注意力 → σ 2.6×
+          +；全层对齐 MoE → σ **23×**；两者都对齐 → **44×**（σ 0.0127 nat
+          +s，即剩余 HC/RMSNorm/head/embedding 的数值地板）。            
+      377 +   - 量级原因：逐层实测 MoE 输出 RMS ≈ 0.70、注意力 ≈ 0.45（Mo
+          +E 是 1.5–2×），且 **MoE 是每层最后写入残差流的那一项**，它的误
+          +差经过的后续混合更少；注意力写在前面，其误差被同层 MoE 的写入 
+          +稀释。                                                        
+      378 +3. **误差是逐层累积的**：只对齐最后一层（`3.attn` σ 无变化、`3
+          +.ffn` 1.6×）、两层（2.4×）都不够，必须全层（23×）。           
+      379 +4. **路由选择两侧一致**（离线复核）：layer 0 的 router logits 
+          +（引擎捕获的 8 个 token 对应序列前 8 个）与训练侧从 checkpoint
+          + 重算的 logits `mean|d| = 0.0046（rel 0.6%）`，**top-6 专家集 
+          +合逐 token 完全相同**、per-slot overlap 100%。→ 再次确认不是离
+          +散选择错误。                                                  
+      380 +5. **嫁接全部对齐后仍有 0.013 nats**：这是 HC（sinkhorn 20 次 
+          +迭代）、RMSNorm、head、embedding 这一路的数值地板。相对 RL 的 
+          +重要性采样阈值可忽略。                                        
+      381 +                                                              
+      382 +### 9.6 方法上的 caveat（必须记住）                           
+      383 +                                                              
+      384 +- **第 0 层的嫁接是"干净"的**（输入一致：embed、attn_norm 的 r
+          +el_err = 0），所以 `0.attn` / `0.ffn` 变体的因果解释最直接。  
+      385 +- **第 ≥1 层的嫁接是"混合态"**：引擎那份输出是用**引擎自己的输
+          +入 h** 算出来的，而训练侧的 h 已经略有不同（注入的是"对另一个 
+          +问题的正确答案"）。因此 `all.*` 变体应理解为"若该模块的输入→输
+          +出映射完全一致（含消除上游误差）会怎样"，而不是严格的模块级归 
+          +因。即便如此，`all.ffn` 与 `all.attn` 的量级差异（23× vs 2.6× 
+          +）远大于任何混合态噪声，结论方向是稳的。                      
+      386 +- 嫁接会**屏蔽离散选择差异**（把选中哪个专家/哪些位置的输出整 
+          +块替换）。为补这一点，单独做了 §9.5-4 的路由一致性复核（一致）
+          +。                                                            
+      387 +- 夹具是 `scaled32` + `head-gain 4`；按 §3.3 的换算，真实权重 
+          +（gain 1）下同等的 h 误差给出的 logprob σ 约小 4×。           
+      388 +                                                              
+      389 +### 9.7 对下一步的影响（修正 §7）                             
+      390 +                                                              
+      391 +- §7 把"注意力算子数值对齐"列为最大单项；**嫁接实验表明 MoE 路
+          +径才是量的主体**（23× vs 2.6×）。若要在训练侧对齐，优先项应改 
+          +为：                                                          
+      392 +  1. **MoE**：`npu_grouped_matmul`（分组 GEMM 的累加顺序/dtype
+          +）、专家输出的累加与 `route_scale`/`norm_topk_prob` 的算术位置
+          +、EP all-to-all（mc2）的归约顺序与精度；                      
+      393 +  2. 其次是注意力核（含 indexer/compressor）；                
+      394 +  3. 最后是 HC/RMSNorm（0.013 nats 地板）。                   
+      395 +- 若维持"不动内核、在 RL 侧吸收"的路线：仍应按 §7-5 用 IS/TIS 
+          +吸收，但**阈值判断要基于修正后的量级**（MoE 主导）。          
+      396 +- 复现/扩展：`--variants` 支持任意 `层.模块` 组合，其他权重只 
+          +需 `--model-path` 换一行（但引擎侧 dump 需先用 `run_dump_engin
+          +e.sh` 对同一权重重跑一次）。                                  
+
+  Thought for 6s (ctrl+o to expand)
+
+● 工作记录已更新。按要求检查并清理进程，同时开始查"MoE
+  侧具体是什么数值差"（这是新的第一名嫌疑）。
+
+  Thought for 6s, ran 2 shell commands (ctrl+o to expand)
+
+● 进程已清干净（NPU 上只剩别的租户的小占用）。新的第一名嫌疑已经浮现：训练侧 MoE
+  刻意升 fp32（output 累加在 fp32、路由权重在 fp32 相乘），而 Ascend 融合 MoE
+  是整条 bf16。先把 scaled（384 专家）的引擎侧 dump
+  挂到后台跑，同时读两边代码确认。
+
+  Thought for 8s, ran 2 shell commands (ctrl+o to expand)
+
+● 后台在加载 scaled 引擎侧 dump。同时读引擎侧 MoE 的算术
+  dtype（训练侧已确认：两次 GEMM 是 bf16，中间激活/路由权重相乘/专家求和都是 
+  fp32）。
+
+  Thought for 34s, searched for 2 patterns, ran 5 shell commands (ctrl+o to expand)
+
+● 现在两边的 MoE 算术差已经定位到具体行：训练侧在两次 GEMM 之间全是 
+  fp32（激活、clamp、路由权重相乘、专家求和、shared 相加），引擎侧是 CANN
+  融合核里的 bf16 通路。做一个 A/B 来确认这是不是那 0.58% 固有差的来源。
+
+  Thought for 9s, ran 2 shell commands (ctrl+o to expand)
+
+● Update(/workspace-verl/FSDPTurbo/fsdp_turbo/models/deepseek_v41/experts.py)
+  ⎿  Added 9 lines
+       1  """Packed DeepSeek-V4.1 routed experts compatible with FSDPTurb
+          o EP."""
+       2  
+       3 +import os                                                      
+       4 +                                                               
+       5  import torch
+       6  import torch.nn.functional as F
+       7  from torch import nn
+       8  
+       9 +# Diagnostic A/B for train-vs-inference consistency (wiki/work_
+         +log/worklog_dsv41_train_infer_consistency.md §10):             
+      10 +# the released reference arithmetic (default) promotes the expe
+         +rt activation, the routing-weight                              
+      11 +# product and the expert sum to fp32 between the two GEMMs, whi
+         +le the Ascend fused MoE that the                               
+      12 +# rollout engine runs keeps them in the activation dtype. Setti
+         +ng VERL_DSV41_MOE_BF16=1 reproduces                            
+      13 +# the engine's recipe so the intrinsic gap can be attributed. D
+         +efault off -> unchanged behaviour.                             
+      14 +MOE_BF16_ACT = os.environ.get("VERL_DSV41_MOE_BF16") == "1"    
+      15  
+      16 +                                                               
+      17  class DeepSeekV41Experts(nn.Module):
+      18      """Store routed experts as two stacked linear-weight tensor
+          s.
+      19  
+
+● Update(/workspace-verl/FSDPTurbo/fsdp_turbo/models/deepseek_v41/experts.py)
+  ⎿  Added 28 lines, removed 12 lines
+      185              local_counts,
+      186              gate_up_proj,
+      187              use_eager=True,
+      188 -        ).float()                                             
+      188 +        )                                                     
+      189 +        if not MOE_BF16_ACT:                                  
+      190 +            gate_up = gate_up.float()                         
+      191          gate, up = gate_up.chunk(2, dim=-1)
+      192          if self.limit is not None:
+      193              gate = gate.clamp(max=self.limit)
+      194              up = up.clamp(min=-self.limit, max=self.limit)
+      195          intermediate = self.act_fn(gate) * up
+      194 -        intermediate *= router_weights.float().unsqueeze(-1)  
+      196 +        if MOE_BF16_ACT:  # engine recipe: routing weights app
+          +lied in the activation dtype                                  
+      197 +            intermediate = intermediate * router_weights.to(hi
+          +dden_states.dtype)                                            
+      198 +        else:                                                 
+      199 +            intermediate *= router_weights.float().unsqueeze(-
+          +1)                                                            
+      200          expert_output = grouped_matmul(
+      201              intermediate.to(hidden_states.dtype),
+      202              local_counts,
+     ...
+      207          # The probabilities are already applied. Ones preserve
+            the original
+      208          # [tokens, top-k] combine shape. Converting before the
+            shared combine
+      209          # makes both its return AllToAll and final expert sum 
+           operate in FP32.
+      205 -        combine_weights = torch.ones_like(topk_weights, dtype=
+          -torch.float32)                                                
+      206 -        output = alltoall_combine(                            
+      207 -            ep_group,                                         
+      208 -            expert_output.float(),                            
+      209 -            combine_weights,                                  
+      210 -            unpermute_indices,                                
+      211 -            split_sizes,                                      
+      212 -            fused=False,                                      
+      213 -        )                                                     
+      214 -        return output.view(*original_shape)                   
+      210 +        if MOE_BF16_ACT:  # engine recipe: the combine kernel 
+          +works in the activation dtype                                 
+      211 +            combine_weights = torch.ones_like(topk_weights, dt
+          +ype=hidden_states.dtype)                                      
+      212 +            combined = alltoall_combine(                      
+      213 +                ep_group,                                     
+      214 +                expert_output,                                
+      215 +                combine_weights,                              
+      216 +                unpermute_indices,                            
+      217 +                split_sizes,                                  
+      218 +                fused=False,                                  
+      219 +            )                                                 
+      220 +        else:                                                 
+      221 +            combine_weights = torch.ones_like(topk_weights, dt
+          +ype=torch.float32)                                            
+      222 +            combined = alltoall_combine(                      
+      223 +                ep_group,                                     
+      224 +                expert_output.float(),                        
+      225 +                combine_weights,                              
+      226 +                unpermute_indices,                            
+      227 +                split_sizes,                                  
+      228 +                fused=False,                                  
+      229 +            )                                                 
+      230 +        return combined.view(*original_shape)                 
+      231  
+      232  
+      233  __all__ = ["DeepSeekV41Experts"]
+
+  Thought for 3s, searched for 1 pattern (ctrl+o to expand)
+
+● Update(/workspace-verl/FSDPTurbo/fsdp_turbo/models/deepseek_v41/model.py)
+  ⎿  Added 1 line, removed 1 line
+      15      HostOffloadEmbedding,
+      16      TorchHostOffloadEmbedding,
+      17  )
+      18 -from .experts import DeepSeekV41Experts                        
+      18 +from .experts import MOE_BF16_ACT, DeepSeekV41Experts          
+      19  from .image_processor import IMAGE, IMAGE_END, IMAGE_NEW_LINE, 
+          IMAGE_START
+      20  from torch import nn
+      21  from .vision import Aligner, ViT
+
+● Update(/workspace-verl/FSDPTurbo/fsdp_turbo/models/deepseek_v41/model.py)
+  ⎿  Added 6 lines, removed 2 lines
+      980          self, x: torch.Tensor, weights: torch.Tensor | None = 
+           None
+      981      ) -> torch.Tensor:
+      982          dtype = x.dtype
+      983 -        gate = self.w1(x).float()                             
+      984 -        up = self.w3(x).float()                               
+      983 +        if MOE_BF16_ACT:  # engine recipe: one dtype through t
+          +he whole expert (see experts.py)                              
+      984 +            gate = self.w1(x)                                 
+      985 +            up = self.w3(x)                                   
+      986 +        else:                                                 
+      987 +            gate = self.w1(x).float()                         
+      988 +            up = self.w3(x).float()                           
+      989          if self.swiglu_limit > 0:
+      990              up = torch.clamp(up, min=-self.swiglu_limit, max=s
+           elf.swiglu_limit)
+      991              gate = torch.clamp(gate, max=self.swiglu_limit)
+
+  Thought for 3s (ctrl+o to expand)
+
+● Update(/workspace-verl/FSDPTurbo/fsdp_turbo/models/deepseek_v41/model.py)
+  ⎿  Added 4 lines, removed 1 line
+      1031          # Match the reference accumulation: routed experts ar
+            e accumulated in
+      1032          # FP32, the shared expert is added in FP32, and only 
+            the complete MoE
+      1033          # result is converted back to the residual-stream dty
+            pe.
+      1034 -        output = routed_output.float() + self.shared_experts(
+           -x).float()                                                   
+      1034 +        if MOE_BF16_ACT:  # engine recipe: routed + shared co
+           +mbined in the activation dtype                               
+      1035 +            output = routed_output + self.shared_experts(x)  
+      1036 +        else:                                                
+      1037 +            output = routed_output.float() + self.shared_expe
+           +rts(x).float()                                               
+      1038          return output.type_as(x).view(shape)
+      1039  
+      1040  
+
+  Thought for 3s, ran 1 shell command (ctrl+o to expand)
+
+● Update(scripts/dsv41_consistency/graft_trainer_stages.py)
+  ⎿  Added 5 lines
+      214      n_layers = sum(1 for name in module_names if name.startswi
+           th("model.layers.") and name.count(".") == 2)
+      215      log(f"n_layers={n_layers}")
+      216  
+      217 +    import fsdp_turbo.models.deepseek_v41.experts as _experts 
+      218 +                                                              
+      219 +    log(f"MoE arithmetic: {'BF16-act (engine recipe)' if _expe
+          +rts.MOE_BF16_ACT else 'FP32-act (reference)'} "               
+      220 +        f"[VERL_DSV41_MOE_BF16={os.environ.get('VERL_DSV41_MOE
+          +_BF16', '<unset>')}]")                                        
+      221 +                                                              
+      222      def find_module(key: str):
+      223          if key not in module_names:
+      224              raise SystemExit(f"module {key!r} not found in the
+            wrapped model")
+
+  Thought for 11s, searched for 1 pattern, listed 1 directory (ctrl+o to expand)
+
+● 引擎侧 dump 报错是环境问题（不是脚本/权重）：gloo 试图绑定一个过期 IP 
+  141.61.29.117，而本机现在是 80.5.25.117。先查环境变量来源。
+
+  Thought for 7s, ran 1 shell command (ctrl+o to expand)
+
+● 根因找到了：/etc/hosts 里 node-29-117 → 141.61.29.117，但机器现在的 IP 是
+  80.5.25.117（主机 IP 变了，hosts 没更新）→ gloo
+  用主机名解析就失败。这是环境坑，也会影响下次跑 GRPO。用 MASTER_ADDR
+  显式覆盖后重试。
+
+  Thought for 35s, searched for 2 patterns, ran 4 shell commands (ctrl+o to expand)
+
+● scaled 引擎侧加载失败（worker 静默死掉，无 traceback，怀疑是 384
+  专家的加载峰值显存）。先跑价值最高的 MoE dtype A/B（用已有 scaled32 引擎
+  dump），再回头处理 scaled。
+  Thought for 8s, ran 1 shell command (ctrl+o to expand)
+
+● A/B 结果否定了我的假设：把训练侧 MoE 改成引擎的 bf16
+  算术后，固有差几乎不变（0.ffn = 0.0057/0.0178，与 fp32 版相同）→ 差异来自分组 
+  GEMM 内核内部，不是 GEMM 之间的 fp32 提升。现在查 scaled
+  引擎加载失败的真实原因（CANN 侧日志）。
+
+  Thought for 9s, listed 1 directory, ran 1 shell command (ctrl+o to expand)
+
+● plog 无设备级错误。回看一个关键细节：run_dump_engine.sh 默认用
+  ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7，而 chip 0/1 
+  上有别的租户（~4GB），gpu_memory_utilization=0.9 在只剩 ~60GB 的卡上放不下
+  13GB 权重 + 44GB KV 池 → 很可能是这个原因。换到空闲的 2–9 号卡重试。
+
+  Thought for 10s, ran 2 shell commands (ctrl+o to expand)
+
+● 根因确认（而且与权重无关）：ValueError: Free memory on device (55.11/61.28 
+  GiB) on startup is less than desired GPU memory utilization (0.9, 55.15 GiB)
+  —— 每张卡上都有别人 ~3GB 的常驻占用，0.9 的阈值刚好卡在边界。给脚本加
+  --mem-util 参数后重试。
+
+● Update(scripts/dsv41_consistency/dump_engine_stages.py)
+  ⎿  Added 5 lines
+      36      ap.add_argument("--tp", type=int, default=8)
+      37      ap.add_argument("--ep", type=int, default=8)
+      38      ap.add_argument("--max-model-len", type=int, default=2048)
+      39 +    ap.add_argument("--mem-util", type=float, default=0.9,     
+      40 +                    help="gpu_memory_utilization; the vLLM work
+         +er refuses to start when the "                                 
+      41 +                         "free NPU memory is below this fractio
+         +n of the device total, and every "                             
+      42 +                         "card here carries a few GiB of other 
+         +tenants' resident allocations, so "                            
+      43 +                         "0.9 can fail by a few hundred MiB (se
+         +e worklog §10).")                                              
+      44      ap.add_argument("--lengths", default="", help="Comma separa
+          ted subset of fixture lengths.")
+      45      ap.add_argument("--skip-stages", action="store_true", help=
+          "Only dump params + logprobs.")
+      46      ap.add_argument("--skip-params", action="store_true")
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Update(scripts/dsv41_consistency/dump_engine_stages.py)
+  ⎿  Added 1 line, removed 1 line
+      74          enable_expert_parallel=args.ep > 1,
+      75          enforce_eager=True,
+      76          max_model_len=args.max_model_len,
+      77 -        gpu_memory_utilization=0.9,                            
+      77 +        gpu_memory_utilization=args.mem_util,                  
+      78          enable_prefix_caching=False,
+      79          enable_chunked_prefill=True,
+      80          max_num_batched_tokens=args.max_model_len,
+
+  Thought for 13s, searched for 1 pattern, ran 1 shell command (ctrl+o to expand)
+
+● GLOO 那步用的是主机名解析出的过期 IP（141.61.29.117）。找一下当前 IP
+  对应的网卡名，用 GLOO_SOCKET_IFNAME 绕开 hosts 文件（不改系统配置）。
+
+  Thought for 9s, ran 2 shell commands (ctrl+o to expand)
+
+● 网卡定位到了：enp48s3u1u1（默认路由 + 80.5.24.0/22 网段）。用
+  GLOO_SOCKET_IFNAME 固定它后重试；等待期间先把已得结论写进工作记录。
+
+  Thought for 6s, ran 1 shell command (ctrl+o to expand)
+
+● Update(wiki/work_log/worklog_dsv41_train_infer_consistency.md)
+  ⎿  Added 82 lines
+      394    3. 最后是 HC/RMSNorm（0.013 nats 地板）。
+      395  - 若维持"不动内核、在 RL 侧吸收"的路线：仍应按 §7-5 用 IS/TIS 
+           吸收，但**阈值判断要基于修正后的量级**（MoE 主导）。
+      396  - 复现/扩展：`--variants` 支持任意 `层.模块` 组合，其他权重只
+           需 `--model-path` 换一行（但引擎侧 dump 需先用 `run_dump_engin
+           e.sh` 对同一权重重跑一次）。
+      397 +                                                              
+      398 +---                                                           
+      399 +                                                              
+      400 +## 10. MoE 算术配方 A/B（2026-09-21，**负结果**）+ 本轮环境坑 
+      401 +                                                              
+      402 +### 10.1 动机与假设                                           
+      403 +                                                              
+      404 +§9 的归因把"量的主体"指到 MoE。逐行对比两侧实现后，最可疑的差 
+          +异是 dtype 配方：                                             
+      405 +                                                              
+      406 +| | 两次 GEMM 之间 | 专家累加 | shared 相加 |                 
+      407 +|---|---|---|---|                                             
+      408 +| 训练侧（`experts.py::native_eager_forward`、`model.py::Exper
+          +t/MoE`，默认） | **fp32**（激活、`swiglu_limit` clamp、路由权 
+          +重相乘） | **fp32**（`alltoall_combine` 前置 `.float()`，注释 
+          +即写明"makes both its return AllToAll and final expert sum ope
+          +rate in FP32"） | **fp32**（`routed.float() + shared.float()` 
+          +） |                                                          
+      409 +| 引擎侧（`DeepseekV4MoE` + CANN 融合 MoE） | bf16（核内） |  
+          +核内（`MoeDistributeCombine`） | `muls_add_triton`（bf16） |  
+      410 +                                                              
+      411 +假设 H5：把训练侧改成引擎的 bf16 配方，MoE 固有差（0.58%）会显
+          +著变小。                                                      
+      412 +                                                              
+      413 +### 10.2 实现（可回退的 env 门控）                            
+      414 +                                                              
+      415 +`FSDPTurbo` 两处、共 3 个门控点，全部由 `VERL_DSV41_MOE_BF16` 
+          +控制，**默认关闭 → 行为与改动前完全一致**：                   
+      416 +                                                              
+      417 +```diff                                                       
+      418 +# fsdp_turbo/models/deepseek_v41/experts.py                   
+      419 ++import os                                                    
+      420 ++# Diagnostic A/B ... Setting VERL_DSV41_MOE_BF16=1 reproduces
+          + the engine's recipe                                          
+      421 ++MOE_BF16_ACT = os.environ.get("VERL_DSV41_MOE_BF16") == "1"  
+      422 +-        ).float()                                            
+      423 ++        )                                                    
+      424 ++        if not MOE_BF16_ACT:                                 
+      425 ++            gate_up = gate_up.float()                        
+      426 +-        intermediate *= router_weights.float().unsqueeze(-1) 
+      427 ++        if MOE_BF16_ACT:   # engine recipe: routing weights a
+          +pplied in the activation dtype                                
+      428 ++            intermediate = intermediate * router_weights.to(h
+          +idden_states.dtype)                                           
+      429 ++        else:                                                
+      430 ++            intermediate *= router_weights.float().unsqueeze(
+          +-1)                                                           
+      431 +-        combine_weights = torch.ones_like(topk_weights, dtype
+          +=torch.float32)                                               
+      432 +-        output = alltoall_combine(ep_group, expert_output.flo
+          +at(), ...)                                                    
+      433 ++        if MOE_BF16_ACT:   # engine recipe: the combine kerne
+          +l works in the activation dtype                               
+      434 ++            combine_weights = torch.ones_like(topk_weights, d
+          +type=hidden_states.dtype)                                     
+      435 ++            combined = alltoall_combine(ep_group, expert_outp
+          +ut, ...)                                                      
+      436 ++        else:                                                
+      437 ++            combine_weights = torch.ones_like(topk_weights, d
+          +type=torch.float32)                                           
+      438 ++            combined = alltoall_combine(ep_group, expert_outp
+          +ut.float(), ...)                                              
+      439 +                                                              
+      440 +# fsdp_turbo/models/deepseek_v41/model.py  (Expert.forward + M
+          +oE.forward)                                                   
+      441 ++from .experts import MOE_BF16_ACT, DeepSeekV41Experts        
+      442 ++        if MOE_BF16_ACT:  # engine recipe: one dtype through 
+          +the whole expert                                              
+      443 ++            gate = self.w1(x); up = self.w3(x)               
+      444 ++        else:                                                
+      445 ++            gate = self.w1(x).float(); up = self.w3(x).float(
+          +)                                                             
+      446 ++        if MOE_BF16_ACT:  # engine recipe: routed + shared co
+          +mbined in the activation dtype                                
+      447 ++            output = routed_output + self.shared_experts(x)  
+      448 ++        else:                                                
+      449 ++            output = routed_output.float() + self.shared_expe
+          +rts(x).float()                                                
+      450 +```                                                           
+      451 +                                                              
+      452 +`graft_trainer_stages.py` 启动时会打印当前配方（`MoE arithmeti
+          +c: FP32-act (reference) / BF16-act (engine recipe)`），日志里 
+          +可核对。                                                      
+      453 +                                                              
+      454 +回退：`cd /workspace-verl/FSDPTurbo && git checkout fsdp_turbo
+          +/models/deepseek_v41/{experts,model}.py`（当前 `git diff --sta
+          +t` 为 2 files, +48/−16）。                                    
+      455 +                                                              
+      456 +### 10.3 结果（scaled32，len 64/200，`--variants baseline,0.at
+          +tn`，输出在 `dump/graft_bf16moe/`）                           
+      457 +                                                              
+      458 +| 变体 / 指标 | fp32 配方（默认，§9） | **bf16 配方（引擎式）*
+          +* | 判读 |                                                    
+      459 +|---|---|---|---|                                             
+      460 +| `0.attn` → `0.ffn`（对齐输入下的 MoE 固有差，len64） | 0.005
+          +8 | **0.0057** | 无变化 |                                     
+      461 +| 同上（len200） | 0.0178 | **0.0178** | 无变化 |             
+      462 +| `0.attn` → `model.norm`（len64 / len200） | 0.0479 / 0.0727 
+          +| 0.0598 / 0.0660 | 无改善 |                                  
+      463 +| `0.attn` → Δlogp σ（len64 / len200） | 0.2761 / 0.3250 | 0.3
+          +421 / 0.3184 | 无改善（len64 反而更差） |                     
+      464 +| baseline Δlogp σ（len64 / len200） | 0.3181 / 0.5596 | 0.367
+          +8 / 0.5028 | 无改善 |                                         
+      465 +                                                              
+      466 +**结论：假设 H5 被否定。** MoE 的 0.58% 固有差**不是**来自两次
+          + GEMM 之间的 fp32 提升，而是在**分组 GEMM/归约内核内部**（分块
+          +与累加顺序、`npu_grouped_matmul` 的实现），改 dtype 配方动不了
+          +它。这与 §4.1（把注意力 eager 实现改 fp32 也没有端到端收益）**
+          +同构**：两套栈的差异是**内核级**的，不是"配方级"的。          
+      467 +                                                              
+      468 +> 对 §9.7 的影响：MoE 仍是最大单项，但"改 dtype 就能对齐"的捷 
+          +径不存在；要真正对齐只能让一侧用另一侧的算子（引擎→训练侧受 A2
+          +/A3 布局限制，见 §4.2；反向则要动 vllm-ascend 的融合核），或继
+          +续用 RL 侧 IS 吸收。                                          
+      469 +                                                              
+      470 +### 10.4 本轮环境坑（会在下次运行复现，务必先看）             
+      471 +                                                              
+      472 +| # | 现象 | 根因 | 绕过 |                                    
+      473 +|---|---|---|---|                                             
+      474 +| E1 | 引擎起来后 worker 崩：`RuntimeError: [enforce fail at g
+          +loo/transport/tcp/device.cc:212] ifa != nullptr. Unable to fin
+          +d interface for: [141.61.29.117]` | **主机 IP 变了**（`141.61.
+          +29.117` → `80.5.25.117`），但 `/etc/hosts` 仍是 `141.61.29.117
+          + node-29-117`；凡是用**主机名**建 gloo 通信的路径都会失败（tor
+          +chrun 路径不受影响，因为它直接用 `127.0.0.1`） | 启动时加 `MAS
+          +TER_ADDR=127.0.0.1`（主/ HCCL 组）**且** `GLOO_SOCKET_IFNAME=e
+          +np48s3u1u1`（gloo 设备；`enp48s3u1u1` 是默认路由所在网卡，承载
+          + `80.5.25.117`）。**GRPO 脚本下次跑之前也要确认这一点** |     
+      475 +| E2 | 引擎启动即报 `ValueError: Free memory on device (54.72/
+          +61.27 GiB) on startup is less than desired GPU memory utilizat
+          +ion (0.9, 55.14 GiB)` | 每张卡都有**其他租户 ~3GB 常驻**，设备
+          +可用总量只有 61.27 GiB，`0.9×61.27 = 55.15 GiB` **刚好超过** f
+          +ree（55.11）→ 差 0.04 GiB 也失败 | `dump_engine_stages.py` 新 
+          +增 `--mem-util`（本轮用 `0.85`）。GRPO 脚本默认 `ROLLOUT_GPU_M
+          +EM_UTIL=0.6`，不受影响 |                                      
+      476 +| E3 | 用了有他人占用的卡 | `run_dump_engine.sh` 默认 `ASCEND_
+          +RT_VISIBLE_DEVICES=0,1,...` | 统一改用空闲的 `2,3,4,5,6,7,8,9`
+          + |                                                            
+      477 +                                                              
+      478 +（384 专家 `scaled` 权重的引擎侧 dump / 嫁接复验：见 §11。）  
+
+  Thought for 5s, ran 1 shell command (ctrl+o to expand)
+
+● scaled（384 专家）引擎侧 dump 成功了（179 个张量/rank，含 logprobs 与
+  decode-vs-prefill）。立刻在它上面复验 MoE 归因结论。
+
+  Thought for 5s, ran 1 shell command (ctrl+o to expand)
+
+● 384 专家上的复验结果更强：all.ffn 把 σ 从 0.706 压到 0.024（29×），而 all.attn
+  只有 1.7×。汇总全部表格：
+
+  Thought for 6s, ran 2 shell commands (ctrl+o to expand)
+
+● 数据齐了。写入工作记录并收尾（清理进程、确认显存释放）。
+
+● Update(wiki/work_log/worklog_dsv41_train_infer_consistency.md)
+  ⎿  Added 62 lines
+      476  | E3 | 用了有他人占用的卡 | `run_dump_engine.sh` 默认 `ASCEND_
+           RT_VISIBLE_DEVICES=0,1,...` | 统一改用空闲的 `2,3,4,5,6,7,8,9`
+            |
+      477  
+      478  （384 专家 `scaled` 权重的引擎侧 dump / 嫁接复验：见 §11。）
+      479 +                                                              
+      480 +---                                                           
+      481 +                                                              
+      482 +## 11. 384 专家权重（`scaled`）复验：MoE 归因成立且更强（2026-
+          +09-21）                                                       
+      483 +                                                              
+      484 +### 11.1 背景                                                 
+      485 +                                                              
+      486 +§9 的嫁接实验在 scaled32（32 专家）上得出"MoE 是量的主体"。而 
+          +线上数据（§0 表最后一行）显示**差距随专家数增长**（32 专家 kl≈
+          +0.11 → 384 专家 kl≈0.38），所以必须在生产专家数上复验。       
+      487 +                                                              
+      488 +`scaled` 权重（4 层 / **384 专家** / 106GB）需要**新跑一次引擎
+          +侧 dump**（原 dump 只有 scaled32）。执行中连撞 §10.4 的 E1/E2/
+          +E3 三个环境坑，全部修复后成功：                               
+      489 +                                                              
+      490 +```bash                                                       
+      491 +MASTER_ADDR=127.0.0.1 MASTER_PORT=29614 GLOO_SOCKET_IFNAME=enp
+          +48s3u1u1 \                                                    
+      492 +ASCEND_RT_VISIBLE_DEVICES=2,3,4,5,6,7,8,9 \                   
+      493 +bash scripts/dsv41_consistency/run_dump_engine.sh \           
+      494 +  --model-path /mnt/share/m00899630/weights/DeepSeek-V4.1-Flas
+          +h-4layer-scaled \                                             
+      495 +  --out-dir /mnt/share/m00899630/dsv41/dump/engine_scaled --le
+          +ngths 64,200 --skip-params --mem-util 0.85                    
+      496 +# → 成功：179 张量/rank 的阶段 dump + prompt_logprobs + decode
+          +-vs-prefill                                                   
+      497 +```                                                           
+      498 +                                                              
+      499 +```bash                                                       
+      500 +setsid bash /tmp/run_graft_scaled.sh   # 同 harness，--model-p
+          +ath / --engine-dir 换成 scaled                                
+      501 +# variants: baseline,0.attn,all.attn,all.ffn,all.attn+all.ffn 
+          +；lengths 64,200                                              
+      502 +python3 scripts/dsv41_consistency/summarize_graft.py --lengths
+          + 200 \                                                        
+      503 +  --graft-dir /mnt/share/m00899630/dsv41/dump/graft_scaled \  
+      504 +  --engine-dir /mnt/share/m00899630/dsv41/dump/engine_scaled  
+      505 +```                                                           
+      506 +                                                              
+      507 +### 11.2 结果（384 专家）                                     
+      508 +                                                              
+      509 +**len = 200**                                                 
+      510 +                                                              
+      511 +| 变体 | norm rel | Δmean | **σ** | \|Δ\|mean | p99 | max | σ 
+          +改善 |                                                        
+      512 +|---|---|---|---|---|---|---|---|                             
+      513 +| baseline | 0.1826 | −0.0971 | **0.7062** | 0.4195 | 2.703 | 
+          +3.194 | 1× |                                                  
+      514 +| `0.attn` | 0.1159 | +0.0077 | 0.4952 | 0.2201 | 1.771 | 3.56
+          +9 | 1.4× |                                                    
+      515 +| `all.attn` | 0.0970 | −0.0137 | 0.4104 | 0.1588 | 1.568 | 3.
+          +272 | 1.7× |                                                  
+      516 +| `all.ffn` | **0.0048** | −0.0008 | **0.0243** | 0.0194 | 0.0
+          +65 | 0.070 | **29×** |                                        
+      517 +| `all.attn+all.ffn` | **0.0010** | −0.0006 | **0.0120** | 0.0
+          +089 | 0.037 | 0.040 | **59×** |                               
+      518 +                                                              
+      519 +**len = 64**                                                  
+      520 +                                                              
+      521 +| 变体 | norm rel | Δmean | **σ** | \|Δ\|mean | p99 | max | σ 
+          +改善 |                                                        
+      522 +|---|---|---|---|---|---|---|---|                             
+      523 +| baseline | 0.2283 | −0.2414 | **1.0786** | 0.7237 | 3.290 | 
+          +3.463 | 1× |                                                  
+      524 +| `0.attn` | 0.0804 | +0.0697 | 0.3993 | 0.1692 | 1.753 | 2.24
+          +6 | 2.7× |                                                    
+      525 +| `all.attn` | 0.0710 | −0.0594 | 0.3015 | 0.1206 | 1.179 | 1.
+          +927 | 3.6× |                                                  
+      526 +| `all.ffn` | **0.0054** | +0.0012 | **0.0257** | 0.0203 | 0.0
+          +61 | 0.068 | **42×** |                                        
+      527 +| `all.attn+all.ffn` | **0.0009** | −0.0001 | **0.0137** | 0.0
+          +106 | 0.031 | 0.033 | **79×** |                               
+      528 +                                                              
+      529 +### 11.3 结论                                                 
+      530 +                                                              
+      531 +1. **§9 的归因在生产专家数上成立，而且更强**：MoE 对齐 29–42× 
+          +，注意力对齐只有 1.7–3.6×，两者都对齐 59–79×（σ 落到 0.012–0.0
+          +14 nats，最终隐状态 rel_err **0.10%**，与 scaled32 完全一致 → 
+          +这个地板是 HC/RMSNorm/head 的，与专家数无关）。               
+      532 +2. **baseline 差距随专家数显著变大**：σ 0.56→0.71（len200）、0
+          +.32→1.08（len64），norm rel_err 0.129→0.183 / 0.143→0.228。这*
+          +*定量解释了线上"kl 0.11（32 专家）→ 0.38（384 专家）"**：MoE  
+          +路径（每 token 的 6/384 专家分组 GEMM 与归约）的数值差随专家数
+          +增长，而它就是主项。                                          
+      533 +3. **引擎自身 decode↔prefill 也随专家数退化**：`engine_scaled`
+          + 的 greedy 8 token 重算差最大到 **+4.09 / +2.65 nats**（scaled
+          +32 同口径 ≤0.14；注意本次 dump 未开 `enable_batch_invariant`）
+          +。RL 的 rollout logprob 正是 decode 产出、训练侧是 prefill →  
+          +这是**第二条独立通道**，384 专家下必须依赖 `rl_config.enable_b
+          +atch_invariant=true`（已写入启动脚本）来压住。                
+      534 +4. 因此线上 384 专家那 0.38 nats 的 kl ≈ [训练↔引擎 MoE 主导的
+          +固有差] + [引擎内部 decode↔prefill 的残余]，两者随专家数一起变
+          +大。                                                          
+      535 +                                                              
+      536 +### 11.4 未做的事（留给下次/新机器）                          
+      537 +                                                              
+      538 +- 384 专家下的 `VERL_DSV41_MOE_BF16=1` A/B（§10 的负结论只在 3
+          +2 专家上验证过；理论上结论不会变，但没实测）。                
+      539 +- 引擎侧反方向嫁接（训练侧输出灌进引擎）——需要改 vllm-ascend w
+          +orker 的 monkey-patch，收益与正向嫁接信息等价，未做。         
+      540 +- 真实（fp8 专家）权重：`MODEL_PATH=` 一行切换即可复用本 harne
+          +ss，引擎侧需重跑 `run_dump_engine.sh`（注意 fp8 权重的 `quanti
+          +zation_config` 会影响 `load_weights` 路径）。                 
+
+● Update(wiki/work_log/worklog_dsv41_train_infer_consistency.md)
+  ⎿  Added 3 lines
+      27  > 12. **单层嫁接几乎无效**（只换第 3 层 attn：σ 无变化；只换第 
+          3 层 MoE：1.6×）——误差是逐层累积的，不是某一层单独造成的。
+      28  > 13. **路由选择两侧一致**：layer 0 的 router logits 差 0.6%（
+          同量级），**top-6 专家集合逐个 token 完全相同** → 再次确认是纯
+          数值差异，不是离散选择错误。
+      29  > 14. 修正后的行动优先级：**想缩小训推差，先对齐 MoE 路径**（gr
+          ouped matmul / 专家累加 / 路由权重算术 / all-to-all 归约），其
+          次才是注意力核。
+      30 +> 15. **384 专家（`scaled`）复验（§11）：归因成立且更强** —— ba
+         +seline σ 0.71/1.08（len200/64）→ 全层对齐 MoE 后 0.024/0.026（*
+         +*29–42×**），只对齐注意力仅 1.7–3.6×，两者都对齐 0.012（**59–79
+         +×**，隐状态 rel_err 0.10% 数值地板）。**这解释了线上"32 专家 kl
+         + 0.11 → 384 专家 kl 0.38"：MoE 固有差随专家数增长，且它是主项。
+         +**                                                             
+      31 +> 16. **dtype 配方不是原因（§10，负结果）**：把训练侧 MoE 改成 
+         +引擎的 bf16 配方（env 门控 `VERL_DSV41_MOE_BF16=1`），固有差纹 
+         +丝不动（0.0058→0.0057 / 0.0178→0.0178）→ 差异在**分组 GEMM 内核
+         +内部**，不在 GEMM 之间的 fp32 提升。与 §4.1（注意力改 fp32 无收
+         +益）同构：**内核级差异，没有"配方级"捷径**。                   
+      32 +> 17. **环境坑（会影响下次运行，见 §10.4）**：主机 IP 已变（`14
+         +1.61.29.117`→`80.5.25.117`）但 `/etc/hosts` 未更新 → 需要 `MAST
+         +ER_ADDR=127.0.0.1` + `GLOO_SOCKET_IFNAME=enp48s3u1u1`；`dump_en
+         +gine_stages.py` 需 `--mem-util 0.85`（每卡有他人 ~3GB 常驻，0.9
+         + 必然失败）。                                                  
+      33  
+      34  ---
+      35  
+
+  Thought for 4s, ran 1 shell command (ctrl+o to expand)
+
+● 有 8 个 VLLM::Worker_TP* 残留进程还占着显存（引擎 dump
+  跑完但进程没退）。按你的要求清理掉。
+
+  Thought for 15s, ran 3 shell commands (ctrl+o to expand)
+
+● 收工。所有任务已退出（pgrep 里剩下的 24 个是已结束进程的 zombie，不占资源；NPU
+  上现有显存占用经 /proc 核对属于其他租户的进程，我们已全部释放）。
+
+  这一轮做了什么
+
+  按你的思路做的，但把它变成因果实验：不是替换权重（权重上一轮已逐张量验证一致）
+  ，而是把引擎侧 layers.N.attn / layers.N.ffn 
+  的输出整块灌进训练侧前向，再看下游还有没有差异。新脚本
+  scripts/dsv41_consistency/graft_trainer_stages.py（10 种嫁接组合 × 2
+  种序列长度，两次运行的 baseline 完全复现上一轮独立 dump 的数字 →
+  确定性可控）。
+
+  结果：你说的 layers.0.attn 是"第一颗种子"，但量的主体是 MoE
+
+  scaled32（32 专家，len=200，σ = 逐位置 Δlogp 标准差）
+
+  ┌─────────────────┬────────────────────┬────────┬────────┐
+  │    嫁接内容     │ model.norm rel_err │   σ    │ σ 改善 │
+  ├─────────────────┼────────────────────┼────────┼────────┤
+  │ baseline        │ 0.1294             │ 0.5596 │ 1×     │
+  ├─────────────────┼────────────────────┼────────┼────────┤
+  │ 只第 0 层 attn  │ 0.0727             │ 0.3250 │ 1.7×   │
+  ├─────────────────┼────────────────────┼────────┼────────┤
+  │ 只第 3 层 attn  │ 0.1277             │ 0.5613 │ 无变化 │
+  ├─────────────────┼────────────────────┼────────┼────────┤
+  │ 全部 attn       │ 0.0592             │ 0.2172 │ 2.6×   │
+  ├─────────────────┼────────────────────┼────────┼────────┤
+  │ 全部 MoE (ffn)  │ 0.0048             │ 0.0243 │ 23×    │
+  ├─────────────────┼────────────────────┼────────┼────────┤
+  │ attn + MoE 全部 │ 0.0010             │ 0.0127 │ 44×    │
+  └─────────────────┴────────────────────┴────────┴────────┘
+
+  scaled（384 专家）复验——生产专家数下结论更强：baseline σ 0.706（len200）/
+  1.079（len64）→ 全层对齐 MoE 后 0.0243 / 0.0257（29–42×），只对齐注意力仅
+  1.7–3.6×，两者都对齐 0.0120 / 0.0137（59–79×），最终隐状态 rel_err 0.10%。
+
+  三个关键判读：
+
+  1. "两者都对齐 → 隐状态差 0.10%、logprob 差 0.012 nats"：这就是
+     HC/RMSNorm/head 的数值地板，与专家数无关。说明链路没有结构性 
+     bug——两套栈在"给定相同模块输出"后完全等价。
+  2. 误差逐层累积：只换一层几乎无效（第 3 层 attn 毫无变化），必须全层。MoE
+     之所以主导：逐层实测其输出 RMS（≈0.70）是注意力（≈0.45）的
+     1.5–2×，且它是每层最后写入残差流的那一项。
+  3. 定量解释线上"32 专家 kl 0.11 → 384 专家 kl 0.38"：MoE
+     固有差随专家数增长（baseline σ 0.56→0.71），而它就是主项。另外引擎自身
+     decode↔prefill 在 384 专家下也退化（重算差最大 +4.09 nats，本次未开
+     batch-invariant）——这是第二条独立通道，RL 里必须靠
+     rl_config.enable_batch_invariant=true 压住。
+
+  顺带验证（离线）：layer 0 的 top-6 专家选择两侧逐 token 完全相同（router
+  logits 只差 0.6% 同量级）→ 不是离散选择错误。
+
+  一个负结果（省得以后再试）
+
+  假设"训练侧两次 GEMM 之间的 fp32 提升是 MoE 固有差的来源"，我加了 env 门控
+  VERL_DSV41_MOE_BF16=1 复刻引擎的 bf16 配方：结果固有差纹丝不动（0.0058→0.0057
+  / 0.0178→0.0178）。→ 差异在分组 GEMM 内核内部（分块/累加顺序），没有"改 dtype 
+  就能对齐"的捷径，与之前"注意力改 fp32 无收益"同构。
+
+  需要你知道的两件事
+
+  ① 环境坑（会影响你下次跑，已写进工作记录 §10.4）
+  - 主机 IP 变了：141.61.29.117 → 80.5.25.117，但 /etc/hosts 仍写 141.61.29.117 
+    node-29-117 → 任何用主机名建 gloo 的路径都报 Unable to find 
+    interface。绕过：MASTER_ADDR=127.0.0.1 +
+    GLOO_SOCKET_IFNAME=enp48s3u1u1（GRPO 脚本下次也要确认）。
+  - dump_engine_stages.py 的 gpu_memory_utilization=0.9
+    在本机必然失败（每卡有他人 ~3GB 常驻，free 55.11 GiB < 0.9×61.27=55.15
+    GiB，差 0.04GiB 也拒启）→ 已加 --mem-util（用 0.85）。
+  - 统一改用空闲卡 ASCEND_RT_VISIBLE_DEVICES=2,3,4,5,6,7,8,9。
+
+  ② 代码改动（都可回退）
+  - 新增：graft_trainer_stages.py、summarize_graft.py、sh/run_graft_trainer.sh（
+    harness，不动产线路径）
+  - 改：dump_engine_stages.py 加 --mem-util
+  - 改：FSDPTurbo/.../{experts,model}.py 加 env 门控的 MoE
+    配方开关（VERL_DSV41_MOE_BF16，默认关闭、行为不变）；不想要就 cd 
+    /workspace-verl/FSDPTurbo && git checkout 
+    fsdp_turbo/models/deepseek_v41/{experts,model}.py
+  - 工作记录：verl/wiki/work_log/worklog_dsv41_train_infer_consistency.md 新增
+    §9/§10/§11 并在 §0 摘要里补了 11–17 条（含命令、报错、修复、全部原始数字）
+
+  下一步候选（等你定）：① 拿到真实 fp8 权重后 MODEL_PATH= 一行切换复跑整套
+  harness（引擎侧 dump 需重跑一次）；② 反过来做"引擎复用训练侧输出"的嫁接（需改
+  vllm-ascend worker，信息量与正向等价）；③ 既然没有配方级捷径，就按 §7-5 用 RL
+  侧 IS/TIS 吸收——现在有了修正后的量级（MoE 主导、384
+  专家下更大），阈值判断会比之前靠谱。
+
+✻ Sautéed for 1h 2m 16s · done Monday 2:42 PM
+
+❯ 工作记录在哪                                                                  
+
+● Please run /login · API Error: HIS Proxy Notification
+
+✻ Sautéed for 1s · done 1:35 AM
