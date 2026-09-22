@@ -39,6 +39,7 @@ def main():
     # degenerate, which is exactly what we want to avoid when comparing sparse attention).
     pool, rows = [], []
     for i, row in df.iterrows():
+        print(f"now is {i} th data, and data is {row}")
         prompt = row["prompt"]
         if isinstance(prompt, str):  # some parquet revisions store raw strings
             prompt = [{"role": "user", "content": prompt}]

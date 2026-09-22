@@ -12,26 +12,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Graft the engine's per-layer attention / MoE outputs into the trainer forward.
+"""Force the trainer's module *inputs* to the engine's values, then re-measure the outputs.
 
-The staged dumps (``dump_trainer_stages.py`` / ``dump_engine_stages.py``) show the two
-stacks first disagree inside layer 0's attention and that the disagreement then grows
-layer by layer. That is consistent with *either* (a) layer 0's attention being the only
-seed -- the later layers just propagate it -- *or* (b) every layer adding its own seed.
+`graft_trainer_stages.py` replaces a module's *output* with the engine's, which answers "how
+much would the rest of the stack drift if this module were perfect?". It cannot answer the
+opposite question: "given the *same* input, does this module still compute a different
+output?" -- because the engine's recorded output was produced from the engine's own input,
+which by layer >= 1 is not the trainer's input (the hybrid-state caveat in the worklog 9.6).
 
-This script separates the two by substituting the engine's own activation into the
-trainer's forward for selected layers (``--variants 0.attn``), so everything downstream of
-the graft runs on the engine's value. If the downstream stages (and the final logprobs)
-then agree, that grafted module was the seed; if they still drift, the remaining layers
-contribute on their own. ``baseline`` (no graft) runs in the same process for an
-apples-to-apples reference.
+This script grafts at the module *input* instead: a forward pre-hook overwrites the tensor
+the trainer is about to feed `model.layers.<i>.<attn|ffn>` with the engine's recorded input
+for the same module, and the engine's recorded output is still compared against whatever the
+trainer produces from it. With the input bit-identical, any remaining difference is the
+module's own kernel-level difference -- no upstream propagation involved. Variants:
+
+    baseline           no injection (reference, and the natural input difference per module)
+    in.all.ffn         force every layer's MoE input   <- "ffn 输入一致后还有没有误差"
+    in.all.attn        force every layer's attention input
+    in.all             both of the above (every module gets the engine's exact input)
+    in.<layer>.<mod>   a single layer, e.g. in.3.ffn
+
+Engine-side input sources (all already present in the staged engine dump):
+
+    attn: language_model.model.layers.<i>.input_layernorm        (module output)
+    ffn:  DeepseekV41DecoderLayer.rms_norm_cast@layer<i>[0]      (bf16 x; [1] is its
+          fp32 twin, verified bit-identical after the fp32 upcast, so the fused MoE's
+          `hidden_states_fp32` router input is covered by injecting [0] alone)
+
+Readouts per module: `in` = ||engine_in - trainer_natural_in|| / ||trainer_in|| (what the
+difference *was*), `out` = ||engine_out - trainer_out|| / ||trainer_out|| (what is left with
+the input forced). Plus model.norm rel_err, logprob Δ stats and argmax agreement.
 
 Usage (8 NPUs; same topology as the GRPO script):
 
     PYTHONPATH=/workspace-verl/vllm:/workspace-verl/vllm-ascend-v41-private:/workspace-verl/FSDPTurbo \
-    torchrun --nproc_per_node=8 scripts/dsv41_consistency/graft_trainer_stages.py \
+    torchrun --nproc_per_node=8 scripts/dsv41_consistency/probe_module_inputs.py \
         --model-path /mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-4layer-scaled32 \
-        --lengths 64,200 --variants baseline,0.attn,0.attn+0.ffn,all.attn
+        --engine-dir /mnt/share/m00899630/dsv41/dump/engine \
+        --out-dir /mnt/share/m00899630/dsv41/dump/probe_input \
+        --lengths 64,200 --variants baseline,in.all.ffn,in.all.attn,in.all
 """
 
 from __future__ import annotations
@@ -48,8 +67,13 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import dump_trainer_stages as dt  # noqa: E402  (sibling helper: build/load/hook plumbing)
 
-# trainer module -> engine dump key ([i] = layer index)
-ENGINE_KEYS = {
+# trainer module -> engine dump key. Inputs are what this experiment injects; outputs are what
+# it measures against (the same keys graft_trainer_stages.py uses for its output graft).
+ENGINE_INPUT_KEYS = {
+    "attn": "language_model.model.layers.{i}.input_layernorm",
+    "ffn": "DeepseekV41DecoderLayer.rms_norm_cast@layer{i}[0]",
+}
+ENGINE_OUTPUT_KEYS = {
     "attn": "language_model.model.layers.{i}.self_attn",
     "ffn": "language_model.model.layers.{i}.mlp",
 }
@@ -60,12 +84,12 @@ def parse_args():
     parser.add_argument("--model-path", default=os.environ.get("MODEL_PATH", ""))
     parser.add_argument("--fixture", default="/mnt/share/m00899630/dsv41/dump/fixture.json")
     parser.add_argument("--engine-dir", default="/mnt/share/m00899630/dsv41/dump/engine")
-    parser.add_argument("--out-dir", default="/mnt/share/m00899630/dsv41/dump/graft")
+    parser.add_argument("--out-dir", default="/mnt/share/m00899630/dsv41/dump/probe_input")
     parser.add_argument("--lengths", default="64", help="Comma separated fixture lengths.")
     parser.add_argument(
         "--variants",
-        default="baseline,0.attn,0.attn+0.ffn,all.attn",
-        help="baseline | <layer>.<attn|ffn> joined by '+' | all.attn | all.ffn",
+        default="baseline,in.all.ffn,in.all.attn,in.all",
+        help="baseline | items joined by '+' | item = in.<all|layer>.<attn|ffn> | in.all",
     )
     parser.add_argument("--fsdp-size", type=int, default=8)
     parser.add_argument("--tp-size", type=int, default=1)
@@ -87,24 +111,35 @@ class _BuildArgs:
 
 
 def parse_variant(spec: str, n_layers: int) -> dict[str, str]:
-    """`0.attn+0.ffn` / `all.attn` -> {"model.layers.0.attn": <engine key>, ...}."""
+    """`in.all.ffn+in.0.attn` -> {"model.layers.<i>.ffn": <engine input key>, ...}."""
     if spec == "baseline":
         return {}
     graft: dict[str, str] = {}
-    for item in spec.split("+"):
-        layer, _, module = item.partition(".")
-        if module not in ENGINE_KEYS:
-            raise SystemExit(f"variant {spec!r}: module must be one of {sorted(ENGINE_KEYS)}")
+    items: list[str] = []
+    for raw in spec.split("+"):
+        # `in.all` is shorthand for both modules at every layer
+        items.extend(["in.all.attn", "in.all.ffn"] if raw == "in.all" else [raw])
+    for item in items:
+        parts = item.split(".")
+        if len(parts) != 3 or parts[0] != "in" or parts[2] not in ENGINE_INPUT_KEYS:
+            raise SystemExit(
+                f"variant {spec!r}: expected baseline | in.<all|layer>.<attn|ffn> | in.all, got {item!r}"
+            )
+        layer, module = parts[1], parts[2]
+        if layer != "all" and not layer.isdigit():
+            raise SystemExit(
+                f"variant {spec!r}: expected baseline | in.<all|layer>.<attn|ffn> | in.all, got {item!r}"
+            )
         layers = range(n_layers) if layer == "all" else [int(layer)]
         for index in layers:
-            graft[f"model.layers.{index}.{module}"] = ENGINE_KEYS[module].format(i=index)
+            graft[f"model.layers.{index}.{module}"] = ENGINE_INPUT_KEYS[module].format(i=index)
     return graft
 
 
-def engine_stage(engine: dict, key: str) -> torch.Tensor:
+def engine_tensor(engine: dict, key: str, label: str) -> torch.Tensor:
     value = engine.get(key)
     if value is None:
-        raise SystemExit(f"engine dump has no key {key!r}")
+        raise SystemExit(f"engine dump has no key {key!r} ({label})")
     tensor = value[0] if isinstance(value, list) else value
     if not torch.is_tensor(tensor):
         raise SystemExit(f"engine key {key!r} is not a tensor: {type(value)}")
@@ -121,36 +156,58 @@ def describe(reference: torch.Tensor, other: torch.Tensor) -> dict:
     }
 
 
-def summarize(variant: str, stages: dict, engine: dict, lengths: int, scored: torch.Tensor,
-              next_logprobs: torch.Tensor, log) -> dict:
-    """Compare the grafted forward's downstream stages and logprobs against the engine."""
-    report = {}
+def summarize(variant, graft, input_sink, stages, engine, length, scored, engine_argmax,
+              next_logprobs, pred_ids, baseline, log) -> dict:
+    """Compare the forced forward against the engine: input diff (natural) + output diff (forced)."""
+    report = {"__inputs__": {}, "__outputs__": {}}
+    # (a) what each module input difference *was*, before the pre-hook overwrote it
+    for trainer_key, natural in input_sink.items():
+        parts = trainer_key.split(".")
+        engine_key = ENGINE_INPUT_KEYS[parts[3]].format(i=parts[2])
+        report["__inputs__"][trainer_key] = describe(
+            engine_tensor(engine, engine_key, "module input"), natural
+        )
+    # (b) every module's output, forced input where grafted
     for index in range(8):
         for module in ("attn", "ffn"):
             trainer_key = f"model.layers.{index}.{module}"
             tensor = stages.get(trainer_key)
             if tensor is None:
                 continue
-            engine_tensor = engine_stage(engine, ENGINE_KEYS[module].format(i=index))
-            if tensor.numel() != engine_tensor.numel():
+            engine_tensor_out = engine_tensor(engine, ENGINE_OUTPUT_KEYS[module].format(i=index), "module output")
+            if tensor.numel() != engine_tensor_out.numel():
                 continue
-            # same convention as compare_stages.py: rel_err = ||engine - trainer|| / ||trainer||
-            report[trainer_key] = describe(tensor, engine_tensor)
+            report["__outputs__"][trainer_key] = describe(tensor, engine_tensor_out)
     if "model.norm" in stages:
-        report["model.norm"] = describe(stages["model.norm"], engine_stage(engine, "language_model.model.norm"))
+        report["__outputs__"]["model.norm"] = describe(
+            stages["model.norm"], engine_tensor(engine, "language_model.model.norm", "model.norm")
+        )
     delta = (next_logprobs - scored).float()
+    agree = float("nan")
+    if engine_argmax:
+        ids = torch.tensor([token for token, _ in engine_argmax], dtype=torch.long)
+        agree = (ids == pred_ids[: ids.numel()].long()).float().mean().item()
     report["__logprob__"] = {
         "mean": delta.mean().item(),
         "std": delta.std().item(),
         "abs_mean": delta.abs().mean().item(),
         "p99": delta.abs().quantile(0.99).item(),
         "max": delta.abs().max().item(),
+        "argmax_agree": agree,
     }
-    log(f"[{variant}] " + " ".join(
-        f"{k.split('layers.')[-1]}={v['rel_err']:.4f}" for k, v in report.items() if k != "__logprob__"
-    ))
-    log(f"[{variant}] logprob Δ: mean={report['__logprob__']['mean']:+.4f} "
-        f"std={report['__logprob__']['std']:.4f} |Δ|p99={report['__logprob__']['p99']:.4f}")
+    parts = []
+    for key, value in report["__outputs__"].items():
+        name = key.split("layers.")[-1] if key.startswith("model.layers") else key
+        natural = report["__inputs__"].get(key)
+        in_text = f" in={natural['rel_err']:.4f}" if natural else ""
+        marker = "*" if key in graft else ""
+        parts.append(f"{name}{in_text} out={value['rel_err']:.4f}{marker}")
+    log(f"[{variant}] " + " | ".join(parts) + "   (* = input forced to the engine's)")
+    sigma = report["__logprob__"]["std"]
+    base_sigma = baseline.get("__logprob__", {}).get("std") if baseline else None
+    log(f"[{variant}] logprob Δ: mean={report['__logprob__']['mean']:+.4f} std={sigma:.4f} "
+        f"|Δ|p99={report['__logprob__']['p99']:.4f} argmax={report['__logprob__']['argmax_agree']:.3f}"
+        + (f"  ({base_sigma / sigma:.1f}× better than baseline σ={base_sigma:.4f})" if base_sigma else ""))
     return report
 
 
@@ -158,6 +215,11 @@ def main():
     args = parse_args()
     if not args.model_path:
         raise SystemExit("--model-path (or MODEL_PATH) is required")
+    # Fail on a bad --variants string before spending two minutes loading the checkpoint.
+    variants = [v for v in args.variants.split(",") if v]
+    for variant in variants:
+        parse_variant(variant, 1)
+    lengths = [int(x) for x in args.lengths.split(",") if x]
     torch, dist, device = dt.init_distributed()
     rank = dist.get_rank()
 
@@ -177,7 +239,7 @@ def main():
 
     def log(message):
         if rank == 0:
-            print(f"[graft] {message}", flush=True)
+            print(f"[probe-input] {message}", flush=True)
 
     config = dt.build_fsdp_turbo_config(_BuildArgs(args))
     init_parallel_state(config)
@@ -237,9 +299,7 @@ def main():
 
     with open(args.fixture) as f:
         fixture = json.load(f)
-    lengths = [int(x) for x in args.lengths.split(",") if x]
     samples = [s for s in fixture["samples"] if s["target_len"] in lengths]
-    variants = [v for v in args.variants.split(",") if v]
 
     out_dir = Path(args.out_dir)
     if rank == 0:
@@ -253,40 +313,51 @@ def main():
         with open(Path(args.engine_dir) / f"engine_len{length}.json") as f:
             engine_logprobs = json.load(f)
         scored = torch.tensor([lp for _, lp in engine_logprobs["scored"]], dtype=torch.float32)
+        engine_argmax = engine_logprobs.get("argmax")
 
         input_ids = torch.tensor([sample["input_ids"]], dtype=torch.long, device=device)
         attention_mask = torch.ones_like(input_ids)
 
         reports = {}
+        baseline = None
         for variant in variants:
             graft = parse_variant(variant, n_layers)
             stage_sink: dict[str, torch.Tensor] = {}
-            original_sink: dict[str, torch.Tensor] = {}
-            # No install_attention_op_hooks() here on purpose: its wrapper closes over the first
-            # call's sink, so across variants the attn-op entries would land in the wrong file.
-            # Those captures already exist in the staged trainer dump.
+            input_sink: dict[str, torch.Tensor] = {}
             handles = []
-            # 1) record the module's own (pre-graft) output, 2) replace it, 3) dump the result:
-            # forward hooks run in registration order, so the dump hooks added by install_hooks()
-            # below see the grafted value, while `original_sink` keeps the reference.
             fired: dict[str, int] = {}
-            for trainer_key in graft:
+            # `baseline` grafts nothing but still records every module input: that is the
+            # "how far apart were the two stacks' inputs" column of the report.
+            record_keys = list(graft) or [
+                f"model.layers.{index}.{module}" for index in range(n_layers) for module in ENGINE_INPUT_KEYS
+            ]
+            # forward pre-hooks run in registration order: record the natural input first (that
+            # is the "input difference" readout), then overwrite it with the engine's value.
+            for trainer_key in record_keys:
                 module = find_module(trainer_key)
+                engine_key = graft.get(trainer_key)
 
-                def record(_module, _inputs, output, key=trainer_key):
-                    payload = dt.to_cpu_fp32(output, args.max_elements)
-                    if payload is not None:
-                        original_sink[key] = payload
+                def record_in(_module, inputs, key=trainer_key):
+                    if inputs and torch.is_tensor(inputs[0]):
+                        payload = dt.to_cpu_fp32(inputs[0], args.max_elements)
+                        if payload is not None:
+                            input_sink[key] = payload
 
-                def replace(_module, _inputs, output, key=trainer_key, engine_key=graft[trainer_key]):
-                    grafted = engine_stage(engine, engine_key).to(device=output.device, dtype=output.dtype)
-                    if grafted.numel() != output.numel():
-                        raise SystemExit(f"{key}: engine {tuple(grafted.shape)} vs trainer {tuple(output.shape)}")
+                def replace_in(_module, inputs, key=trainer_key, eng_key=engine_key):
+                    hidden = inputs[0]
+                    grafted = engine_tensor(engine, eng_key, "module input").to(
+                        device=hidden.device, dtype=hidden.dtype
+                    )
+                    if grafted.numel() != hidden.numel():
+                        raise SystemExit(
+                            f"{key}: engine input {tuple(grafted.shape)} vs trainer input {tuple(hidden.shape)}"
+                        )
                     fired[key] = fired.get(key, 0) + 1
-                    return grafted.reshape(output.shape)
+                    return (grafted.reshape(hidden.shape), *inputs[1:])
 
-                handles.append(module.register_forward_hook(record))
-                handles.append(module.register_forward_hook(replace))
+                handles.append(module.register_forward_pre_hook(record_in))
+                if engine_key is not None:
+                    handles.append(module.register_forward_pre_hook(replace_in))
             handles += dt.install_hooks(model, torch, args.max_elements, stage_sink)
 
             started = time.time()
@@ -301,11 +372,14 @@ def main():
             logits = output.logits.float()
             logprobs = torch.log_softmax(logits, dim=-1)
             next_logprobs = logprobs[0, :-1].gather(-1, input_ids[0, 1:].unsqueeze(-1)).squeeze(-1)
-            expected_hits = {key: 1 for key in graft}
-            if fired != expected_hits:
-                raise SystemExit(f"graft hooks did not fire as expected: fired={fired} expected={expected_hits}")
+            pred_ids = logits[0, :-1].argmax(-1).cpu()
+            if fired != {key: 1 for key in graft}:
+                raise SystemExit(f"input hooks did not fire as expected: fired={fired} graft={list(graft)}")
             if rank == 0:
-                report = summarize(variant, stage_sink, engine, length, scored, next_logprobs.cpu(), log)
+                report = summarize(variant, graft, input_sink, stage_sink, engine, length, scored,
+                                   engine_argmax, next_logprobs.cpu(), pred_ids, baseline, log)
+                if variant == "baseline":
+                    baseline = report
                 reports[variant] = report
                 torch.save(
                     {
@@ -313,11 +387,12 @@ def main():
                         "graft": graft,
                         "input_ids": input_ids[0].cpu(),
                         "next_logprobs": next_logprobs.float().cpu(),
+                        "pred_ids": pred_ids,
                         "stages": stage_sink,
-                        "stages_pre_graft": original_sink,
+                        "inputs": input_sink,
                         "forward_s": elapsed,
                     },
-                    out_dir / f"graft_len{length}_{variant.replace('+', '-')}.pt",
+                    out_dir / f"probe_len{length}_{variant.replace('+', '-').replace('.', '_')}.pt",
                 )
             # fresh engine request <-> fresh ring buffers, same as the staged dumps
             for name, buffer in model.named_buffers():

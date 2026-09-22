@@ -22,8 +22,12 @@ PARAM_PATTERNS = [
     "embed_tokens",
     "lm_head",
     "layers.0.",
+    "layers.1.",
     "layers.2.",
-    "layers.3.",
+    "layers.3.",  # 0/2/3 were the structurally interesting ones (layer 2 owns the compressed
+    #               KV + index, layer 3 reads its selection), but skipping layer 1 left it with
+    #               only 4 of its ~25 params fingerprinted, and nothing in the 4-layer configs
+    #               (engram off) justifies that. Existing dumps predate this line.
     "norm.weight",
 ]
 

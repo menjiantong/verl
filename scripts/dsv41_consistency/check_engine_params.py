@@ -29,7 +29,20 @@ def parse_args():
     ap.add_argument("--rtol", type=float, default=0.02, help="relative tolerance on std/absmax/mean")
     ap.add_argument("--tp", type=int, default=8)
     ap.add_argument("--ep", type=int, default=8)
+    ap.add_argument("--n-experts", type=int, default=0,
+                    help="Override the routed-expert count (default: read n_routed_experts from "
+                         "--model-path/config.json). The old hard-coded 32 silently mis-checks "
+                         "384-expert checkpoints.")
     return ap.parse_args()
+
+
+def num_routed_experts(model_path: str, override: int) -> int:
+    """The checkpoint's routed-expert count, so the EP shard mapping is right for any model."""
+    if override:
+        return override
+    config = json.loads((Path(model_path) / "config.json").read_text())
+    text_config = config.get("text_config", config)
+    return int(text_config["n_routed_experts"])
 
 
 class Checkpoint:
@@ -113,6 +126,11 @@ def main():
                 add("head.weight[tp shard0]", ck("head.weight", 0))
             elif name == "language_model.model.norm.weight":
                 add("norm?", ck("norm.weight") if "norm.weight" in ckpt.weight_map else None)
+            elif name.startswith("vision.") or name.startswith("aligner."):
+                # The VL wrapper builds the tower when the config says vision_n_layers > 0 (F6),
+                # so the engine holds vision tensors under the checkpoint's own names. It was
+                # reported as a false FAIL until this branch existed.
+                add(name, ck(name))
             elif m:
                 layer, rest = m.group(1), m.group(2)
                 base = f"layers.{layer}."
@@ -143,7 +161,9 @@ def main():
                 if rest in simple:
                     add(f"{base}{simple[rest]}", ck(base + simple[rest]))
                 elif rest == "self_attn.attn_sink":
-                    add(f"{base}attn.attn_sink[tp]", ck(base + "attn.attn_sink"))
+                    # TP-sharded along the head axis (engine holds n_heads/tp entries per rank).
+                    # The random fixtures zero this tensor, which hid the missing shard until now.
+                    add(f"{base}attn.attn_sink[tp]", ck(base + "attn.attn_sink", 0))
                 elif rest == "self_attn.wq_b.weight":
                     add(f"{base}attn.wq_b.weight[tp0]", ck(base + "attn.wq_b.weight", 0))
                 elif rest == "self_attn.wo_b.weight":
@@ -164,7 +184,7 @@ def main():
                     if tensor is not None:
                         add(f"{base}ffn.shared_experts.w2[tp1]", tensor)
                 elif rest in ("mlp.experts.routed_experts.w13_weight", "mlp.experts.routed_experts.w2_weight"):
-                    n_experts = 32
+                    n_experts = num_routed_experts(args.model_path, args.n_experts)
                     per_rank = n_experts // args.ep
                     mine = range(rank * per_rank, (rank + 1) * per_rank)
                     if rest.endswith("w13_weight"):

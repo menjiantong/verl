@@ -278,6 +278,10 @@ python3 make_random_ckpt_dsv41_4layers.py --config config.dsv41_4layer.bf16.json
 | `training_log_ppl` vs `rollout_log_ppl` | 接近 | 差距大 |
 | `actor/grad_norm` | 有限 | nan |
 
+> ⚠️ **阈值要按"权重/专家数"重标定（2026-09-22 修正）**：上表的"~0 / >0.99"是在 G12 那批权重上得出的，**不能当通用阈值**。后续一致性专项（见 [work_log/worklog_dsv41_module_input_probe.md](work_log/worklog_dsv41_module_input_probe.md)）证明：这两个指标主要是**两套栈的固有内核数值差（每模块 ~0.5% ≈ bf16 的 1 ULP）**经 MoE 路由离散翻转逐层放大的结果，**随专家数与 head-gain 显著变化**——32 专家 scaled32 是 `0.010/0.979`，384 专家 `scaled` 是 `kl 0.38 / pearson 0.79`，二者都是"同步正确"的正常表现；真实（fp8、head 正常尺度）权重预计回到 kl ≈ 0.01 量级。
+> **判据改为看量级断层**：真错位（专家错绑/布局没回退）会是 **O(1) 的 logprob 落差 / pearson ~0.5**，与"专家数放大"有数量级差异；同时用**直接量**做健康检查——权重指纹（`check_engine_params.py`）、模块 rel_err / Δlogp σ（`probe_module_inputs.py` + `summarize_probe.py`）。
+> 另：默认配置下 `old_log_probs` 由训练侧重算（`trainer_base.py::_compute_old_log_prob`；本脚本未设 `algorithm.rollout_correction`），**这个差进入的是 off-policy 程度与监控指标，不进入 PG ratio**。
+
 **结果（2026-09-19，scaled32 权重，第一步）**：
 
 | 指标 | N(0,1) 权重（G12） | scaled 权重 |
@@ -350,6 +354,23 @@ python3 make_random_ckpt_dsv41_4layers.py --config config.dsv41_4layer.bf16.json
 - 另发现训练侧 padded/rmpad 路径的 **label roll 会跨样本回绕**（每序列 1 个响应 token 的 logprob 错，±0.03–0.10 nats/序列），建议单独修复。
 - 新增工具链 `scripts/dsv41_consistency/`（夹具/dump/参数校验/四种对比）、`VERL_DSV41_DUMP_BATCH` 落盘开关。
 
+## 4.6 真实权重复跑（2026-09-22）：训推差距的主因是一个**可修的 dtype 不对称**
+
+用真实 DeepSeek-V4.1-Flash 切出 4 层（384 专家）重跑 §4.5 的整套 harness
+（**完整工作记录：[work_log/worklog_dsv41_real_weights_4layer.md](work_log/worklog_dsv41_real_weights_4layer.md)**；
+另见 [work_log/worklog_dsv41_module_input_probe.md](work_log/worklog_dsv41_module_input_probe.md) §8），三条结论会影响这里的判读标准：
+
+1. **随机权重把因果搞反了**：随机权重下"把模块输入钉成引擎的值"能让 σ 降 22–35×（噪声几乎全部来自输入差被 MoE 放大）；
+   真实权重下只降 1.2–1.4×。真实权重的主因是：**checkpoint 里 fp32 的 MoE 路由器纠偏 bias
+   （`layers.<i>.ffn.gate.bias`）被训练侧的 `prepare_deepseek_v41_model_for_fsdp` 统一转成 bf16（`adapter.py:395-398`），
+   而引擎保持 fp32**（架构本身声明 fp32：`model.py:936`；bf16 与 **W8A8** 两套真实权重实测都是 F32）。
+   该 bias 只进专家**选择**不进权重，所以它的舍入是**纯离散**的：喂逐位相同的输入，top-6 集合仍在 **20–62%** 的 token 上不同。
+2. **量化贡献**（4 组 A/B，`VERL_DSV41_KEEP_FP32_PARAMS=1|gate|continuous`，len=200）：
+   baseline σ **0.2573 → 0.0967（只还原 gate.bias）→ 0.0668（全还原）**；输入钉死后的 σ **0.1882 → 0.0202 → 0.0191**；
+   MoE 地板 0.0115–0.0449 → **0.0034–0.0042**；argmax 一致率 0.82 → **0.97**。只还原 `hc_*`/`attn_sink` 则**毫无变化**。
+3. **§4.5 的健康指标判读再修正一次**：真实权重下这个不对称是**可修项**（训练侧保 fp32 / 引擎侧对齐 bf16，见 plan §7.4），
+   修完再看是否需要 TIS；`rollout_corr/kl` 等指标在修之前**不能当作"同步是否健康"**的依据（它们现在混进了 10× 的参数级离散种子）。
+
 ## 5. 剩余风险与待办
 
 | 风险/待办 | 说明 | 建议 |
@@ -363,7 +384,8 @@ python3 make_random_ckpt_dsv41_4layers.py --config config.dsv41_4layer.bf16.json
 - 加载广播：单个 3D 专家张量 18.1GB（`384×4608×5120` bf16）**每卡瞬时**，DCP 逐 tensor 广播，同一时刻只有一个。
 - 因此加载峰值 ≈ **45–50GB/卡**；训练/rollout 阶段靠 `offload_policy` + vLLM sleep 与 27GB 专家常驻共存。
 
-
+| 风险/待办 | 说明 | 建议 |
+|---|---|---|
 | 权重同步峰值 | `get_per_tensor_param` 会对每个专家 DTensor 做 `full_tensor()`（18GB/次上卡），再 unfuse | 观察真机显存；必要时用 bucketed 传输/降低并发 |
 | 训练吞吐 | V4.1 参考注意力在 NPU 上走 `indexed_sparse_attention_torch`（eager，非 fused DSA）；`use_remove_padding=False` 走 padded | 先正确后快；后续评估 `use_sparse_flash_attn=True` / packed 路径 |
 | 稠密参数导出仍走 offload/all-gather 路径 | 专家之外（embed/head/attention/mlp，约 1GB/rank）仍按 `_export_param` 默认实现 `param.to(device).full_tensor()`，在 CPU-offloaded DTensor 上做 all-gather；scaled32 实测这部分的传输量约 3 GiB/rank、折合约 3–5s | 若日后仍是瓶颈：需要按**单个参数**对齐 FSDP 分片与引擎 TP 分片（embedding/head 两侧都是 dim0 连续切分，但 loader 还会再 narrow，不能直接送分片）；或按 G13 的思路让引擎回报所需分片 |

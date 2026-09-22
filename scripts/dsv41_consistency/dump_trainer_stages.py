@@ -247,6 +247,88 @@ def to_cpu_fp32(value, max_elements):
     return None
 
 
+def restore_fp32_parameters(model, model_path, log, device, only: str = ""):
+    """Compute with the checkpoint's fp32 parameter values where the trainer holds bf16 (H2).
+
+    `prepare_deepseek_v41_model_for_fsdp` normalizes *every* floating parameter to bf16, so the
+    architecture's own fp32 declarations get rounded on load while the engine keeps the
+    checkpoint's fp32 values. In the real 4-layer slice that is 32 parameter tensors the trainer
+    actually has: the router's correction bias (`Gate.bias`, declared fp32 in `model.py:936`),
+    `attn_sink` and the six `hc_*` per layer. The router bias is the one that matters most -- it
+    steers expert *selection* only, so its rounding is a purely discrete perturbation that no
+    input graft can remove (offline, on the engine's own MoE inputs: rounding it to bf16 changes
+    the trainer's top-6 set on 20-62% of tokens -- and the trainer's *recorded* routing is
+    reproduced 100% with the rounded value, 21-62% with the true fp32 one -- while the engine's
+    own router capture reproduces with fp32).
+
+    The parameter itself must stay bf16: FSDP2 asserts one original dtype per parameter group
+    (`_fsdp_param_group.py::_init_mp_dtypes`, hit when this used to reassign `parameter.data`).
+    So the fp32 value is swapped in around the owning module's forward instead -- same tensors
+    the engine holds, and FSDP never sees a second dtype. Env-gated by the caller
+    (`VERL_DSV41_KEEP_FP32_PARAMS=1`). Returns the names overridden.
+    """
+    import torch
+    from safetensors import safe_open
+
+    from verl.workers.engine.fsdp.fsdp_turbo_dsv41_impl import _MODEL_PREFIX, _checkpoint_weight_map
+
+    weight_map = _checkpoint_weight_map(Path(model_path))
+    handles: dict[str, object] = {}
+    overrides: dict[str, dict[str, torch.Tensor]] = {}  # module path -> {attr: fp32 tensor}
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            ckpt_name = name[len(_MODEL_PREFIX):] if name.startswith(_MODEL_PREFIX) else name
+            shard = weight_map.get(ckpt_name)
+            if shard is None or parameter.is_meta or parameter.dtype == torch.float32:
+                continue
+            if shard not in handles:
+                handles[shard] = safe_open(str(Path(model_path) / shard), framework="pt", device="cpu")
+            handle = handles[shard]
+            if handle.get_slice(ckpt_name).get_dtype() != "F32":
+                continue
+            value = handle.get_tensor(ckpt_name)
+            if tuple(value.shape) != tuple(parameter.shape):
+                log(f"skip fp32 override of {name}: ckpt shape {tuple(value.shape)} != {tuple(parameter.shape)}")
+                continue
+            module_path, _, attr = name.rpartition(".")
+            if only == "gate" and attr != "bias":  # `=gate`: router correction bias only
+                continue
+            if only == "continuous" and attr == "bias":  # `=continuous`: hc_*/attn_sink only
+                continue
+            # The load uses cpu_offload=True, so `parameter.device` is cpu; the swap has to
+            # land where the forward runs (the module's activations), not where it was loaded.
+            overrides.setdefault(module_path, {})[attr] = value.to(device=device, dtype=torch.float32)
+
+    module_names = {name for name, _ in model.named_modules()}
+    for module_path, attrs in overrides.items():
+        if module_path not in module_names:
+            log(f"skip fp32 override for unknown module {module_path!r}")
+            continue
+        module = model.get_submodule(module_path)
+        saved: dict[str, tuple[bool, object]] = {}
+
+        def swap_in(mod, _inputs, _attrs=attrs, _saved=saved):  # pre-hook: (module, args)
+            for attr, tensor in _attrs.items():
+                _saved[attr] = (attr in mod.__dict__, mod.__dict__.get(attr))
+                object.__setattr__(mod, attr, tensor)
+
+        def swap_out(mod, _inputs, output, _saved=saved):  # post-hook: (module, args, output)
+            for attr, (existed, old) in _saved.items():
+                if existed:
+                    object.__setattr__(mod, attr, old)
+                else:
+                    mod.__dict__.pop(attr, None)
+            return output
+
+        module.register_forward_pre_hook(swap_in)
+        module.register_forward_hook(swap_out)
+
+    names = [f"{path}.{attr}" for path, attrs in overrides.items() for attr in attrs]
+    log(f"fp32 use-site override on {len(names)} parameters ({len(overrides)} modules): "
+        f"{sorted({n.split('.')[-1] for n in names})}")
+    return names
+
+
 def install_attention_op_hooks(torch, stage_sink, max_elements):
     """Record the inputs/output of `indexed_sparse_attention` per layer.
 
@@ -374,7 +456,16 @@ def main():
 
     log("materializing parameters from checkpoint")
     started = time.time()
-    full_state = read_dsv41_checkpoint_state_dict(Path(args.model_path), param_meta)[0] if rank == 0 else {}
+    if rank == 0:
+        full_state, ckpt_report = read_dsv41_checkpoint_state_dict(Path(args.model_path), param_meta)
+        # Otherwise DCP's strict=True raises a generic "Missing key(s)" much later (see H6 in
+        # plans/dsv41-real-weights-4layer/plan.md); fail here with the actual names instead.
+        assert not ckpt_report["missing"], (
+            f"checkpoint {args.model_path} lacks {len(ckpt_report['missing'])} tensors the model needs, "
+            f"e.g. {ckpt_report['missing'][:5]}"
+        )
+    else:
+        full_state = {}
     options = StateDictOptions(full_state_dict=True, broadcast_from_rank0=True, cpu_offload=True)
     set_model_state_dict(model, full_state, options=options)
     del full_state
@@ -383,6 +474,9 @@ def main():
     for buffer in model.buffers():
         if buffer.device != device:
             buffer.data = buffer.data.to(device)
+    fp32_mode = os.environ.get("VERL_DSV41_KEEP_FP32_PARAMS", "")
+    if fp32_mode:
+        restore_fp32_parameters(model, args.model_path, log, device, only="" if fp32_mode == "1" else fp32_mode)
     refresh_dsv41_expert_metadata(model, device)
     still_meta = [name for name, parameter in model.named_parameters() if parameter.is_meta]
     assert not still_meta, f"parameters left on meta: {still_meta[:5]}"
