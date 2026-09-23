@@ -5,6 +5,9 @@
 > `/mnt/share/m00899630/plans/dsv41-real-weights-4layer/`，本篇只写"怎么改的、踩了什么、验成什么样"。
 >
 > 状态：**已完成**（代码 + CPU 侧逐位校验 + 真实切片 smoke/probe 回归 + 离线 identification + 8 卡 GRPO 冒烟，全部通过）
+>
+> 2026-09-23 追加 **§7**：回答上一轮会话末尾被打断的 btw —— "同步会把引擎那份降级成 bf16，那同步过一次之后
+> 误差是不是就小了"。含逐环节代码核实、生产时序结论，以及它对 §5 那组数字**作用域**的修正。
 
 ---
 
@@ -23,6 +26,10 @@
 输入全钉死后 σ **0.1882 → 0.0202**、MoE 地板 **0.0316–0.0449 → 0.0037/0.0042/0.0038/0.0034**、
 `model.norm` **0.0735 → 0.0062**、argmax **0.819 → 0.970**；离线 identification 从"bf16 100%"
 翻成"**fp32 100%**"。数字与修复前 `=gate` 效果预演**逐项相同**。详见 §5。
+
+> ⚠️ **读这组数字时注意它的作用域**（2026-09-23 补，§7）：它测的是 harness 状态——**引擎直接从 ckpt 起、
+> 从不做权重同步**。生产 GRPO 在首次 rollout **之前**就先同步一次权重（`ray_trainer.py:1429-1430`），
+> 所以修复前生产侧两侧其实早已"一致在 bf16 值"上；修复的真正增量是"一致的值回到 ckpt 精度"+"不依赖同步"。
 
 ---
 
@@ -351,10 +358,14 @@ rollout → 训练步）要另外验证——新版 `state_dict()` 里多了 buf
    纠偏 bias 会在同步通道上被重新舍入。
 5. **权重同步的量**：修复后 fp32 bias 会随 `state_dict()` 一起同步到引擎（名字不变 → 引擎 WeightsMapper 照旧命中）。
    数值上这与引擎自有值相同（都是 ckpt fp32），但这也意味着**训练侧保存的 checkpoint 现在会带这个 buffer**
-   （DCP 保存含 persistent buffer），恢复时不会再退回 0。
+   （DCP 保存含 persistent buffer），恢复时不会再退回 0。这条同步机制还有**更一般的另一面**：修复前它会把
+   引擎侧所有 *ckpt fp32 / 训练 bf16* 的值**一起降级**成训练侧精度（`gate.bias` + `attn_sink` + `hc_*`）——
+   逐环节核实、以及"生产在首次 rollout 之前就同步过"这个时序结论见 **§7**。
 
 ### 6.2 遗留
 
+- **"同步后"状态的数值对照没有专门跑**（§7.3）：把两侧的 `gate.bias` 都按 bf16 往返一次再算 σ，需要重跑
+  引擎 dump（~40–70 min）+ probe（~20 min）。当前结论来自代码链 + §5.3 的 identification，预期与修复后同量级。
 - **`=gate` 档的"变为空操作"没有单独复跑**：E7 说它现在找不到目标（`gate.bias` 不是 parameter 了），
   跑出来应当与 baseline 逐位相同；这一条是代码读出来的结论，**没有**再花 10 分钟 NPU 时间做一次确认
   （identification 已经从"训练侧手里是哪个值"这个更直接的角度证明过了）。
@@ -369,7 +380,73 @@ rollout → 训练步）要另外验证——新版 `state_dict()` 里多了 buf
 
 ---
 
-## 7. 复现命令
+## 7. btw：同步把引擎那份"降级"之后，误差是不是就小了？（2026-09-23 回答）
+
+> 独立成稿（同样的内容，自包含、可单独传阅）：`/workspace-verl/QA/QA-2026-09-23-dsv41-权重同步与gate-bias-dtype不对称.md`
+
+> **提问原文**（2026-09-23 04:12，上一轮会话在这里被 API 错误打断，没来得及回答）：
+>
+> 权重同步（训练 → 引擎）：修复前训练侧导出的确实是 bf16 张量，引擎 `load_weights` 把它写进 fp32 参数时
+> 类型变成 fp32、值已经是 bf16 舍入过的 —— 也就是说同步这条路会把引擎那份"降级"，此后两边在这个张量上
+> 就一致了（都是 bf16 值）。进行过一次权重同步后，是不是误差会减小
+
+### 7.1 结论
+
+1. **是**。一次同步之后两侧手里的 `gate.bias` 就是**同一个值**（引擎侧 fp32 张量里装着训练侧 export 的那个
+   bf16 值）→ 由参数级 dtype 不对称产生的**离散翻转源直接归零**。机制上这与本次修复是同一条路的两个版本：
+   **同步 = 把引擎降到训练侧精度**（两侧一致，但都不是 ckpt 的值）；**修复 = 把训练侧升到 ckpt 精度**
+   （两侧一致，且都是 ckpt 的值）。
+2. **在生产 GRPO 里，这件事"修复之前"就已经发生**：`fit()` 在 `_load_checkpoint()` 之后、**任何生成之前**
+   先同步一次权重（`verl/trainer/ppo/ray_trainer.py:1428-1430`，注释原文 *"load checkpoint and update weights
+   before doing anything"*），此后每步末尾再同步一次（`:1716`）。所以 **§5.2 那组"不对称"数字（baseline
+   0.2573 / 钉死 0.1882）描述的是 harness 状态**（引擎从 ckpt 起、从不做同步），**不是生产状态**：修复前的
+   生产运行从第一次 rollout 起，引擎拿的就是训练侧那份 bf16 舍入过的 bias。冒烟日志的时序也吻合——引擎
+   14:42:26 起来、第一次生成请求 14:44:18，中间 ~112 s 的窗口里就包含这次开局同步（步内同步实测 89.7 s）。
+   本 recipe 走 `backend: naive`（冒烟日志里的 resolved config），实现是同一条路：
+   `actor_wg.update_weights()` → `engine.get_per_tensor_param()`（`verl/workers/engine_workers.py:786`）。
+   这行开局同步不是本次工作引入的：`git log -L 1428,1430` 显示它来自 2026-03-04 的上游提交
+   （`c4593e3c`，当时还是无参的 `update_weights()`），也就是说**修复前它就一直在**。
+3. 所以修复的收益要重新分配一下。**"两栈一致性"那一半，生产里同步已经给了**；修复真正多出来的是：
+   ① 两侧一致的值是 **checkpoint 的 fp32 值**——离散路由不再偏离模型意图，且**训练侧自己的 forward/backward
+   从第一个 token 起**就是 ckpt 意图的路由（这一条与同步无关，同步只能改引擎那份）；
+   ② **不依赖同步**：harness / 离线评估 / 任何"引擎刚从 ckpt 起、同步还没跑"的时刻都是对齐的，§5 的判据
+   才是关于**模型本身**而不是"同步有没有跑过"的判据；
+   ③ 不必接受一次**静默降级**——同步覆盖引擎侧 ckpt fp32 值这件事没有任何日志。
+
+### 7.2 "同步真的会把这个张量送过去、并按 bf16 落进 fp32 参数吗"——逐环节核实
+
+| 环节 | 代码位置 | 结论 |
+|---|---|---|
+| 导出 | `verl/workers/engine/fsdp/transformer_impl.py:1028` `params = self.module.state_dict()` | `state_dict()` 含 **persistent buffer** → 修复前（Parameter）与修复后（buffer）**都在里面** |
+| 导出（dtype） | 同文件 `_export_param`（`:977-987`）；dsv41 覆写只对专家张量分片（`fsdp_turbo_dsv41_impl.py:305-363`） | 张量**原样**导出、不做 dtype 归一化：修复前 bf16、修复后 fp32 |
+| 传输 | `checkpoint_engine/base.py:570-585`（`TensorMeta(dtype=weight.dtype)` + `view(uint8)`）、`:600-620`（`chunk.view(dtype)` 还原） | 按**每个张量自己的 dtype** 过线，字节不变。本 recipe 走 `naive`（同进程直传，连 CE 这条路都不经过），dtype 更不会被改 |
+| 落盘（名字） | `vllm_ascend/models/deepseek_v4/model.py:1183` `.gate.bias` → `.gate.e_score_correction_bias` | 名字命中；**这行在"skip extra bias"守卫之前**，不会被 `.bias` 结尾的跳过逻辑吃掉；映射不上是 **KeyError（响亮失败）**，不是静默丢弃 |
+| 落盘（值） | `vllm/model_executor/model_loader/weight_utils.py:1231-1245` `default_weight_loader` = `param.data.copy_(loaded_weight)` | bf16 → fp32 参数：**dtype 是 fp32、值就是 bf16 值**（bf16→fp32 加宽无损）→ 提问里的**前提成立**；fp32 → fp32：逐位 |
+
+同一条机制的"另一半"：引擎侧所有 *ckpt fp32 / 训练 bf16* 的参数都会被这次同步**一起降级**——`attn_sink`
+（`model.py:501`）与 `hc_*`（`:726-731`、`:867-870`）在引擎侧同样是 `dtype=torch.float32` 的 Parameter，
+进入同步时被训练侧的 bf16 值覆盖。§6.1.2 那 28 个"没动"的参数（阴性对照贡献 ≈0）走的就是这条路。
+
+时序备注：naive 同步的顺序是 **resume weights → push → （下一步）gen**（`engine_workers.py:768-804`），
+所以每次生成时引擎一定拿的是最近一次同步的值——与 vLLM sleep 是 offload 还是 discard 无关。
+
+### 7.3 数值上的预期，以及为什么这一条没有另花 NPU 时间
+
+- **离散源归零有直接证据**：§5.3 的 identification——两侧值一致时 top-6 命中率就是 100%，值不同时只有
+  21.9–64.1%（即翻转率）。"同步后两侧同值" ⇒ 该翻转率归零 ⇒ σ 预期回到与修复后**同量级**
+  （baseline ≈0.0967、钉死 ≈0.0202、MoE 地板 ≈0.0034–0.0042）：两者都只剩"输入差 × 内核差"这一支。
+  严格说两者共享的 bias **值**不同（bf16 vs fp32）、路由图案不同，地板可能在最后一位上差一点。
+- **未实测**：没有真的跑一次"两侧都用 bf16 舍入值"的对照——它要重跑引擎 dump（~40–70 min）+ probe
+  （~20 min）。做法（若要做）：给两个 harness 的加载路径加一个 env（如
+  `VERL_DSV41_EMULATE_SYNC_BF16_BIAS=1`），在张量进模型前把 `*.gate.bias` 做一次 `x.bfloat16().float()`
+  往返、两侧都开，再跑 `summarize_probe.py` 对比。
+- 顺带核实（**40 层复跑的前置检查**）：真实 40 层 config 的 `text_config` 里没有 `num_hash_layers`
+  （引擎侧缺省 0）→ `self.hash` 全 False、**每层都有 `e_score_correction_bias` 参数**，不会出现
+  "hash 层该参数为 `None`、而同步送来一个 `.gate.bias` → KeyError"。
+
+---
+
+## 8. 复现命令
 
 ```bash
 # 全部：smoke + probe + 汇总 + CPU 校验（~20–25 min，8 卡）

@@ -374,6 +374,12 @@ python3 make_random_ckpt_dsv41_4layers.py --config config.dsv41_4layer.bf16.json
 > ✅ **2026-09-22 补充：修复已落地**（`Gate.bias` → fp32 buffer），真实切片回归数字与上表的"只还原 `gate.bias`"**逐项相同**，
 > 且不需要任何 env 开关；8 卡 GRPO 冒烟（含权重同步）也已跑通。
 > 完整记录：[worklog_dsv41_gate_bias_fp32_fix.md](worklog_dsv41_gate_bias_fp32_fix.md)。
+>
+> ⚠️ **2026-09-23 再补一条作用域修正**（修复记录 **§7**）：本节这些数字（含修复前的 0.2573 / 0.1882）测的都是
+> **harness 状态**——引擎从 ckpt 起、**不做权重同步**。而生产的 `fit()` 在首次 rollout **之前**就先同步一次权重
+> （`ray_trainer.py:1428-1430`），同步会把引擎那份 ckpt fp32 的 bias **降级**成训练侧的 bf16 值——所以修复前
+> 生产侧两侧其实早已"一致在 bf16 值"上，本节 σ 描述的是"引擎刚从 ckpt 起、同步还没跑"的那一刻。修复的增量
+> 因此是 **"一致的值回到 ckpt 精度" + "不依赖同步"**，而不是"把生产的两栈差异从 0.2573 降下来"。
 
 ## 5. 剩余风险与待办
 
