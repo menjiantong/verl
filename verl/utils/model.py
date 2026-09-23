@@ -85,13 +85,39 @@ def update_model_config(module_config, override_config_kwargs):
             setattr(module_config, key, val)
 
 
+def get_auto_config_with_vllm_fallback(model_name: str, trust_remote_code: bool = False, **kwargs):
+    """``AutoConfig.from_pretrained`` with a fallback to vLLM's config registry.
+
+    The DeepSeek-V4 family (``deepseek_v4``, ``deepseek_v4.1``) is not registered with
+    transformers: vllm-ascend registers those config classes in vLLM's own registry, so
+    load them the way vLLM does. Anything else keeps the default behavior.
+    """
+    try:
+        return AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code, **kwargs)
+    except ValueError as error:
+        lookup_error = error.__cause__ or error.__context__
+        if not isinstance(lookup_error, KeyError) or lookup_error.args not in (
+            ("deepseek_v4",),
+            ("deepseek_v4.1",),
+        ):
+            raise
+        try:
+            # noqa: F401 — importing applies the config-registry patch
+            import vllm_ascend.patch.platform.patch_deepseek_v41_config
+        except ImportError:
+            pass
+        from vllm.transformers_utils.config import get_config
+
+        return get_config(model_name, trust_remote_code=trust_remote_code, **kwargs)
+
+
 def get_huggingface_actor_config(model_name: str, override_config_kwargs=None, trust_remote_code=False) -> dict:
     if override_config_kwargs is None:
         override_config_kwargs = {}
     assert isinstance(override_config_kwargs, dict), (
         f"override_config_kwargs must be a dict, got {type(override_config_kwargs)}"
     )
-    module_config = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    module_config = get_auto_config_with_vllm_fallback(model_name, trust_remote_code=trust_remote_code)
     update_model_config(module_config, override_config_kwargs)
 
     return module_config

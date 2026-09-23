@@ -275,9 +275,23 @@ def get_npu_versions() -> tuple[AscendHardwareVersion, str, str]:
     if not os.path.exists(cann_path):
         raise RuntimeError(f"CANN toolkit path does not exist: {cann_path}")
 
-    info_file = os.path.join(cann_path, "ascend_toolkit_install.info")
-    if not os.path.exists(info_file):
-        raise RuntimeError(f"CANN toolkit info file does not exist: {info_file}")
+    # CANN 9.x merged layouts rename the install info files (the old
+    # `ascend_toolkit_install.info` disappears, `ascend_all_cann_install.info` /
+    # `ascend_ops_install.info` appear instead), so probe all known names.
+    info_file = None
+    for candidate in (
+        "ascend_toolkit_install.info",
+        "ascend_all_cann_install.info",
+        "ascend_ops_install.info",
+    ):
+        candidate_path = os.path.join(cann_path, candidate)
+        if os.path.exists(candidate_path):
+            info_file = candidate_path
+            break
+    if info_file is None:
+        raise RuntimeError(
+            f"CANN toolkit info file does not exist: {os.path.join(cann_path, 'ascend_toolkit_install.info')}"
+        )
 
     # Parse version from info file
     cann_version = None

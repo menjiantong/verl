@@ -974,6 +974,18 @@ class FSDPEngine(BaseEngine):
         gen, _ = self.get_per_tensor_param_shard()
         return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
 
+    def _export_param(self, name: str, param):
+        """Yield the tensors a weight sync streams for one parameter.
+
+        The default materializes the parameter as-is, all-gathering DTensor shards onto
+        the local device. Engines override this to stream a parameter in smaller pieces
+        (see the DeepSeek-V4.1 engine's expert weights).
+        """
+        if isinstance(param, DTensor):
+            yield name, param.to(get_device_id(), non_blocking=True).full_tensor()
+        else:
+            yield name, param
+
     def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
@@ -1025,13 +1037,8 @@ class FSDPEngine(BaseEngine):
         if peft_config is not None and base_sync_done:
             per_tensor_param = params.items()
         else:
-            device = get_device_id()  # used when fsdp2 set cpu_offload_policy
             per_tensor_param = (
-                (
-                    name,
-                    param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param,
-                )
-                for name, param in params.items()
+                entry for name, param in params.items() for entry in self._export_param(name, param)
             )
             per_tensor_param = unfuse_moe_params(per_tensor_param, self.model_config.hf_config.model_type)
 

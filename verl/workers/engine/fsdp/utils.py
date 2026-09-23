@@ -87,6 +87,66 @@ def get_sharding_strategy(device_mesh, zero3_enable=True):
     return sharding_strategy
 
 
+def split_fused_expert_tensor(name: str, tensor, first_expert_id: int = 0):
+    """Expand one packed expert tensor into vLLM's per-expert checkpoint keys.
+
+    ``name`` ends with the packed parameter name (``...experts.gate_up_proj`` or
+    ``...experts.down_proj``) and ``tensor`` carries ``[num_experts, ...]`` rows.
+    ``first_expert_id`` is the global id of ``tensor[0]``, so callers that stream the
+    packed parameter in blocks (see the DSV41 engine's expert export) keep the global
+    expert numbering that vLLM's loader maps onto its local experts.
+
+    Returns None when ``name`` is not a packed expert parameter, so callers can fall
+    back to streaming the tensor as-is.
+    """
+    if tensor.dim() != 3:
+        return None
+
+    if name.endswith(".mlp.experts.gate_up_proj"):
+        gate, up = tensor.chunk(2, dim=1)
+        base = name.removesuffix(".gate_up_proj")
+        return [
+            entry
+            for expert_id in range(tensor.size(0))
+            for entry in (
+                (f"{base}.{first_expert_id + expert_id}.gate_proj.weight", gate[expert_id].contiguous()),
+                (f"{base}.{first_expert_id + expert_id}.up_proj.weight", up[expert_id].contiguous()),
+            )
+        ]
+
+    if name.endswith(".mlp.experts.down_proj"):
+        base = name.removesuffix(".down_proj")
+        return [
+            (f"{base}.{first_expert_id + expert_id}.down_proj.weight", tensor[expert_id].contiguous())
+            for expert_id in range(tensor.size(0))
+        ]
+
+    # FSDP-Turbo's DeepSeek-V4.1 backbone packs the routed experts the same way under
+    # ``ffn.experts`` but names the halves the way the checkpoint does (w1/w3/w2): vLLM
+    # loads V4 checkpoints one expert at a time, so emitting those keys keeps the live
+    # sync on the same path as a from-disk load.
+    if name.endswith(".ffn.experts.gate_up_proj"):
+        gate, up = tensor.chunk(2, dim=1)
+        base = name.removesuffix(".gate_up_proj")
+        return [
+            entry
+            for expert_id in range(tensor.size(0))
+            for entry in (
+                (f"{base}.{first_expert_id + expert_id}.w1.weight", gate[expert_id].contiguous()),
+                (f"{base}.{first_expert_id + expert_id}.w3.weight", up[expert_id].contiguous()),
+            )
+        ]
+
+    if name.endswith(".ffn.experts.down_proj"):
+        base = name.removesuffix(".down_proj")
+        return [
+            (f"{base}.{first_expert_id + expert_id}.w2.weight", tensor[expert_id].contiguous())
+            for expert_id in range(tensor.size(0))
+        ]
+
+    return None
+
+
 def unfuse_moe_params(weights, model_type: str | None = None):
     """Expand Transformers 5 packed MoE expert tensors to vLLM checkpoint keys.
 
@@ -106,18 +166,9 @@ def unfuse_moe_params(weights, model_type: str | None = None):
             yield name, tensor
             continue
 
-        if name.endswith(".mlp.experts.gate_up_proj") and tensor.dim() == 3:
-            gate, up = tensor.chunk(2, dim=1)
-            base = name.removesuffix(".gate_up_proj")
-            for expert_id in range(tensor.size(0)):
-                yield f"{base}.{expert_id}.gate_proj.weight", gate[expert_id].contiguous()
-                yield f"{base}.{expert_id}.up_proj.weight", up[expert_id].contiguous()
-            continue
-
-        if name.endswith(".mlp.experts.down_proj") and tensor.dim() == 3:
-            base = name.removesuffix(".down_proj")
-            for expert_id in range(tensor.size(0)):
-                yield f"{base}.{expert_id}.down_proj.weight", tensor[expert_id].contiguous()
+        split = split_fused_expert_tensor(name, tensor)
+        if split is not None:
+            yield from split
             continue
 
         yield name, tensor
