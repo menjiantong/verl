@@ -54,6 +54,24 @@ def describe(ref: torch.Tensor, other: torch.Tensor) -> dict:
         "cos": cos,
     }
 
+def print_ckpt(checkpoint):
+    print("=" * 80)
+    try:
+        if isinstance(checkpoint, dict):
+            print(f"{'Key 名称':<60} {'Shape / 形状'}")
+            print("-" * 80)
+            for key, value in checkpoint.items():
+                # 确保值拥有 shape 属性（部分 key 可能是配置文本或数字）
+                shape = value.shape if hasattr(value, "shape") else type(value).__name__
+                print(f"{key:<60} {shape}")   
+        elif hasattr(checkpoint, "shape"):
+            print(f"该文件直接包含一个张量，无 Key。Shape: {checkpoint.shape}")
+        else:
+            print(f"未知的存储结构，文件根节点类型为: {type(checkpoint)}")
+    except Exception as e:
+        print(f"读取文件失败: {e}")
+    print("=" * 80)
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
@@ -67,6 +85,10 @@ def main():
     trainer = torch.load(Path(args.trainer_dir) / f"trainer_len{args.len}.pt", map_location="cpu")
     engine = torch.load(Path(args.engine_dir) / f"engine_stages_len{args.len}_rank{args.engine_rank}.pt",
                         map_location="cpu")
+
+    print_ckpt(trainer)
+    print_ckpt(engine)
+
     rank1 = None
     other_rank = Path(args.engine_dir) / f"engine_stages_len{args.len}_rank1.pt"
     if args.engine_rank != 1 and other_rank.exists():

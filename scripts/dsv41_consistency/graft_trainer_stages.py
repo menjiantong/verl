@@ -171,6 +171,9 @@ def main():
     from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
     from verl.workers.engine.fsdp.fsdp_turbo_dsv41_impl import (
+        checkpoint_buffer_meta,
+        move_buffers_to_device,
+        place_checkpoint_buffers_for_load,
         read_dsv41_checkpoint_state_dict,
         refresh_dsv41_expert_metadata,
     )
@@ -194,11 +197,12 @@ def main():
     initialize_deepseek_v41_model(model)
     model = prepare_deepseek_v41_model_for_fsdp(model, device=device, parameter_dtype=torch.bfloat16)
     param_meta = {name: (tuple(param.shape), param.dtype) for name, param in model.named_parameters()}
+    buffer_meta = checkpoint_buffer_meta(model)  # fp32 router correction bias (persistent buffers)
     model = FSDPTurbo(config, model).model
 
     started = time.time()
     if rank == 0:
-        full_state, ckpt_report = read_dsv41_checkpoint_state_dict(Path(args.model_path), param_meta)
+        full_state, ckpt_report = read_dsv41_checkpoint_state_dict(Path(args.model_path), param_meta, buffer_meta)
         # DCP's strict=True would fail much later with a generic "Missing key(s)"; name them here.
         assert not ckpt_report["missing"], (
             f"checkpoint {args.model_path} lacks {len(ckpt_report['missing'])} tensors the model needs, "
@@ -207,13 +211,12 @@ def main():
     else:
         full_state = {}
     options = StateDictOptions(full_state_dict=True, broadcast_from_rank0=True, cpu_offload=True)
+    place_checkpoint_buffers_for_load(model, buffer_meta, log)
     set_model_state_dict(model, full_state, options=options)
     del full_state
     log(f"model built + checkpoint loaded in {time.time() - started:.1f}s")
 
-    for buffer in model.buffers():
-        if buffer.device != device:
-            buffer.data = buffer.data.to(device)
+    move_buffers_to_device(model, device, log)
     fp32_mode = os.environ.get("VERL_DSV41_KEEP_FP32_PARAMS", "")
     if fp32_mode:
         dt.restore_fp32_parameters(model, args.model_path, log, device, only="" if fp32_mode == "1" else fp32_mode)

@@ -127,8 +127,10 @@ def main():
             stages = written
             print(f"[dump-engine] len={length}: stage dumps {written[:2]}", flush=True)
 
+        print(f" ---------------------------------- result.prompt_logprobs shape is {result.prompt_logprobs.shape} ----------------------------")
         scored, argmax = [], []
         for position, entry in enumerate(result.prompt_logprobs):
+            print(f" ---------------------------------- entry shape is {entry.shape} ----------------------------")
             if entry is None:  # position 0 has no context
                 continue
             scored_token = ids[position]

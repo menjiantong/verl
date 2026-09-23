@@ -2,14 +2,14 @@
 
 > 计划文档 · 2026-09-22 · 状态：**待执行**（尚未创建切片、未跑任何任务；所有"事实"均已核实到文件/行号）
 > 本目录（`/mnt/share/m00899630/plans/dsv41-real-weights-4layer/`）存放本工作流的计划与记录。
-> 相关文档：`verl/wiki/work_log/worklog_dsv41_module_input_probe.md`（机制闭环与 §5.3 方向 B）、
-> `verl/wiki/work_log/worklog_dsv41_train_infer_consistency.md`（§9–§11）、`verl/wiki/worklog_dsv41_rl.md`（健康信号阈值）。
+> 相关文档：`verl/wiki/worklog_dsv41_module_input_probe.md`（机制闭环与 §5.3 方向 B）、
+> `verl/wiki/worklog_dsv41_train_infer_consistency.md`（§9–§11）、`verl/wiki/worklog_dsv41_rl.md`（健康信号阈值）。
 > 产物位置约定：切片 `/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-4layer-real/`；
 > dump `/mnt/share/m00899630/dsv41/dump/{engine_real4,probe_input_real4}/`。
 
 ## Context（为什么做）
 
-- 上一轮已闭环机制（`verl/wiki/work_log/worklog_dsv41_module_input_probe.md`）：**训推差距 = 每模块 ~0.5% 核差（≈ bf16 的 1 ULP）× MoE 离散路由翻转放大**；专家数只加强放大器，不改变核差。
+- 上一轮已闭环机制（`verl/wiki/worklog_dsv41_module_input_probe.md`）：**训推差距 = 每模块 ~0.5% 核差（≈ bf16 的 1 ULP）× MoE 离散路由翻转放大**；专家数只加强放大器，不改变核差。
 - 但那是**随机权重**：路由处在近平局、`--head-gain 4` 把 logprob 噪声放大 4×（KL ~16×）→ 绝对值全偏悲观。方向 B 就是用真实权重复跑，拿生产数字决定 (a) 只换健康指标 还是 (b) 上 TIS/尾部纠正。
 - 真实权重 `/mnt/share/DeepSeek-V4.1-Flash-bf16/`（40 层 + 3 MTP、384 专家、1.53 TB、无量化配置）；harness 与 fixture 都是围绕 **4 层**模型建的 → 需要 **4 层切片目录**，两套加载路径都指向它。
 - **用户已定**：切**第 0–3 层**；跑**全套 harness**。

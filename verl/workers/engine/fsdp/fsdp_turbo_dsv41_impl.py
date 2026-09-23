@@ -103,14 +103,96 @@ def _checkpoint_weight_map(ckpt_dir: Path) -> dict[str, str]:
     return weight_map
 
 
+def checkpoint_buffer_meta(module) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    """Shapes/dtypes of the buffers that the checkpoint owns.
+
+    PyTorch's convention already separates checkpoint state from runtime scratch:
+    every attention cache and RoPE table in this model is ``persistent=False``, so
+    what is left is exactly the state the checkpoint must supply -- today the MoE
+    router correction bias, which `Gate` keeps as an fp32 buffer so that the
+    parameter-dtype normalization cannot round it (see the class docstring).
+
+    The loader needs these because DCP will not report a model key that goes
+    unassigned -- its ``strict`` only prunes the other direction (see
+    :func:`read_dsv41_checkpoint_state_dict` and the callers, which check the values
+    that landed). Routing with a zeroed correction bias would otherwise be silent.
+    """
+    parameters = {name for name, _ in module.named_parameters()}
+    return {
+        name: (tuple(buffer.shape), buffer.dtype)
+        for name, buffer in module.named_buffers()
+        if buffer is not None and name not in parameters and name in module.state_dict()
+    }
+
+
+def place_checkpoint_buffers_for_load(module, buffer_meta, log=None) -> list[str]:
+    """Align the checkpoint-owned buffers with the parameters' device before the DCP load.
+
+    ``set_model_state_dict(broadcast_from_rank0=True)`` collects the device of every dim>0
+    tensor of the model state and refuses to guess when it sees more than one ("Multiple
+    devices found"; meta is excluded -- that is how the deferred experts get assigned). The
+    parameters are placed by the offload policy, i.e. CPU-side under ``cpu_offload=True``
+    (the way this engine loads ~100 GB of experts), while
+    ``prepare_deepseek_v41_model_for_fsdp`` moves every buffer to the accelerator. The other
+    buffers are all ``persistent=False`` and therefore invisible to that scan; the
+    checkpoint buffers are not, so align them here. Returns the names moved.
+
+    The load itself replaces those tensors (``assign=True`` comes with the meta experts), so
+    they end up where the load put them; the caller's post-load loop is what moves the
+    buffers back to the compute device.
+    """
+    target = next((param.device for param in module.parameters() if not param.is_meta), None)
+    if target is None:
+        return []
+    moved = []
+    for name, buffer in module.named_buffers():
+        if buffer is not None and name in buffer_meta and buffer.device != target:
+            buffer.data = buffer.data.to(target)
+            moved.append(name)
+    if log is not None and moved:
+        log(f"aligned {len(moved)} checkpoint buffers to {target} for the load (e.g. {moved[:2]})")
+    return moved
+
+
+def move_buffers_to_device(module, device, log=None) -> list[str]:
+    """Put every buffer on the parameters' compute device (the load leaves them on the host).
+
+    ``load_state_dict(assign=True)`` -- which comes with the deferred experts -- *replaces* the
+    parameter and buffer tensors with the ones the broadcast produced, and with
+    ``cpu_offload=True`` those are host tensors. Replacing the registered buffer is the move
+    that always works: ``setattr`` on a buffer name updates ``_buffers[name]`` in place and
+    keeps its persistence, whereas ``buffer.data = <tensor on another device>`` relies on
+    ``set_data``'s type rules -- it rejects some targets outright ("Attempted to call
+    `variable.set_data(tensor)`, but `variable` and `tensor` have incompatible tensor type").
+    Returns the names replaced.
+    """
+    moved = []
+    for name, buffer in module.named_buffers():
+        if buffer is None or buffer.device == device:
+            continue
+        owner, _, local = name.rpartition(".")
+        target = module.get_submodule(owner) if owner else module
+        setattr(target, local, buffer.to(device))
+        moved.append(name)
+    if log is not None and moved:
+        log(f"moved {len(moved)} buffers to {device} (e.g. {moved[:2]})")
+    return moved
+
+
 def read_dsv41_checkpoint_state_dict(
-    ckpt_dir: Path, param_meta: dict[str, tuple[tuple[int, ...], torch.dtype]]
+    ckpt_dir: Path,
+    param_meta: dict[str, tuple[tuple[int, ...], torch.dtype]],
+    buffer_meta: dict[str, tuple[tuple[int, ...], torch.dtype]] | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, list[str]]]:
     """Build the full, unsharded CPU state dict for the training model.
 
     Only rank 0 calls this; the result feeds ``set_model_state_dict`` with
     ``broadcast_from_rank0=True``, which broadcasts one tensor at a time and writes
     each rank's shard, so rank 0 is the only rank that ever holds the full model.
+
+    ``buffer_meta`` carries the checkpoint-owned buffers (see
+    :func:`checkpoint_buffer_meta`); they are loaded like parameters but keep their
+    own dtype, so an fp32 checkpoint tensor is not rounded on the way in.
 
     Returns the state dict and a report of the checkpoint tensors that were skipped
     (vision tower / aligner / unused router biases) or expected but absent.
@@ -119,6 +201,8 @@ def read_dsv41_checkpoint_state_dict(
 
     weight_map = _checkpoint_weight_map(ckpt_dir)
     handles: dict[str, object] = {}
+    expected_meta = dict(param_meta)
+    expected_meta.update(buffer_meta or {})
 
     def fetch(name: str) -> torch.Tensor:
         shard_file = weight_map[name]
@@ -144,11 +228,11 @@ def read_dsv41_checkpoint_state_dict(
             expert_names.setdefault(layer_id, {}).setdefault(kind, {})[expert_id] = name
             continue
         model_name = _MODEL_PREFIX + name
-        if model_name not in param_meta:
+        if model_name not in expected_meta:
             # vision tower / aligner / image embeddings / vision router bias
             skipped.append(name)
             continue
-        shape, dtype = param_meta[model_name]
+        shape, dtype = expected_meta[model_name]
         state_dict[model_name] = cast(fetch(name), name, shape, dtype)
 
     for layer_id, kinds in sorted(expert_names.items()):
@@ -178,7 +262,7 @@ def read_dsv41_checkpoint_state_dict(
                         offset += tensor.shape[0]
             state_dict[model_name] = fused
 
-    missing = [name for name in param_meta if name not in state_dict]
+    missing = [name for name in expected_meta if name not in state_dict]
     return state_dict, {"skipped": skipped, "missing": missing}
 
 
@@ -345,6 +429,7 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
         # Metadata of the unsharded model, captured before FSDP-Turbo rewrites
         # parameters into (nested) DTensors: the loader needs global shapes/dtypes.
         param_meta = {name: (tuple(param.shape), param.dtype) for name, param in module.named_parameters()}
+        buffer_meta = checkpoint_buffer_meta(module)
         module = FSDPTurbo(self.fsdp_turbo_config, module).model
 
         offload_policy = None
@@ -354,23 +439,28 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
             offload_policy = True
             self._uses_fsdp2_cpu_offload_policy = True
 
-        self._materialize_dsv41_parameters(module, param_meta, offload_policy)
+        self._materialize_dsv41_parameters(module, param_meta, buffer_meta, offload_policy)
         return module
 
-    def _materialize_dsv41_parameters(self, module, param_meta, offload_policy):
+    def _materialize_dsv41_parameters(self, module, param_meta, buffer_meta, offload_policy):
         """Load the rollout checkpoint into the sharded model (rank 0 reads, everyone
         receives) and finish the device placement the meta construction skipped."""
         from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
         checkpoint_dir = Path(self._dsv41_model_path())
-        _log_rank0("materializing %d parameters from %s (experts deferred to meta)", len(param_meta), checkpoint_dir)
+        _log_rank0(
+            "materializing %d parameters + %d checkpoint buffers from %s (experts deferred to meta)",
+            len(param_meta),
+            len(buffer_meta),
+            checkpoint_dir,
+        )
         started = time.time()
         if os.environ.get("VERL_DSV41_RANDOM_INIT", "0") == "1":
             _log_rank0("VERL_DSV41_RANDOM_INIT=1: skipping checkpoint weights, deferring experts at N(0, 0.02)")
             full_state = _random_state_dict(param_meta) if dist.get_rank() == 0 else {}
         elif dist.get_rank() == 0:
             # Only rank 0 reads the checkpoint; the broadcast below feeds every other rank.
-            full_state, report = read_dsv41_checkpoint_state_dict(checkpoint_dir, param_meta)
+            full_state, report = read_dsv41_checkpoint_state_dict(checkpoint_dir, param_meta, buffer_meta)
             if report["missing"]:
                 raise ValueError(
                     f"Checkpoint {checkpoint_dir} is missing {len(report['missing'])} tensors the training model "
@@ -389,7 +479,28 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
             broadcast_from_rank0=True,
             cpu_offload=bool(offload_policy),
         )
+        place_checkpoint_buffers_for_load(module, buffer_meta, log=_log_rank0)
+        # DCP's strict load only prunes keys the model cannot take and never reports a model key
+        # left unassigned (see _broadcast_state_dict); and it overwrites the dict handed to it,
+        # so keep the expected values aside. Routing with a zeroed correction bias would be
+        # silent and wrong -- check that the checkpoint buffers landed.
+        expected_buffers = (
+            {name: full_state[name].clone() for name in buffer_meta if name in full_state} if dist.get_rank() == 0 else {}
+        )
         set_model_state_dict(module, full_state, options=options)
+        if dist.get_rank() == 0:
+            current = dict(module.named_buffers())
+            unloaded = [
+                name
+                for name, expected in expected_buffers.items()
+                if name not in current or not torch.equal(expected, current[name])
+            ]
+            if unloaded:
+                raise RuntimeError(
+                    f"checkpoint buffers were not loaded into the model: {unloaded[:3]}. "
+                    "See place_checkpoint_buffers_for_load / checkpoint_buffer_meta."
+                )
+            _log_rank0("checkpoint buffers loaded: %d (bit-exact against the checkpoint)", len(expected_buffers))
         del full_state
         _log_rank0("parameters materialized in %.1fs", time.time() - started)
 
@@ -397,9 +508,7 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
         # the host: attention tables and scratch caches must follow the parameters'
         # compute device, the way fsdp2_load_full_state_dict does for HF models.
         device = torch.accelerator.current_accelerator()
-        for buffer in module.buffers():
-            if buffer.device != device:
-                buffer.data = buffer.data.to(device)
+        move_buffers_to_device(module, device, log=_log_rank0)
 
         refresh_dsv41_expert_metadata(module, device)
 

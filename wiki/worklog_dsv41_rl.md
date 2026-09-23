@@ -278,7 +278,7 @@ python3 make_random_ckpt_dsv41_4layers.py --config config.dsv41_4layer.bf16.json
 | `training_log_ppl` vs `rollout_log_ppl` | 接近 | 差距大 |
 | `actor/grad_norm` | 有限 | nan |
 
-> ⚠️ **阈值要按"权重/专家数"重标定（2026-09-22 修正）**：上表的"~0 / >0.99"是在 G12 那批权重上得出的，**不能当通用阈值**。后续一致性专项（见 [work_log/worklog_dsv41_module_input_probe.md](work_log/worklog_dsv41_module_input_probe.md)）证明：这两个指标主要是**两套栈的固有内核数值差（每模块 ~0.5% ≈ bf16 的 1 ULP）**经 MoE 路由离散翻转逐层放大的结果，**随专家数与 head-gain 显著变化**——32 专家 scaled32 是 `0.010/0.979`，384 专家 `scaled` 是 `kl 0.38 / pearson 0.79`，二者都是"同步正确"的正常表现；真实（fp8、head 正常尺度）权重预计回到 kl ≈ 0.01 量级。
+> ⚠️ **阈值要按"权重/专家数"重标定（2026-09-22 修正）**：上表的"~0 / >0.99"是在 G12 那批权重上得出的，**不能当通用阈值**。后续一致性专项（见 [worklog_dsv41_module_input_probe.md](worklog_dsv41_module_input_probe.md)）证明：这两个指标主要是**两套栈的固有内核数值差（每模块 ~0.5% ≈ bf16 的 1 ULP）**经 MoE 路由离散翻转逐层放大的结果，**随专家数与 head-gain 显著变化**——32 专家 scaled32 是 `0.010/0.979`，384 专家 `scaled` 是 `kl 0.38 / pearson 0.79`，二者都是"同步正确"的正常表现；真实（fp8、head 正常尺度）权重预计回到 kl ≈ 0.01 量级。
 > **判据改为看量级断层**：真错位（专家错绑/布局没回退）会是 **O(1) 的 logprob 落差 / pearson ~0.5**，与"专家数放大"有数量级差异；同时用**直接量**做健康检查——权重指纹（`check_engine_params.py`）、模块 rel_err / Δlogp σ（`probe_module_inputs.py` + `summarize_probe.py`）。
 > 另：默认配置下 `old_log_probs` 由训练侧重算（`trainer_base.py::_compute_old_log_prob`；本脚本未设 `algorithm.rollout_correction`），**这个差进入的是 off-policy 程度与监控指标，不进入 PG ratio**。
 
@@ -343,7 +343,7 @@ python3 make_random_ckpt_dsv41_4layers.py --config config.dsv41_4layer.bf16.json
 > 注意开关有两个写法，二者等价：脚本层的 `LOCAL_EXPERT_EXPORT=1` 或引擎层的 `VERL_DSV41_LOCAL_EXPERT_EXPORT=1`（脚本已做 fallback；脚本层变量优先，只设其一即可）。
 
 
-## 4.5 训推一致性专项（2026-09-20，详见 [work_log/worklog_dsv41_train_infer_consistency.md](work_log/worklog_dsv41_train_infer_consistency.md)）
+## 4.5 训推一致性专项（2026-09-20，详见 [worklog_dsv41_train_infer_consistency.md](worklog_dsv41_train_infer_consistency.md)）
 
 对「`rollout_actor_probs_pearson_corr` 只有 0.95–0.98、`kl 0.10–0.19`」做了逐阶段数值分桶（新夹具 + 双侧 dump + 引擎 worker extension），结论：
 
@@ -357,8 +357,8 @@ python3 make_random_ckpt_dsv41_4layers.py --config config.dsv41_4layer.bf16.json
 ## 4.6 真实权重复跑（2026-09-22）：训推差距的主因是一个**可修的 dtype 不对称**
 
 用真实 DeepSeek-V4.1-Flash 切出 4 层（384 专家）重跑 §4.5 的整套 harness
-（**完整工作记录：[work_log/worklog_dsv41_real_weights_4layer.md](work_log/worklog_dsv41_real_weights_4layer.md)**；
-另见 [work_log/worklog_dsv41_module_input_probe.md](work_log/worklog_dsv41_module_input_probe.md) §8），三条结论会影响这里的判读标准：
+（**完整工作记录：[worklog_dsv41_real_weights_4layer.md](worklog_dsv41_real_weights_4layer.md)**；
+另见 [worklog_dsv41_module_input_probe.md](worklog_dsv41_module_input_probe.md) §8），三条结论会影响这里的判读标准：
 
 1. **随机权重把因果搞反了**：随机权重下"把模块输入钉成引擎的值"能让 σ 降 22–35×（噪声几乎全部来自输入差被 MoE 放大）；
    真实权重下只降 1.2–1.4×。真实权重的主因是：**checkpoint 里 fp32 的 MoE 路由器纠偏 bias
@@ -370,6 +370,10 @@ python3 make_random_ckpt_dsv41_4layers.py --config config.dsv41_4layer.bf16.json
    MoE 地板 0.0115–0.0449 → **0.0034–0.0042**；argmax 一致率 0.82 → **0.97**。只还原 `hc_*`/`attn_sink` 则**毫无变化**。
 3. **§4.5 的健康指标判读再修正一次**：真实权重下这个不对称是**可修项**（训练侧保 fp32 / 引擎侧对齐 bf16，见 plan §7.4），
    修完再看是否需要 TIS；`rollout_corr/kl` 等指标在修之前**不能当作"同步是否健康"**的依据（它们现在混进了 10× 的参数级离散种子）。
+
+> ✅ **2026-09-22 补充：修复已落地**（`Gate.bias` → fp32 buffer），真实切片回归数字与上表的"只还原 `gate.bias`"**逐项相同**，
+> 且不需要任何 env 开关；8 卡 GRPO 冒烟（含权重同步）也已跑通。
+> 完整记录：[worklog_dsv41_gate_bias_fp32_fix.md](worklog_dsv41_gate_bias_fp32_fix.md)。
 
 ## 5. 剩余风险与待办
 

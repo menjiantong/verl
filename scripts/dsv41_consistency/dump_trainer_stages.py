@@ -247,25 +247,32 @@ def to_cpu_fp32(value, max_elements):
     return None
 
 
+def buffer_fingerprint(buffer) -> str:
+    """sha1 of the raw bytes: the fp32 router bias is checked *bit-exactly*, not approximately."""
+    import hashlib
+
+    return hashlib.sha1(buffer.detach().float().cpu().contiguous().numpy().tobytes()).hexdigest()[:16]
+
+
 def restore_fp32_parameters(model, model_path, log, device, only: str = ""):
     """Compute with the checkpoint's fp32 parameter values where the trainer holds bf16 (H2).
 
+    **Superseded for the router bias** (`=gate`, and therefore the `=1` "everything" mode):
+    `Gate.bias` is an fp32 *buffer* now (see `fsdp_turbo.../model.py`), so the trainer holds the
+    checkpoint value by construction and this override finds nothing to swap for it -- a `=gate`
+    run should therefore come out identical to a plain run. It is kept for the remaining case:
+    the fp32 *parameters* that are still normalized to bf16 (`attn_sink`, the six `hc_*` per
+    layer), which the real-weight A/B measured as contributing nothing (`=continuous`), and as
+    the effect preview that motivated the fix.
+
     `prepare_deepseek_v41_model_for_fsdp` normalizes *every* floating parameter to bf16, so the
     architecture's own fp32 declarations get rounded on load while the engine keeps the
-    checkpoint's fp32 values. In the real 4-layer slice that is 32 parameter tensors the trainer
-    actually has: the router's correction bias (`Gate.bias`, declared fp32 in `model.py:936`),
-    `attn_sink` and the six `hc_*` per layer. The router bias is the one that matters most -- it
-    steers expert *selection* only, so its rounding is a purely discrete perturbation that no
-    input graft can remove (offline, on the engine's own MoE inputs: rounding it to bf16 changes
-    the trainer's top-6 set on 20-62% of tokens -- and the trainer's *recorded* routing is
-    reproduced 100% with the rounded value, 21-62% with the true fp32 one -- while the engine's
-    own router capture reproduces with fp32).
-
-    The parameter itself must stay bf16: FSDP2 asserts one original dtype per parameter group
-    (`_fsdp_param_group.py::_init_mp_dtypes`, hit when this used to reassign `parameter.data`).
-    So the fp32 value is swapped in around the owning module's forward instead -- same tensors
-    the engine holds, and FSDP never sees a second dtype. Env-gated by the caller
-    (`VERL_DSV41_KEEP_FP32_PARAMS=1`). Returns the names overridden.
+    checkpoint's fp32 values. The parameter itself must stay bf16: FSDP2 asserts one original
+    dtype per parameter group (`_fsdp_param_group.py::_init_mp_dtypes`, hit when this used to
+    reassign `parameter.data`). So the fp32 value is swapped in around the owning module's
+    forward instead -- same tensors the engine holds, and FSDP never sees a second dtype.
+    Env-gated by the caller (`VERL_DSV41_KEEP_FP32_PARAMS=1|gate|continuous`).
+    Returns the names overridden.
     """
     import torch
     from safetensors import safe_open
@@ -425,6 +432,9 @@ def main():
     from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
     from verl.workers.engine.fsdp.fsdp_turbo_dsv41_impl import (
+        checkpoint_buffer_meta,
+        move_buffers_to_device,
+        place_checkpoint_buffers_for_load,
         read_dsv41_checkpoint_state_dict,
         refresh_dsv41_expert_metadata,
     )
@@ -450,14 +460,31 @@ def main():
     initialize_deepseek_v41_model(model)
     model = prepare_deepseek_v41_model_for_fsdp(model, device=device, parameter_dtype=torch.bfloat16)
     param_meta = {name: (tuple(param.shape), param.dtype) for name, param in model.named_parameters()}
-    log(f"model built in {time.time() - started:.1f}s ({len(param_meta)} parameters)")
+    buffer_meta = checkpoint_buffer_meta(model)
+    log(f"model built in {time.time() - started:.1f}s ({len(param_meta)} parameters, "
+        f"{len(buffer_meta)} checkpoint buffers: {sorted(buffer_meta)[:2]} ...)")
 
     model = FSDPTurbo(config, model).model
 
     log("materializing parameters from checkpoint")
     started = time.time()
+    place_checkpoint_buffers_for_load(model, buffer_meta, log)
+    # DCP's broadcast load scans every dim>0 tensor of the model state and requires one device
+    # ("Multiple devices found" otherwise). Log that inventory: with cpu_offload the parameters
+    # are CPU-side and the checkpoint buffers must land on the same side.
+    from torch.distributed.checkpoint.state_dict import _iterate_valid_model_state
+
+    inventory: dict[str, list[str]] = {}
+    for key, value in _iterate_valid_model_state(model):
+        if torch.is_tensor(value) and value.dim() > 0:
+            inventory.setdefault(str(value.device), []).append(key)
+    log("DCP device scan: " + ", ".join(f"{where}: {len(keys)} e.g. {keys[:2]}" for where, keys in inventory.items()))
+    for where, keys in inventory.items():
+        on_device = [key for key in keys if key in buffer_meta]
+        if on_device:
+            log(f"  checkpoint buffers on {where}: {on_device}")
     if rank == 0:
-        full_state, ckpt_report = read_dsv41_checkpoint_state_dict(Path(args.model_path), param_meta)
+        full_state, ckpt_report = read_dsv41_checkpoint_state_dict(Path(args.model_path), param_meta, buffer_meta)
         # Otherwise DCP's strict=True raises a generic "Missing key(s)" much later (see H6 in
         # plans/dsv41-real-weights-4layer/plan.md); fail here with the actual names instead.
         assert not ckpt_report["missing"], (
@@ -466,20 +493,40 @@ def main():
         )
     else:
         full_state = {}
+    # DCP's strict load only prunes state-dict keys it does not find in the model; a model key
+    # that never got a value keeps its initialization and is *not* reported (see
+    # _broadcast_state_dict). Keep the checkpoint values aside (it also overwrites the dict it
+    # was handed) and compare afterwards, so a silently dropped router bias cannot pass as
+    # "loaded".
+    expected_buffers = (
+        {name: full_state[name].clone() for name in buffer_meta if name in full_state} if rank == 0 else {}
+    )
     options = StateDictOptions(full_state_dict=True, broadcast_from_rank0=True, cpu_offload=True)
     set_model_state_dict(model, full_state, options=options)
+    if rank == 0:
+        current = dict(model.named_buffers())
+        for name, expected in sorted(expected_buffers.items()):
+            actual = current.get(name)
+            equal = actual is not None and torch.equal(expected, actual)
+            log(f"load check {name}: checkpoint->model {'bit-exact' if equal else 'MISMATCH'}"
+                + ("" if equal else f" (model holds {actual.detach().float().flatten()[:3].tolist()})"))
     del full_state
     log(f"parameters materialized in {time.time() - started:.1f}s")
 
-    for buffer in model.buffers():
-        if buffer.device != device:
-            buffer.data = buffer.data.to(device)
+    move_buffers_to_device(model, device, log)
     fp32_mode = os.environ.get("VERL_DSV41_KEEP_FP32_PARAMS", "")
     if fp32_mode:
         restore_fp32_parameters(model, args.model_path, log, device, only="" if fp32_mode == "1" else fp32_mode)
     refresh_dsv41_expert_metadata(model, device)
     still_meta = [name for name, parameter in model.named_parameters() if parameter.is_meta]
     assert not still_meta, f"parameters left on meta: {still_meta[:5]}"
+    # Read the buffers back from the model (the load *replaces* those tensors, so anything
+    # captured before it is a stale tensor): this is the value the forward will actually use,
+    # and the dump carries it for a bit-exact check against the checkpoint.
+    checkpoint_buffers = {name: buffer for name, buffer in model.named_buffers() if name in buffer_meta}
+    for name, buffer in sorted(checkpoint_buffers.items()):
+        log(f"checkpoint buffer {name}: dtype={buffer.dtype} shape={tuple(buffer.shape)} "
+            f"sha1={buffer_fingerprint(buffer)} first={[round(x, 7) for x in buffer.detach().float().flatten()[:4].tolist()]}")
 
     with open(args.fixture) as f:
         fixture = json.load(f)
@@ -509,7 +556,11 @@ def main():
             for handle in handles:
                 handle.remove()
         logits = output.logits.float()
+        print(f" ---------------------------- debug input_ids shape is {input_ids.shape} --------------------------------  ")
+        print(f" ---------------------------- debug logics shape is {logits.shape} --------------------------------  ")
         logprobs = torch.log_softmax(logits, dim=-1)
+        print(f" ---------------------------- debug logprobs shape is {logprobs.shape} --------------------------------  ")
+
         seq = input_ids.shape[1]
         # (a) canonical next-token convention: logprob of token t comes from logits[t-1].
         #     Position 0 has no context, so it is dropped -- this is what the engine reports.
@@ -529,6 +580,9 @@ def main():
                 "topk_logprobs": logprobs[0].gather(-1, topk.indices).cpu(),
                 "logits_absmax": float(logits.abs().max().item()),
                 "stages": stage_sink,
+                "checkpoint_buffers": {
+                    name: buffer.detach().float().cpu() for name, buffer in checkpoint_buffers.items()
+                },
             }
             if length <= 64:
                 payload["logits"] = logits[0].to(torch.float16).cpu()
