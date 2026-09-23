@@ -345,9 +345,11 @@ def install_attention_op_hooks(torch, stage_sink, max_elements):
     """
     import fsdp_turbo.models.deepseek_v41.model as model_module
 
-    original = model_module.indexed_sparse_attention
-    if getattr(original, "_dump_wrapped", False):
-        return original
+    # Re-install per stage_sink: the wrapper closes over *this* sink, so a second call must
+    # rebind, not early-return (the old `_dump_wrapped` guard left every later sample's
+    # attn_op tensors in the first sample's dict -- fix regression log shows it as
+    # `stages=57 (len=64) / stages=37 (len=200)`).
+    original = getattr(model_module.indexed_sparse_attention, "_dump_original", model_module.indexed_sparse_attention)
 
     def wrapper(query, key_value, attention_sink, topk_indices, softmax_scale, attention_mask=None, **kwargs):
         output = original(
@@ -367,7 +369,7 @@ def install_attention_op_hooks(torch, stage_sink, max_elements):
                 stage_sink[f"attn_op{index}.{key}"] = tensor
         return output
 
-    wrapper._dump_wrapped = True
+    wrapper._dump_original = original
     model_module.indexed_sparse_attention = wrapper
     return original
 

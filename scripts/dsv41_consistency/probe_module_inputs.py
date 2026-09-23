@@ -362,6 +362,11 @@ def main():
                 if engine_key is not None:
                     handles.append(module.register_forward_pre_hook(replace_in))
             handles += dt.install_hooks(model, torch, args.max_elements, stage_sink)
+            # Record the inputs/output of `indexed_sparse_attention` per layer (the trainer-side
+            # attention has no submodule to hook; same wrapper as the trainer smoke, which rebinds
+            # to *this* variant's stage_sink on every call). This is what lets the ~0.005 attn
+            # floor be decomposed offline into qkv / compressed-kv / core / sink contributions.
+            dt.install_attention_op_hooks(torch, stage_sink, args.max_elements)
 
             started = time.time()
             try:

@@ -1,0 +1,923 @@
+ ▐▛███▛█   Claude Code v2.1.271
+▝▜██████▀  deepseek-v4-flash · API Usage Billing
+  ▝▝ ▝▝    /workspace-verl/verl
+
+
+❯ /clear                                                                        
+
+❯ 0923上午的工作记录，@"2026-09-23-041325-local-command-caveatcaveat-the-messag 
+  es-below v1.txt" ，继续工作，把这里的btw也输出到工作记录中。                  
+
+  Thought for 3s, searched for 1 pattern, listed 1 directory (ctrl+o to expand)
+
+● Stop Task
+  ⎿  find / -name "*2026-09-23-041325*" -not -path "*/proc/*" 2>/dev/null |
+     head -20 · stopped
+
+  Thought for 54s, searched for 2 patterns, read 1 file, listed 1 directory, ran 1 shell command, recalled 2 memories (ctrl+o to expand)
+
+● Found the state. The transcript ends right at an unanswered user question (the
+  "btw") — the session died with an API error. Let me read the worklog and
+  recover the code state.
+
+  Thought for 16s, read 1 file, ran 1 shell command (ctrl+o to expand)
+  ⎿  Loaded CLAUDE.md
+
+● State recovered. The transcript ends exactly at an unanswered follow-up
+  question (the "btw") right before the API error killed the session:
+
+  ▎ 权重同步（训练 → 引擎）：修复前训练侧导出的确实是 bf16 张量，引擎 
+  ▎ load_weights 把它写进 fp32 参数时类型变成 fp32、值已经是 bf16 舍入过的 —— 
+  ▎ 也就是说同步这条路会把引擎那份"降级"，此后两边在这个张量上就一致了（都是 
+  ▎ bf16 值）。进行过一次权重同步后，是不是误差会减小？
+
+  So: continue = answer that question with evidence, and write it into the
+  worklog. Let me first check NPU occupancy and the actual sync path.
+
+  Thought for 38s, searched for 5 patterns, listed 1 directory, ran 3 shell commands (ctrl+o to expand)
+
+● Let me verify the sync path end-to-end in code, and check who's holding the
+  NPUs.
+
+  Thought for 35s, searched for 2 patterns, listed 1 directory, ran 6 shell commands (ctrl+o to expand)
+
+● The training loop syncs at the end of each step — that's decisive for the
+  answer. Now let me verify the two ends of the pipe: the export (_export_param)
+  and the engine-side copy semantics.
+
+  Thought for 58s, searched for 6 patterns, listed 1 directory, ran 6 shell commands (ctrl+o to expand)
+
+● Let me check whether there's an initial weight sync before the first rollout —
+  that changes the answer materially.
+
+  Thought for 11s, ran 1 shell command (ctrl+o to expand)
+
+● Major finding: ray_trainer.py:1429-1430 does _load_checkpoint() then
+  update_weights() before anything else — i.e. an initial sync precedes the very
+  first rollout. Let me confirm this against the smoke run's actual log.
+
+  Thought for 31s, read 1 file, listed 1 directory, ran 4 shell commands (ctrl+o to expand)
+
+● Let me check one thing that could bite the 40-layer run: hash-router layers
+  have e_score_correction_bias = None on the engine side.
+
+  Thought for 38s, searched for 3 patterns, ran 6 shell commands (ctrl+o to expand)
+
+● Verification complete. Now let me check cross-references before writing the
+  new section.
+
+  Thought for 12s, searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Let me try to empirically confirm the initial (pre-rollout) sync in the smoke
+  log.
+
+  Thought for 24s, ran 3 shell commands (ctrl+o to expand)
+
+● Now I'll write the answer into the worklog. Starting with the new section:
+
+● Update(wiki/worklog_dsv41_gate_bias_fp32_fix.md)
+  ⎿  Added 3 lines
+       5  > `/mnt/share/m00899630/plans/dsv41-real-weights-4layer/`，本篇
+          只写"怎么改的、踩了什么、验成什么样"。
+       6  >
+       7  > 状态：**已完成**（代码 + CPU 侧逐位校验 + 真实切片 smoke/prob
+          e 回归 + 离线 identification + 8 卡 GRPO 冒烟，全部通过）
+       8 +>                                                              
+       9 +> 2026-09-23 追加 **§7**：回答上一轮会话末尾被打断的 btw —— "同
+         +步会把引擎那份降级成 bf16，那同步过一次之后                    
+      10 +> 误差是不是就小了"。含逐环节代码核实、生产时序结论，以及它对 §
+         +5 那组数字**作用域**的修正。                                   
+      11  
+      12  ---
+      13  
+
+● Update(wiki/worklog_dsv41_gate_bias_fp32_fix.md)
+  ⎿  Added 4 lines
+      27  `model.norm` **0.0735 → 0.0062**、argmax **0.819 → 0.970**；离
+          线 identification 从"bf16 100%"
+      28  翻成"**fp32 100%**"。数字与修复前 `=gate` 效果预演**逐项相同**
+          。详见 §5。
+      29  
+      30 +> ⚠️ **读这组数字时注意它的作用域**（2026-09-23 补，§7）：它测 
+         +的是 harness 状态——**引擎直接从 ckpt 起、                      
+      31 +> 从不做权重同步**。生产 GRPO 在首次 rollout **之前**就先同步一
+         +次权重（`ray_trainer.py:1429-1430`），                         
+      32 +> 所以修复前生产侧两侧其实早已"一致在 bf16 值"上；修复的真正增 
+         +量是"一致的值回到 ckpt 精度"+"不依赖同步"。                    
+      33 +                                                               
+      34  ---
+      35  
+      36  ## 1. 为什么要改、为什么是这个参数
+
+  Thought for 1s (ctrl+o to expand)
+
+● Update(wiki/worklog_dsv41_gate_bias_fp32_fix.md)
+  ⎿  Added 63 lines, removed 1 line
+      376  
+      377  ---
+      378  
+      379 -## 7. 复现命令                                                
+      379 +## 7. btw：同步把引擎那份"降级"之后，误差是不是就小了？（2026-
+          +09-23 回答）                                                  
+      380  
+      381 +> **提问原文**（2026-09-23 04:12，上一轮会话在这里被 API 错误 
+          +打断，没来得及回答）：                                        
+      382 +>                                                             
+      383 +> 权重同步（训练 → 引擎）：修复前训练侧导出的确实是 bf16 张量 
+          +，引擎 `load_weights` 把它写进 fp32 参数时                    
+      384 +> 类型变成 fp32、值已经是 bf16 舍入过的 —— 也就是说同步这条路 
+          +会把引擎那份"降级"，此后两边在这个张量上                      
+      385 +> 就一致了（都是 bf16 值）。进行过一次权重同步后，是不是误差会
+          +减小                                                          
+      386 +                                                              
+      387 +### 7.1 结论                                                  
+      388 +                                                              
+      389 +1. **是**。一次同步之后两侧手里的 `gate.bias` 就是**同一个值**
+          +（引擎侧 fp32 张量里装着训练侧 export 的那个                  
+      390 +   bf16 值）→ 由参数级 dtype 不对称产生的**离散翻转源直接归零*
+          +*。机制上这与本次修复是同一条路的两个版本：                   
+      391 +   **同步 = 把引擎降到训练侧精度**（两侧一致，但都不是 ckpt 的
+          +值）；**修复 = 把训练侧升到 ckpt 精度**                       
+      392 +   （两侧一致，且都是 ckpt 的值）。                           
+      393 +2. **在生产 GRPO 里，这件事"修复之前"就已经发生**：`fit()` 在 
+          +`_load_checkpoint()` 之后、**任何生成之前**                   
+      394 +   先同步一次权重（`verl/trainer/ppo/ray_trainer.py:1428-1430`
+          +，注释原文 *"load checkpoint and update weights               
+      395 +   before doing anything"*），此后每步末尾再同步一次（`:1716` 
+          +）。所以 **§5.2 那组"不对称"数字（baseline                    
+      396 +   0.2573 / 钉死 0.1882）描述的是 harness 状态**（引擎从 ckpt 
+          +起、从不做同步），**不是生产状态**：修复前的                  
+      397 +   生产运行从第一次 rollout 起，引擎拿的就是训练侧那份 bf16 舍
+          +入过的 bias。冒烟日志的时序也吻合——引擎                       
+      398 +   14:42:26 起来、第一次生成请求 14:44:18，中间 ~112 s 的窗口 
+          +里就包含这次开局同步（步内同步实测 89.7 s）。                 
+      399 +   本 recipe 走 `backend: naive`（冒烟日志里的 resolved config
+          +），实现是同一条路：                                          
+      400 +   `actor_wg.update_weights()` → `engine.get_per_tensor_param(
+          +)`（`verl/workers/engine_workers.py:786`）。                  
+      401 +3. 所以修复的收益要重新分配一下。**"两栈一致性"那一半，生产里 
+          +同步已经给了**；修复真正多出来的是：                          
+      402 +   ① 两侧一致的值是 **checkpoint 的 fp32 值**——离散路由不再偏 
+          +离模型意图，且**训练侧自己的 forward/backward                 
+      403 +   从第一个 token 起**就是 ckpt 意图的路由（这一条与同步无关，
+          +同步只能改引擎那份）；                                        
+      404 +   ② **不依赖同步**：harness / 离线评估 / 任何"引擎刚从 ckpt  
+          +起、同步还没跑"的时刻都是对齐的，§5 的判据                    
+      405 +   才是关于**模型本身**而不是"同步有没有跑过"的判据；         
+      406 +   ③ 不必接受一次**静默降级**——同步覆盖引擎侧 ckpt fp32 值这件
+          +事没有任何日志。                                              
+      407 +                                                              
+      408 +### 7.2 "同步真的会把这个张量送过去、并按 bf16 落进 fp32 参数 
+          +吗"——逐环节核实                                               
+      409 +                                                              
+      410 +| 环节 | 代码位置 | 结论 |                                    
+      411 +|---|---|---|                                                 
+      412 +| 导出 | `verl/workers/engine/fsdp/transformer_impl.py:1028` `
+          +params = self.module.state_dict()` | `state_dict()` 含 **persi
+          +stent buffer** → 修复前（Parameter）与修复后（buffer）**都在里
+          +面** |                                                        
+      413 +| 导出（dtype） | 同文件 `_export_param`（`:977-987`）；dsv41 
+          +覆写只对专家张量分片（`fsdp_turbo_dsv41_impl.py:305-363`） |  
+          +张量**原样**导出、不做 dtype 归一化：修复前 bf16、修复后 fp32 
+          +|                                                             
+      414 +| 传输 | `checkpoint_engine/base.py:570-585`（`TensorMeta(dtyp
+          +e=weight.dtype)` + `view(uint8)`）、`:600-620`（`chunk.view(dt
+          +ype)` 还原） | 按**每个张量自己的 dtype** 过线，字节不变（naiv
+          +e 路径同进程，同理不转 dtype） |                              
+      415 +| 落盘（名字） | `vllm_ascend/models/deepseek_v4/model.py:1183
+          +` `.gate.bias` → `.gate.e_score_correction_bias` | 名字命中；*
+          +*这行在"skip extra bias"守卫之前**，不会被 `.bias` 结尾的跳过 
+          +逻辑吃掉；映射不上是 **KeyError（响亮失败）**，不是静默丢弃 | 
+      416 +| 落盘（值） | `vllm/model_executor/model_loader/weight_utils.
+          +py:1231-1245` `default_weight_loader` = `param.data.copy_(load
+          +ed_weight)` | bf16 → fp32 参数：**dtype 是 fp32、值就是 bf16  
+          +值**（bf16→fp32 加宽无损）→ 提问里的**前提成立**；fp32 → fp32 
+          +：逐位 |                                                      
+      417 +                                                              
+      418 +同一条机制的"另一半"：引擎侧所有 *ckpt fp32 / 训练 bf16* 的参 
+          +数都会被这次同步**一起降级**——`attn_sink`                     
+      419 +（`model.py:501`）与 `hc_*`（`:726-731`、`:867-870`）在引擎侧 
+          +同样是 `dtype=torch.float32` 的 Parameter，                   
+      420 +进入同步时被训练侧的 bf16 值覆盖。§6.1.2 那 28 个"没动"的参数 
+          +（阴性对照贡献 ≈0）走的就是这条路。                           
+      421 +                                                              
+      422 +时序备注：naive 同步的顺序是 **resume weights → push → （下一 
+          +步）gen**（`engine_workers.py:768-804`），                    
+      423 +所以每次生成时引擎一定拿的是最近一次同步的值——与 vLLM sleep 是
+          + offload 还是 discard 无关。                                  
+      424 +                                                              
+      425 +### 7.3 数值上的预期，以及为什么这一条没有另花 NPU 时间       
+      426 +                                                              
+      427 +- **离散源归零有直接证据**：§5.3 的 identification——两侧值一致
+          +时 top-6 命中率就是 100%，值不同时只有                        
+      428 +  21.9–64.1%（即翻转率）。"同步后两侧同值" ⇒ 该翻转率归零 ⇒ σ 
+          +预期回到与修复后**同量级**                                    
+      429 +  （baseline ≈0.0967、钉死 ≈0.0202、MoE 地板 ≈0.0034–0.0042） 
+          +：两者都只剩"输入差 × 内核差"这一支。                         
+      430 +  严格说两者共享的 bias **值**不同（bf16 vs fp32）、路由图案不
+          +同，地板可能在最后一位上差一点。                              
+      431 +- **未实测**：没有真的跑一次"两侧都用 bf16 舍入值"的对照——它要
+          +重跑引擎 dump（~40–70 min）+ probe                            
+      432 +  （~20 min）。做法（若要做）：给两个 harness 的加载路径加一个
+          + env（如                                                      
+      433 +  `VERL_DSV41_EMULATE_SYNC_BF16_BIAS=1`），在张量进模型前把 `*
+          +.gate.bias` 做一次 `x.bfloat16().float()`                     
+      434 +  往返、两侧都开，再跑 `summarize_probe.py` 对比。            
+      435 +- 顺带核实（**40 层复跑的前置检查**）：真实 40 层 config 的 `t
+          +ext_config` 里没有 `num_hash_layers`                          
+      436 +  （引擎侧缺省 0）→ `self.hash` 全 False、**每层都有 `e_score_
+          +correction_bias` 参数**，不会出现                             
+      437 +  "hash 层该参数为 `None`、而同步送来一个 `.gate.bias` → KeyEr
+          +ror"。                                                        
+      438 +                                                              
+      439 +---                                                           
+      440 +                                                              
+      441 +## 8. 复现命令                                                
+      442 +                                                              
+      443  ```bash
+      444  # 全部：smoke + probe + 汇总 + CPU 校验（~20–25 min，8 卡）
+      445  bash scripts/dsv41_consistency/sh/run_fix_regression.sh
+
+  Thought for 1s (ctrl+o to expand)
+
+● Update(wiki/worklog_dsv41_gate_bias_fp32_fix.md)
+  ⎿  Added 3 lines, removed 1 line
+      358     纠偏 bias 会在同步通道上被重新舍入。
+      359  5. **权重同步的量**：修复后 fp32 bias 会随 `state_dict()` 一起
+           同步到引擎（名字不变 → 引擎 WeightsMapper 照旧命中）。
+      360     数值上这与引擎自有值相同（都是 ckpt fp32），但这也意味着**
+           训练侧保存的 checkpoint 现在会带这个 buffer**
+      361 -   （DCP 保存含 persistent buffer），恢复时不会再退回 0。     
+      361 +   （DCP 保存含 persistent buffer），恢复时不会再退回 0。这条 
+          +同步机制还有**更一般的另一面**：修复前它会把                  
+      362 +   引擎侧所有 *ckpt fp32 / 训练 bf16* 的值**一起降级**成训练侧
+          +精度（`gate.bias` + `attn_sink` + `hc_*`）——                  
+      363 +   逐环节核实、以及"生产在首次 rollout 之前就同步过"这个时序结
+          +论见 **§7**。                                                 
+      364  
+      365  ### 6.2 遗留
+      366  
+
+● Update(wiki/worklog_dsv41_gate_bias_fp32_fix.md)  ⎿  Added 2 lines
+      364  
+      365  ### 6.2 遗留
+      366  
+      367 +- **"同步后"状态的数值对照没有专门跑**（§7.3）：把两侧的 `gate
+          +.bias` 都按 bf16 往返一次再算 σ，需要重跑                     
+      368 +  引擎 dump（~40–70 min）+ probe（~20 min）。当前结论来自代码 
+          +链 + §5.3 的 identification，预期与修复后同量级。             
+      369  - **`=gate` 档的"变为空操作"没有单独复跑**：E7 说它现在找不到
+           目标（`gate.bias` 不是 parameter 了），
+      370    跑出来应当与 baseline 逐位相同；这一条是代码读出来的结论，**
+           没有**再花 10 分钟 NPU 时间做一次确认
+      371    （identification 已经从"训练侧手里是哪个值"这个更直接的角度
+           证明过了）。
+
+  Thought for 6s, read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● Update(wiki/worklog_dsv41_rl.md)
+  ⎿  Added 6 lines
+      374  > ✅ **2026-09-22 补充：修复已落地**（`Gate.bias` → fp32 buffe
+           r），真实切片回归数字与上表的"只还原 `gate.bias`"**逐项相同**
+           ，
+      375  > 且不需要任何 env 开关；8 卡 GRPO 冒烟（含权重同步）也已跑通
+           。
+      376  > 完整记录：[worklog_dsv41_gate_bias_fp32_fix.md](worklog_dsv4
+           1_gate_bias_fp32_fix.md)。
+      377 +>                                                             
+      378 +> ⚠️ **2026-09-23 再补一条作用域修正**（修复记录 **§7**）：本 
+          +节这些数字（含修复前的 0.2573 / 0.1882）测的都是              
+      379 +> **harness 状态**——引擎从 ckpt 起、**不做权重同步**。而生产的
+          + `fit()` 在首次 rollout **之前**就先同步一次权重              
+      380 +> （`ray_trainer.py:1428-1430`），同步会把引擎那份 ckpt fp32  
+          +的 bias **降级**成训练侧的 bf16 值——所以修复前                
+      381 +> 生产侧两侧其实早已"一致在 bf16 值"上，本节 σ 描述的是"引擎刚
+          +从 ckpt 起、同步还没跑"的那一刻。修复的增量                   
+      382 +> 因此是 **"一致的值回到 ckpt 精度" + "不依赖同步"**，而不是" 
+          +把生产的两栈差异从 0.2573 降下来"。                           
+      383  
+      384  ## 5. 剩余风险与待办
+      385  
+
+  Thought for 4s, read 1 file (ctrl+o to expand)
+
+● Update(/mnt/share/m00899630/plans/dsv41-real-weights-4layer/worklog.md)
+  ⎿  Added 7 lines
+      24  → **`gate.bias` 一项就解释了 ~9× 的"输入钉死地板"和 2.7× 的 bas
+          eline σ**；还原后真实权重的行为**回到随机权重那一套**
+      25  （地板回到 0.0034–0.0042 的均匀核噪声）。机制在离线可复现（§7）
+          ，不需要 NPU 就能对任何 checkpoint 复算。
+      26  
+      27 +> ⚠️ **2026-09-23 作用域修正**（修复记录 `/workspace-verl/verl/
+         +wiki/worklog_dsv41_gate_bias_fp32_fix.md` **§7**）：           
+      28 +> 上表的 σ 都是 **harness 状态**（引擎从 ckpt 起、**不做权重同 
+         +步**）的数字。生产的 `fit()` 在首次 rollout                    
+      29 +> **之前**就先同步一次权重（`ray_trainer.py:1428-1430`），而同 
+         +步会把引擎那份 ckpt fp32 的 bias **降级**成训练侧的            
+      30 +> bf16 值——修复前生产侧两侧早已"一致在 bf16 值"上。所以"2.7× ba
+         +seline σ"描述的是"引擎刚从 ckpt 起、同步还没跑"                
+      31 +> 的那一刻；修复的增量是 **"一致的值回到 ckpt 精度" + "不依赖同
+         +步"**，而不是把生产的两栈差异降下来（该结论的                  
+      32 +> 逐环节代码核实见 §7.2，数值对照未实测，见 §7.3）。           
+      33 +                                                               
+      34  ---
+      35  
+      36  ## 1. 产物清单
+
+  Thought for 5s (ctrl+o to expand)
+
+● Now the memory updates:
+
+  Thought for 15s, read 1 file, wrote 3 memories (ctrl+o to expand)
+
+● Let me tighten one cell for accuracy, and verify the initial-sync claim
+  against git history:
+
+● Update(wiki/worklog_dsv41_gate_bias_fp32_fix.md)
+  ⎿  Added 1 line, removed 1 line
+      415  |---|---|---|
+      416  | 导出 | `verl/workers/engine/fsdp/transformer_impl.py:1028` `
+           params = self.module.state_dict()` | `state_dict()` 含 **persi
+           stent buffer** → 修复前（Parameter）与修复后（buffer）**都在里
+           面** |
+      417  | 导出（dtype） | 同文件 `_export_param`（`:977-987`）；dsv41 
+           覆写只对专家张量分片（`fsdp_turbo_dsv41_impl.py:305-363`） | 
+           张量**原样**导出、不做 dtype 归一化：修复前 bf16、修复后 fp32 
+           |
+      418 -| 传输 | `checkpoint_engine/base.py:570-585`（`TensorMeta(dtyp
+          -e=weight.dtype)` + `view(uint8)`）、`:600-620`（`chunk.view(dt
+          -ype)` 还原） | 按**每个张量自己的 dtype** 过线，字节不变（naiv
+          -e 路径同进程，同理不转 dtype） |                              
+      418 +| 传输 | `checkpoint_engine/base.py:570-585`（`TensorMeta(dtyp
+          +e=weight.dtype)` + `view(uint8)`）、`:600-620`（`chunk.view(dt
+          +ype)` 还原） | 按**每个张量自己的 dtype** 过线，字节不变。本 r
+          +ecipe 走 `naive`（同进程直传，连 CE 这条路都不经过），dtype 更
+          +不会被改 |                                                    
+      419  | 落盘（名字） | `vllm_ascend/models/deepseek_v4/model.py:1183
+           ` `.gate.bias` → `.gate.e_score_correction_bias` | 名字命中；*
+           *这行在"skip extra bias"守卫之前**，不会被 `.bias` 结尾的跳过
+           逻辑吃掉；映射不上是 **KeyError（响亮失败）**，不是静默丢弃 |
+      420  | 落盘（值） | `vllm/model_executor/model_loader/weight_utils.
+           py:1231-1245` `default_weight_loader` = `param.data.copy_(load
+           ed_weight)` | bf16 → fp32 参数：**dtype 是 fp32、值就是 bf16 
+           值**（bf16→fp32 加宽无损）→ 提问里的**前提成立**；fp32 → fp32
+           ：逐位 |
+      421  
+
+  Thought for 3s, ran 1 shell command (ctrl+o to expand)
+
+● Update(wiki/worklog_dsv41_gate_bias_fp32_fix.md)
+  ⎿  Added 2 lines
+      402     14:42:26 起来、第一次生成请求 14:44:18，中间 ~112 s 的窗口
+           里就包含这次开局同步（步内同步实测 89.7 s）。
+      403     本 recipe 走 `backend: naive`（冒烟日志里的 resolved config
+           ），实现是同一条路：
+      404     `actor_wg.update_weights()` → `engine.get_per_tensor_param(
+           )`（`verl/workers/engine_workers.py:786`）。
+      405 +   这行开局同步不是本次工作引入的：`git log -L 1428,1430` 显示
+          +它来自 2026-03-04 的上游提交                                  
+      406 +   （`c4593e3c`，当时还是无参的 `update_weights()`），也就是说
+          +**修复前它就一直在**。                                        
+      407  3. 所以修复的收益要重新分配一下。**"两栈一致性"那一半，生产里
+           同步已经给了**；修复真正多出来的是：
+      408     ① 两侧一致的值是 **checkpoint 的 fp32 值**——离散路由不再偏
+           离模型意图，且**训练侧自己的 forward/backward
+      409     从第一个 token 起**就是 ckpt 意图的路由（这一条与同步无关，
+           同步只能改引擎那份）；
+
+  Thought for 19s, searched for 1 pattern, ran 2 shell commands (ctrl+o to expand)
+
+● Recorded. Here's where things stand.
+
+  先回答那条被中断的 btw
+
+  问：修复前同步会把引擎那份 fp32 bias 写进 bf16 值（类型仍
+  fp32），之后两边就一致了 —— 那同步过一次之后，误差是不是就减小？
+
+  答：是，而且比"减小"更强 —— 同步之后两侧拿的是同一个值，离散翻转源直接归零。但
+  核实过程中发现一件更要紧的事，它修正了昨天结论的作用域：
+
+  ┌─────────────────────────┬────────────────────┬──────────────────────────┐
+  │          状态           │    两侧的 bias     │        两栈一致性        │
+  ├─────────────────────────┼────────────────────┼──────────────────────────┤
+  │ harness（§5 那组数字）  │ 引擎 ckpt-fp32 vs  │ 不一致 → σ 0.2573 / 钉死 │
+  │                         │ 训练 bf16          │  0.1882                  │
+  ├─────────────────────────┼────────────────────┼──────────────────────────┤
+  │ 生产                    │ 同步后都是 bf16 值 │ 一致 →                   │
+  │ pre-fix（实际发生的）   │                    │ 预期与修复后同量级       │
+  ├─────────────────────────┼────────────────────┼──────────────────────────┤
+  │ 修复后（harness         │ 都是 ckpt fp32 值  │ 一致 → 0.0967 / 0.0202   │
+  │ 与生产同）              │                    │                          │
+  └─────────────────────────┴────────────────────┴──────────────────────────┘
+
+  因为 ray_trainer.fit() 在 _load_checkpoint()
+  之后、任何生成之前先同步一次权重（ray_trainer.py:1428-1430，git log -L
+  显示这行来自 2026-03 的上游提交，不是本次引入），此后每步末尾再同步（:1716）。
+  所以修复前生产运行从第一轮 rollout 起就已经"两侧一致在 bf16 值"上——§5.2
+  那组不对称数字描述的是"引擎刚从 ckpt 起、还没同步"的 harness
+  状态，不是生产状态。
+
+  同步链路的每一环节都核实过（导出 state_dict() 含 persistent buffer、张量按自己
+  dtype 过线、引擎 .gate.bias→.e_score_correction_bias 映射在 "skip extra bias"
+  守卫之前、default_weight_loader 的 copy_ 加宽无损 →
+  提问的前提成立），顺带核实同一条机制还会把 attn_sink/hc_* 一起降级；以及 40 层
+  config 无 hash 层（不会有 e_score_correction_bias=None 撞 KeyError 的问题）。
+
+  所以修复的增量要重新表述：不是"把生产的两栈差异从 0.2573 降下来"，而是 ①
+  两侧一致的值回到 ckpt 精度（离散路由不再偏离模型意图，且训练侧自己的
+  forward/backward 也用它）；②
+  不依赖同步（harness/离线评估/引擎刚起还没同步的时刻都对齐）；③
+  不必接受一次静默降级。
+
+  记录位置
+
+  - wiki/worklog_dsv41_gate_bias_fp32_fix.md 新增 §7（提问原文 + 结论 +
+    逐环节代码表 + 未实测项），§0/§6.1.5/§6.2 同步修正；原 §7 复现命令 → §8
+  - wiki/worklog_dsv41_rl.md §4.6 加作用域修正；NFS
+    plans/dsv41-real-weights-4layer/worklog.md §0 同
+  - memory 两条更新（dtype 不对称那条 + 工作流那条）
+
+  两处 wiki 改动还没提交（上一个提交 0c20823f "fix consistency" 是把 worklog
+  一起带上的，我按惯例等你发话）。NPU 现在是空的（HBM 4%，之前的 57 GB
+  占用已随进程消失）。
+
+● User declined to answer questions
+  ⎿  · 接下来跑哪个？（8 卡空闲，§7.3 的"未实测"是目前唯一悬着的实证项） 
+     (补测"同步后状态" / 40 层整模型复跑（方向 3） / 便宜收尾：=gate 空操作复跑 
+     / 先不跑，只提交文档)
+     · 这次的两处 wiki 改动（+NFS 工作记录）要不要提交？ (提交到 
+     /workspace-verl/verl / 先不提交)
+
+✻ Brewed for 22m 27s · done 6:10 AM
+
+❯ 把刚才所有的btw输出一份想的文件，放到工作目录同级别目录下，可以叫QA什么的。   
+
+  Thought for 17s, ran 1 shell command (ctrl+o to expand)
+
+● Write(/workspace-verl/QA/QA-2026-09-23-dsv41-权重同步与gate-bias-dtype不对称.m
+       d)
+  ⎿  Wrote 115 lines to
+     ../QA/QA-2026-09-23-dsv41-权重同步与gate-bias-dtype不对称.md
+       1 # QA：权重同步会把引擎那份"降级"吗？同步过一次之后误差是不是就小
+       2 
+       3 > 来源：2026-09-23 上午的工作记录（上一轮会话末尾的 btw 提问，当
+       4 > 本文是那条问答的**独立成稿**；同一内容也写进了
+         ` **§7**（那份另有代码改动、回归数字与复现命令）。
+       6 > 结论的每一条都由**代码链 + 已有实测**支撑；唯一未实测的一处已
+       7 > 相关：`/workspace-verl/verl/wiki/worklog_dsv41_real_weights_4l
+         ayer.md`（真实切片 A/B）、
+         mory `verl-dsv41-router-bias-dtype-asymmetry`。
+      10 ---
+     … +173 lines (ctrl+o to expand)
+
+  Thought for 3s (ctrl+o to expand)
+
+● Update(wiki/worklog_dsv41_gate_bias_fp32_fix.md)
+  ⎿  Added 2 lines
+      382  
+      383  ## 7. btw：同步把引擎那份"降级"之后，误差是不是就小了？（2026-
+           09-23 回答）
+      384  
+      385 +> 独立成稿（同样的内容，自包含、可单独传阅）：`/workspace-verl
+          +/QA/QA-2026-09-23-dsv41-权重同步与gate-bias-dtype不对称.md`   
+      386 +                                                              
+      387  > **提问原文**（2026-09-23 04:12，上一轮会话在这里被 API 错误
+           打断，没来得及回答）：
+      388  >
+      389  > 权重同步（训练 → 引擎）：修复前训练侧导出的确实是 bf16 张量
+           ，引擎 `load_weights` 把它写进 fp32 参数时
+
+● 已写好一份独立成稿：
+
+  /workspace-verl/QA/QA-2026-09-23-dsv41-权重同步与gate-bias-dtype不对称.md
+
+  （/workspace-verl 是当前工作目录 /workspace-verl/verl 的同级目录，新建了 QA/
+  文件夹放这类问答，仓库里不留副本；文件本身自包含，可直接单独传阅。）
+
+  内容 = 刚才这条 btw 的全部：
+
+  ┌──────────┬───────────────────────────────────────────────────────────────┐
+  │    节    │                             内容                              │
+  ├──────────┼───────────────────────────────────────────────────────────────┤
+  │ §0       │ 提问原话（逐字保留）                                          │
+  ├──────────┼───────────────────────────────────────────────────────────────┤
+  │ §1       │ 一句话答案：是；且生产在首次 rollout                          │
+  │          │ 之前就先同步过一次（ray_trainer.py:1428-1430）                │
+  ├──────────┼───────────────────────────────────────────────────────────────┤
+  │ §2       │ 三种状态对照表（harness / 生产 pre-fix / 修复后）与各自的 σ   │
+  ├──────────┼───────────────────────────────────────────────────────────────┤
+  │ §3       │ 逐环节代码核实表（导出 → 传输 → 名字映射 → copy_              │
+  │          │ 落值），含"引擎侧没有自定义 weight_loader"、naive 后端        │
+  ├──────────┼───────────────────────────────────────────────────────────────┤
+  │ §3.1–3.2 │ 同机制的另一半（attn_sink/hc_* 一起降级）；resume→push→gen    │
+  │          │ 时序 + 那行开局同步来自 2026-03 上游提交                      │
+  ├──────────┼───────────────────────────────────────────────────────────────┤
+  │ §4       │ 修复的价值重新表述（一致的值回到 ckpt 精度 / 不依赖同步 /     │
+  │          │ 无静默降级），以及"2.7× baseline σ"的作用域修正               │
+  ├──────────┼───────────────────────────────────────────────────────────────┤
+  │ §5       │ 唯一未实测的一处（要重跑引擎 dump +                           │
+  │          │ probe）与想测时的做法（env 门控做 bf16 往返）                 │
+  ├──────────┼───────────────────────────────────────────────────────────────┤
+  │ §6       │ 顺带核实：40 层 config 无 hash 层，不会撞                     │
+  │          │ e_score_correction_bias=None 的 KeyError                      │
+  └──────────┴───────────────────────────────────────────────────────────────┘
+
+  回指也加了：wiki/worklog_dsv41_gate_bias_fp32_fix.md §7 顶部现在指向这份 QA
+  文件。
+
+  还有两件事等你发话：① 两处 wiki 改动（+ 这份 QA）要不要提交进
+  /workspace-verl/verl；② 下一步跑不跑 NPU 实验 —— 最值得的是把 §5
+  那条"未实测"补上（两侧 gate.bias 做 bf16 往返回仿真"同步后"状态，重跑引擎 dump
+  ~40–70 min + probe ~20 min，可顺带补齐层 1 参数指纹），其余选项是 40
+  层整模型复跑（方向 3）和 =gate 空操作复跑（~10 min）。
+
+✻ Churned for 55s · done 7:18 AM
+
+❯ 昨天跑的日志在哪？                                                            
+
+  Thought for 4m 23s, searched for 1 pattern, listed 1 directory, ran 3 shell commands (ctrl+o to expand)
+
+● 昨天（2026-09-22）的日志分三类，全部在 /tmp 和 NFS 
+  上，按"哪个日志出哪个数字"列一下：
+
+  A. 修复回归（13:39–14:27，一条龙）
+
+  文件: /tmp/run_fix_regression.log
+  时间: 13:39
+  内容: 一条龙 driver 的第一次尝试（停在下发 torchrun 那行）
+  ────────────────────────────────────────
+  文件: /tmp/run_fix_smoke{2,3,4}.log
+  时间: 13:44/13:56/14:03
+  内容: 训练侧冒烟的三次尝试
+  ────────────────────────────────────────
+  文件: /tmp/run_fix_smoke5.log
+  时间: 14:11
+  内容: 冒烟成功那次（末尾带了 VERDICT: provenance=PASS 
+  identification=FAIL——那时
+  probe 还没跑）
+  ────────────────────────────────────────
+  文件: /tmp/dump_trainer_real4_fix.log
+  时间: 14:10
+  内容: 训练侧冒烟正文（load check … bit-exact、buffer sha1 都在这里）
+  ────────────────────────────────────────
+  文件: /tmp/run_fix_probe.log
+  时间: 14:23
+  内容: probe 步骤（=== all done 14:23:35 ===）
+  ────────────────────────────────────────
+  文件: /tmp/probe_input_real4_fix.log
+  时间: 14:23
+  内容: probe 正文
+  ────────────────────────────────────────
+  文件: /tmp/summarize_probe_real4_fix.txt
+  时间: 14:23
+  内容: σ/地板/argmax 全表（worklog §5.2 的来源）
+  ────────────────────────────────────────
+  文件: /tmp/verify_gate_bias_fp32.txt
+  时间: 14:23
+  内容: CPU provenance + identification（§5.1/§5.3 的来源）
+
+  产物 dump：/mnt/share/m00899630/dsv41/dump/trainer_real4_fix/、…/probe_input_r
+  eal4_fix/。
+
+  B. 8 卡 GRPO 冒烟（14:26–14:47）
+
+  文件: /tmp/run_fix_grpo_smoke.log（671 KB）
+  内容: driver 全量日志
+  ────────────────────────────────────────
+  文件: /workspace-verl/verl/logs/DeepSeek-V4.1-Flash-4layer-scaled32-20260922_1
+  43613.log
+  内容: 成功那次的框架日志（step:1 那行指标、timing_s/update_weights 89.7s
+  在这里）
+  ────────────────────────────────────────
+  文件: …_143135.log、…_142644.log
+  内容: 前两次失败的尝试
+  ────────────────────────────────────────
+  文件: /tmp/ray/session_2026-09-22_14-{26-55,31-47,36-24}*/
+  内容: 对应三次的 Ray 会话日志
+
+  C. 上午的准备与四组 fp32 A/B（03:27–09:41）
+
+  ┌─────────────────────────────────────────────────────┬────────────────────┐
+  │                        文件                         │        内容        │
+  ├─────────────────────────────────────────────────────┼────────────────────┤
+  │ /tmp/make_slice_real4.log (07:58)                   │ 真实 4 层切片      │
+  ├─────────────────────────────────────────────────────┼────────────────────┤
+  │ /tmp/trainer_real4_smoke.log (08:07) →              │ 切片训练侧 dump    │
+  │ dump/trainer_real4/                                 │                    │
+  ├─────────────────────────────────────────────────────┼────────────────────┤
+  │ /tmp/dump_engine_real4.log (08:19) →                │ 引擎侧 dump（H2    │
+  │ dump/engine_real4/                                  │ 四组 A/B           │
+  │                                                     │ 共用的那份）       │
+  ├─────────────────────────────────────────────────────┼────────────────────┤
+  │ /tmp/probe_input_real4.log (08:33) →                │ 现状（bf16）       │
+  │ dump/probe_input_real4/                             │                    │
+  ├─────────────────────────────────────────────────────┼────────────────────┤
+  │ /tmp/probe_input_real4_fp32{,_gate,_continuous}.log │ 只还原 gate /      │
+  │  (09:27–09:36)                                      │ 只还原连续项 /     │
+  │                                                     │ 全还原             │
+  ├─────────────────────────────────────────────────────┼────────────────────┤
+  │ /tmp/summarize_real4.log                            │ 汇总、参数指纹核对 │
+  │ (08:50)、check_params_real4{,_v2}.log               │                    │
+  ├─────────────────────────────────────────────────────┼────────────────────┤
+  │ /tmp/probe_input_scaled{,32}.log (03:27/03:32)      │ 随机 scaled 那两组 │
+  └─────────────────────────────────────────────────────┴────────────────────┘
+
+  ⚠️ 一个提醒：A、B、C 的日志全在 /tmp（+/tmp/ray），是易失的（worklog §5.2
+  直接引用的 summarize_probe_real4_fix.txt 也在里面）；durable 的只有 NFS 上的
+  dump 目录。要不要我把 09-22 的这批日志（合计约 1.5 MB）拷一份到
+  /workspace-verl/verl/wiki/work_log/2026-09-22/？
+
+✻ Cooked for 5m 35s · done 7:33 AM
+
+❯ /workspace-verl/verl/logs/DeepSeek-V4.1-Flash-4layer-scaled32-20260922_143613 
+  .log training/rollout_actor_probs_pearson_corr:0.9753191471099854             
+  中的这个指标为何才0.975                                                       
+
+  Thought for 45s, searched for 2 patterns, ran 3 shell commands (ctrl+o to expand)
+
+● Post-fix smoke used the same fixture family the worklogs already chart — but
+  there's an offline route to decompose this metric. Let me check what the
+  existing dumps contain.
+
+  Thought for 10s, listed 1 directory, ran 1 shell command (ctrl+o to expand)
+
+● Both dumps contain per-token logprobs — so I can compute this metric family
+  offline on real weights. Let me find the trainer-side tensors:
+
+  Thought for 25s, searched for 1 pattern, ran 5 shell commands (ctrl+o to expand)
+● Now let me do the offline decomposition of this exact metric on the
+  real-weights dumps (CPU only):
+
+  Thought for 23s, ran 1 shell command (ctrl+o to expand)
+
+● 这个指标我在真实权重 dump 上离线复算了一遍，结论很明确：0.975 是这个 fixture 
+  的正常量级，不是同步有问题。分三层解释。
+
+  1. 先看它到底算什么（verl/utils/debug/metrics.py:143-166）
+
+  actor_probs   = torch.exp(actor_old_log_probs)      # 训练侧重算
+  rollout_probs = torch.exp(rollout_old_log_probs)    # 引擎生成时记录
+  pearson_corrcoef = pearson_correlation_coefficient(actor_probs, rollout_probs,
+  response_mask_bool)
+  rollout_probs_diff = |actor_probs - rollout_probs|  # → diff_mean 0.0108 / max
+  0.382
+
+  关键：它是概率域的相关系数（不是 log 域），而且 diff_* 是
+  |Δp|。概率域意味着差异按绝对值计入 → 指标几乎由高概率 token 决定；log
+  域的同一份差异（log_ppl_abs_diff 0.088 nats/ token）在高概率 token 上被放大成
+  |Δp| 0.01–0.38，在低概率 token 上则微不足道。
+
+  2. 为什么两套栈算同一批权重还会有差
+
+  1. 内核差：引擎是逐 token decode + paged KV（动态拼批），训练侧是一次 padded
+     forward；RMSNorm/attention/MoE 的 bf16 累加顺序不同 → 每模块 ~0.5% ≈ bf16 1
+     ULP（这是既有结论，已逐模块测过）。
+  2. MoE 离散放大（主因）：这点点输入差会让部分 token-层的 top-6 
+     专家集合翻转，翻转 token 的 logp 直接跳 O(1) nats——实测 97% 的平方误差落在
+     ~5% 的翻转 token 上。所以分布是重尾：中位数 token 几乎一样，少数 token
+     差很多。
+  3. 这一轮的样本还特别"脆"：scaled32 是随机权重（head-gain
+     4），路由翻转的后果比训练过的权重严重得多；而且这一步只有 4 prompt × n=2 ×
+     64 token ≈ 512 个 response token，重尾 + 小样本 → 单次估计波动大。
+
+  3. 实测对照（刚用昨天真实权重 dump 离线算的，CPU）
+
+  | 数据 | log 域 Δlogp | 概率域 pearson（RL 同款） | |Δp| |
+  |---|---|---|---|
+  | 真实 4 层切片，baseline（199 token） | std 0.0967 / max 0.962 / argmax 0.950
+  | 1.0000 | mean 2e-5 / max 0.003 |
+  | 真实 4 层切片，输入全钉死 | std 0.0202 / max 0.069 | 1.0000 | mean 2e-5 |
+  | scaled32 冒烟（你问的这行） | ~0.09 量级 | 0.9753 | mean 0.011 / max 0.382 |
+
+  也就是说：同一个量级的 log 域差异，在真实切片上算出 1.0000，在随机权重 fixture
+  上算出 0.975 ——
+  差别来自概率尺度（切片退化到近均匀分布，p~1e-5，绝对差被淹没；随机权重下 p 到
+  O(0.1)，同样 0.09 nats
+  的相对差变成百分之几的绝对差），而不是"随机权重那次两栈差得多"。
+
+  尾部集中度（真实切片 baseline）：最差的 1 个 token 就占 Σ(Δlogp)² 的 50%，前
+  5%（9 个）占 89%。
+
+  4. 判读标准
+
+  同 fixture 的重复运行（worklog_dsv41_rl.md G13，scaled32）pearson = 0.967 / 
+  0.979 / 0.978 / 0.968，你这行 0.9753 正落在里面；384 专家全尺寸是
+  0.90–0.92（kl 0.38）。结论（既有）：这类指标随专家数/head-gain
+  走，不能拿绝对值当"同步是否健康"的判据——真错位是量级断层（O(1) 的 diff_mean 或
+  pearson ~0.5）。另外它默认不进 loss（old_log_probs 由训练侧重算，GRPO
+  脚本没开 algorithm.rollout_correction），只影响 off-policy 程度与监控。
+
+  想把这行的 per-token 分布也拆开看的话，工具已经写好了：重跑冒烟时加
+  VERL_DSV41_DUMP_BATCH=/tmp/dsv41_dump（metrics.py:68-100
+  的调试钩子，就是为这个问题加的），会落 batch_step0.pt，然后 CPU
+  上做上面同样的分解。要跑吗？约 11 分钟 8 卡。
+
+✻ Cogitated for 5m 55s · done 7:44 AM
+
+❯ DeepSeek-V4.1-Flash-4layer-scaled32-20260922_142644.log                       
+   这是跑的真实权重，还是随机4layer权重                                         
+
+  Thought for 18s, ran 4 shell commands (ctrl+o to expand)
+
+● 随机权重，不是真实权重。
+
+  证据（都是从日志和 fixture 本身读出来的）：
+
+  ┌────────────────┬────────────────────────────────────────────────────────┐
+  │       项       │                           值                           │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │ 模型路径（日志 │ /mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-4laye │
+  │  line          │ r-scaled32                                             │
+  │ 242/471）      │                                                        │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │ 该 fixture 的  │ 4 层 / 32 专家 / moe_intermediate 2304 / hidden 5120   │
+  │ config         │                                                        │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │                │ 2026-09-19 02:34，由 mjt_workplace/deepseek41/inferenc │
+  │ 生成时间与来源 │ e/make_random_ckpt_dsv41_4layers.py --init scaled      │
+  │                │ --head-gain 4 生成（4 层 32 专家、14                   │
+  │                │ GB，专门用于快速迭代）                                 │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │ 冒烟脚本自己的 │ run_fix_grpo_smoke.sh：「Uses the 4-layer 32-expert    │
+  │ 注释           │ scaled fixture (14 GB) so the whole thing fits         │
+  │                │ comfortably」                                          │
+  └────────────────┴────────────────────────────────────────────────────────┘
+
+  对照一下，昨天用真实权重的几批跑的都是另外的路径：
+
+  - DeepSeek-V4.1-Flash-4layer-real —— 从 40 层真实 ckpt 切出的 0–3 层（384 
+    专家，带 SLICE.md），训练侧/引擎侧 dump、四组 fp32 A/B、修复回归都用它；
+  - /mnt/share/DeepSeek-V4.1-Flash-bf16 —— 整模型 40 层 384
+    专家（还没跑过端到端）。
+
+  也就是说：你问的这份日志（以及同族的 143135、143613）全程都是随机 
+  scaled32。它验的是通路（新 buffer 能加载、权重同步 89.7s 走通、GRPO 第 1
+  步完整跑完），数值改进的证据不在它身上——worklog §5.5 就是这么写的：scaled
+  fixture 两侧 gate.bias 都是 0，所以它测不出 dtype 不对称；同理上面那行 pearson
+  0.9753 属于「随机 32 专家」族群（同 fixture 重复运行
+  0.967–0.979），拿来和真实权重比会误判。
+
+  顺带：142644 那次是三次尝试里的第一次，挂在主机名 socket 解析上（就是 worklog
+  的 E9 坑，后来脚本里写死了 MASTER_ADDR=127.0.0.1 +
+  GLOO_SOCKET_IFNAME=enp48s3u1u1），143613 才是跑通那次。
+
+✻ Worked for 1m 27s · done 7:50 AM
+
+❯ len=200 修复后（无 env）** | 0.0967 | 0.0202（4.8×） |                        
+  0.0037/0.0042/0.0038/0.0034 | 0.0062 | **0.970                                
+  那这个是没有跑grpo端到端吗？这个len200是怎么算的                              
+
+  Thought for 31s, ran 5 shell commands (ctrl+o to expand)
+
+● 不是 GRPO 端到端。 那一行来自 probe harness（scripts/dsv41_consistency/
+  那套），是纯前向的两栈对比：两侧都从 ckpt 直接加载、跑同一条输入，没有 rollout
+  / 采样 / 优化器 / 权重同步。GRPO 端到端目前只有 §5.5 那次冒烟（而且用的是随机
+  scaled32）；真实权重的端到端还没跑过——那正是待办里的"方向 3：40
+  层整模型复跑"。
+
+  len=200 是什么
+
+  /mnt/share/m00899630/dsv41/dump/fixture.json 里一条用 RL tokenizer 编好的
+  prompt 截到 200 个 token（samples[target_len=200].input_ids；len=64 就是同一条
+  prompt 的前 64 个 token，所以两个长度可比）。
+
+  两侧吃同一条序列，因此逐位置可对齐：
+
+  1. 引擎侧（8 卡 vLLM-Ascend，dump_engine_stages.py）：跑一次前向，dump
+     各模块输出（engine_stages_len200_rank*.pt，8 份内容相同）+
+     engine_len200.json 里的 scored（199 个 next-token logprob）与 argmax；
+  2. 训练侧（8 卡 FSDPTurbo，probe_module_inputs.py）：同一输入前向，pre/post
+     hook 抓每个模块的输入/输出与 model.head logits（probe_len200_baseline.pt
+     等）；
+  3. 汇总（summarize_probe.py）：四个变体——baseline（各自自然输入）、in.all.ffn
+     / in.all.attn（只把对应模块的输入换成引擎的）、in.all（8
+     个模块输入全钉死）。
+
+  每个数字怎么算
+
+  表里那一列: baseline σ 0.0967
+  公式（代码位置）: std(trainer_next_logprob − engine_scored)，单位
+  nats（probe_module_inputs.py:186-194；logprob 由
+  log_softmax(head)[:-1].gather(input_ids[1:])，:376-377）
+  规模: 199 个 token 位置
+  ────────────────────────────────────────
+  表里那一列: in.all σ 0.0202（"4.8×"）
+  公式（代码位置）: 同上，但所有模块输入换成引擎 dump 的逐位相同值后再前向；4.8×
+
+  = 0.0967/0.0202
+  规模: 199 个位置
+  ────────────────────────────────────────
+  表里那一列: MoE 地板 0.0037/0.0042/0.0038/0.0034
+  公式（代码位置）: in.all 下逐层 ffn 模块输出的 rel_err = ‖trainer −
+  engine‖₂/‖engine‖₂（describe()，:152-158）
+  规模: 每层 200×5120 ≈ 102 万个数
+  ────────────────────────────────────────
+  表里那一列: model.norm 0.0062
+  公式（代码位置）: 同理，model.norm 输出
+  规模: 102 万个数
+  ────────────────────────────────────────
+  表里那一列: argmax 0.970
+  公式（代码位置）: argmax 一致率：引擎 vs 训练侧的 next-token
+  argmax（argmax_agree，:190-193）
+  规模: 199 个位置中 193 个
+
+  顺带一个能说明机制的对照（同一份 report 里的 baseline 列）：不钉输入时，模块
+  rel_err 随深度递增 0.0052 → 0.0077 → 0.0118 → 0.0196、model.norm
+  0.0294；把输入钉死后全部压回 0.0034–0.0060 —— 这就是"每模块自身只差
+  ~0.5%（核噪声），但输入差被 MoE 逐层放大"的直接读数。
+
+  两点边界要记住：① 样本只有一条序列 / 199 
+  个位置，它是"机制显微镜"，不是数据集平均；② 按今天 §7 的结论，它测的是 harness
+  状态（引擎刚从 ckpt 起、不经权重同步）。
+
+✻ Baked for 1m 51s · done 7:54 AM
+
+❯ /mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-4layer-real                  
+  基于最新的跑一下GRPO，然后记录下跑的脚本。如果没有资源等待即可。              
+
+  Thought for 10s (ctrl+o to expand)
+
+● Start with reconnaissance: NPU occupancy, the real slice, the data, and the
+  launch-script knobs.
+
+  Thought for 6s, ran 2 shell commands (ctrl+o to expand)
+
+● All 8 chips free. Real slice = 4 层 / 384 专家 / 108 GB. Now let me read the
+  launch script's knobs:
+
+  Thought for 24s, ran 2 shell commands (ctrl+o to expand)
+
+❯ 关注下training/rollout_actor_probs_pearson_corr:                              
+  这个指标，然后跑10个step即可。                                                
+
+  Thought for 52s, ran 1 shell command (ctrl+o to expand)
+
+● All chips free and the knobs are clear. Writing the run script now:
+
+● Write(scripts/dsv41_consistency/sh/run_real4_grpo.sh)
+  ⎿  Wrote 47 lines to scripts/dsv41_consistency/sh/run_real4_grpo.sh
+       1 #!/bin/bash
+         nt/share/m00899630/weights/
+         on-bias fix in place (2026-09-22).
+       4 #
+         rward-only harness (§5.2/§5.3) plus a
+         r is a real-weight production path.
+          steps, focused on
+       8 # `training/rollout_actor_probs_pearson_corr` (and the two compa
+       9 # `rollout_corr/kl`):
+         -1 -- the band t
+     … +59 lines (ctrl+o to expand)
+
+  Thought for 9s, ran 2 shell commands (ctrl+o to expand)
+
+● All clear — launching the real-weight GRPO run (10 steps) in the background:
+
+  Thought for 4s, ran 1 shell command (ctrl+o to expand)
+
+● Launched with total_training_steps=10 on the real slice. Let me monitor
+  startup while preparing the per-token analysis tool for the pearson metric.
+
+  Thought for 15s, searched for 2 patterns, ran 3 shell commands (ctrl+o to expand)
+
+● Write(scripts/dsv41_consistency/analyze_rollout_actor_gap.py)
+  ⎿  Wrote 151 lines to
+     scripts/dsv41_consistency/analyze_rollout_actor_gap.py
+       1 #!/usr/bin/env python3
+          `VERL_DSV41_DUMP_BATCH` dumps.
+       3 
+         our scalars per step:
+       6     training/rollout_probs_diff_{mean,max,std}   = |exp(old_log_
+         probs) - exp(rollout_log_probs)|
+         ose two *probability* vectors
+       8 
+          trainer's padded forward) agree to
+         w tokens disagree by O(1) nats, and
+     … +178 lines (ctrl+o to expand)
+
+  Thought for 10s, searched for 1 pattern, ran 2 shell commands (ctrl+o to expand)
+
+● Tool validated against an independent computation (0.8098 vs 0.809811 ✓). Let
+  me check what the sync-profile logging looks like, then keep polling.
+
+  Thought for 14s, searched for 1 pattern, ran 4 shell commands (ctrl+o to expand)
+
+● Yesterday's harness loaded the same slice in 255 s, so this is normal.
+  Polling:
+
+  Thought for 23s, searched for 1 pattern, ran 3 shell commands (ctrl+o to expand)
+
+● The run is healthy and loading (12:50 elapsed). Let me set up an automatic
+  check-back so I can report each step's metric as it lands:
+
+● CronCreate(13,37 * * * *: 检查真实 4 层切片 GRPO 10 步运行（日志
+            /tmp/run_real4_grpo.…)
+  ⎿  Scheduled 4ecc1ba0 (13,37 * * * *)
+
+  Thought for 16s, ran 3 shell commands (ctrl+o to expand)
+
+● The run failed. Let me get the root cause:
+  Ran 1 shell command (ctrl+o to expand)
+
+● Please run /login · API Error: HIS Proxy Notification
+
+✻ Cogitated for 19m 55s · done 8:42 AM

@@ -17,9 +17,14 @@
 #
 # Cost note: the default weight sync exports the full model on every rank (verl/wiki/worklog_dsv41_rl.md
 # G13 measured 86.7s for the 14 GB scaled32 model, dominated by CPU-offloaded all-gathers), so ~108 GB
-# of this checkpoint will make each step's `update_weights` the dominant term. `LOCAL_EXPERT_EXPORT=1`
-# (env, opt-in, validated at 32 experts only) cuts that ~14x; flip it once the default path's first
-# step looks healthy.
+# of this checkpoint will make each step's `update_weights` the dominant term -- measured live on
+# 2026-09-23 (logs/DeepSeek-V4.1-Flash-4layer-real-20260923_104558.log): update_weights 1032.7s of a
+# 1230.1s step, sender 4702 tensors / 104.96 GiB, export ~900-1000s, flush only ~13s.
+# That first default-path step came back healthy (diff_mean 0.0047 / pearson 0.995), and the fast path
+# is now validated on THIS checkpoint too (`..._093816.log`: 670 tensors / 16.37 GiB, export 0.9s,
+# update_weights 18.5s, pearson 0.988 at half batch) -- so run real4 iterations with
+# `LOCAL_EXPERT_EXPORT=1` (5.7x step speedup; a wrong rank pairing cannot hide: the metrics would
+# cliff to O(1)/~0.5). See wiki/worklog_dsv41_real4_prod_consistency.md §2.
 set -xeuo pipefail
 cd /workspace-verl/verl
 
