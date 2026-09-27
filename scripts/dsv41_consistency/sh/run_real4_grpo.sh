@@ -49,4 +49,4 @@ VAL_BSZ=${VAL_BSZ:-8} \
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-GRPO-DSV41-real4-biasfix} \
 ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7} \
 bash examples/grpo_trainer/run_deepseek_v41_grpo_fsdp_turbo_npu.sh \
-  trainer.total_training_steps=${STEPS:-10}
+  trainer.total_training_steps=${STEPS:-10} "$@"

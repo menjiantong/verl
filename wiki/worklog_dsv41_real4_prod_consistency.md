@@ -4,8 +4,12 @@
 > 本篇记录修复之后**第一次真实权重的生产 GRPO 运行**(`DeepSeek-V4.1-Flash-4layer-real-20260923_104558.log`)暴露的两个问题、
 > 它们的定位过程、以及为"提升验证速度 → 继续定位不一致"所做的改动。
 >
-> 状态:**问题 1(慢)已定位并修复中;问题 2(pearson 0.995→0.999)已完成离线分解,残差结构已定形**。
-> 最后更新:2026-09-23 13:00(fast-sync 重跑仍在进行,结果回填 §5.4)。
+> 状态:**问题 1(慢)已解决并定版(§5.4,6.3× 提速);问题 2(pearson 0.995→0.999)已完成
+> 子段级归因(§4.4–§4.6:残差=o_proj 尾 ~0.0045 + expert GEMM/combine ~0.0037 + core ~0.002,
+> 全部为均匀 bf16-ULP 核差,离散/参数级因素为零)**;指标口径已修正为 probs 空间(§3.1);
+> fulldet 杠杆证伪(§5.5)、o_proj 形态对齐证伪(§4.7)→ 残余核差是并行结构差;
+> **TIS(rollout_correction)已实施并验证可用(§5.8)**;优化路线与遗留见 §7。
+> 最后更新:2026-09-23 15:10。
 
 ---
 
@@ -21,12 +25,19 @@
    两条独立证据链:
    - 生产 token 级 dump(`batch_step0/1.pt`):|Δlogp| 中位数 0.049、49% token >0.05、1.3% >1.0;
      **drop 最差的 5% token 后 pearson 0.9993** —— "宽基底 + 重尾"。
-   - 钉输入探针的离线子段分解(新工具 `analyze_moe_floor_offline.py`):同一份钉死输入下
-     **路由器 0 残差**(top-6 选择 200/200 含槽位序全同、权重 |Δ|≤1.2e-7),地板全部来自
-     **expert GEMM/combine(attn 与 MoE 各 ~0.003–0.006)且完全均匀**(top-1% token 只占能量 1–2%),
-     head 也无离散残差(logit 行 rel_err 0.0064、argmax 一致)。
-   - 定量目标:production 噪声 std 0.24 → **≤0.15** 才够 0.999(信号 std 3.4,`r≈1/√(1+(σn/σs)²)`),
-     即核差要整体压 ~1.6×;dtype/参数级的路已经走完了,剩下是内核累加序/精度路径的工程。
+   - 钉输入探针的离线子段分解(新工具 `analyze_moe_floor_offline.py` + `analyze_attn_floor_offline.py`,
+     §4.4/§4.6):同一份钉死输入下 **路由器 0 残差**(top-6 选择 200/200 含槽位序全同、权重 |Δ|≤1.2e-7)、
+     **attn q 投影 <1e-4**(rope 无罪);地板三块:**MoE expert GEMM/combine 0.0034–0.0045、
+     attn 尾(inverse-rope+o_proj 段)~0.0045(§4.7:微基准证伪"调用形态差",归因修正为
+     引擎 TP 头切+HCCL all-reduce 的**并行结构差**)、attn core ~0.002**——全部逐 token
+     均匀无尾(top-1% 能量占比 ≤2%),即 bf16 1 ULP 级核差;head 也无离散残差。
+     harness 另含 attn_sink 值不对称(engine fp32 vs trainer bf16,rel ~0.18%/层),生产同步会抹平。
+   - 定量目标:**以 §3.1 的 probs 空间读法为准**(0.995 由 ~1% 高置信翻转 token 主导,drop 1% → 0.9986);
+     dtype/参数级/调用形态的路已全部走完或证伪(§3.1/§4.3/§4.7),残余核差是**两套栈并行布局的结构差**,
+     不可单点消除 → 现实杠杆是 §5.8 的 TIS(把翻转 token 的后果计入 PG loss)。
+3. **TIS 已实施并验证可用**(§5.8,14:38–15:05):dsv41 recipe 首次走通 Decoupled+token-IS 全链路;
+   `ratio_fraction_high 0.68%/0.93%` 与 §3.1 的"worst ~1% 高置信 token"**独立互证**;pearson 同带(无误伤)。
+   遗留:reward 全 −1 的数据退化让 pg_loss=0,**梯度端效果待有方差的 reward 再验**(§7-F)。
 
 ---
 
@@ -124,13 +135,50 @@ step1 batch:pearson 0.99744,diff std 0.244 —— 两步同量级(权重未变,�
 
 - **形态 = 宽基底 + 重尾**:5% 的坏 token 承载了 0.995→0.999 之间的主要差距;与"MoE 路由翻转
   token 吃掉 64–90% 误差能量"的既有结论同一机制。
-- 本地重算 0.9976 vs 日志 0.9950:聚合口径略有差(日志端在训练进程内算,dump 端是落盘 fp32 张量重算);
-  不影响形态判断,**以 drop-tail 结构为主要证据**。
-- 定量到目标:噪声 std σn=0.24、信号 std σs=3.43,`r ≈ 1/√(1+(σn/σs)²)` → 0.999 需要 **σn ≤ 0.153**
-  (压到 63%)。
+- ~~本地重算 0.9976 vs 日志 0.9950:聚合口径略有差~~ **已由 §3.1 查明:trainer 指标在 probs 空间
+  (metrics.py:146 `exp()`),按同口径重算=0.99505,与日志完全吻合;本节的 logprob 数字只用于看形态。**
+- ~~定量到目标:σn ≤ 0.153(压到 63%)~~ **目标函数读法以 §3.1 为准**(probs 空间由 ~1% 高置信
+  token 主导,阈值型响应,不是线性压噪声)。
 - ⚠️ 作用域提醒:该 fixture 是 4 层未训练 policy(entropy 5.9 / ppl ~366),σs 偏小,pearson 对噪声
   比真实训练模型更敏感;同样的核差在 40 层真实 policy 上预计指标更好看,但**绝对 σ 不保证更小**
   (上一篇 §6.1.3 的层数 caveat 仍然有效)。
+
+---
+
+## 3.1 **口径修正(14:2x,本轮最重要的一个发现)**:指标在 probs 空间,不是 logprob 空间
+
+§3 的离线分解是在 logprob 上做的,得到 pearson 0.9976,与日志 0.9950 有 3e-3 的"口径差"——当时记为
+"聚合路径差异,不影响形态判断"。**这个判断错了,现已查明**:`verl/utils/debug/metrics.py:146-148`
+
+```python
+actor_probs = torch.exp(actor_old_log_probs)      # ← 先 exp!
+rollout_probs = torch.exp(rollout_old_log_probs)
+pearson_corrcoef = pearson_correlation_coefficient(actor_probs, rollout_probs, ...)
+```
+
+trainer 的 `rollout_actor_probs_pearson_corr` 算在 **probs = e^logprob 空间**。用 dump 张量按同口径重算:
+
+```
+probs-pearson(10:45 run step1) = 0.99505   vs 日志 0.995047  ✓ 完全吻合
+probs-pearson(fast-sync step1)  = 0.99416   vs 日志 0.994155  ✓
+```
+
+** mystery 关闭:没有任何"聚合口径差",dump 就是全部;之前所有判读要在 probs 空间重做**,而重做后
+结构变了——**差距几乎完全由 ~1% 的高概率 token 承载**:
+
+| 数量(probs 空间,生产 dump,4096 token) | 值 | 怎么读 |
+|---|---|---|
+| \|Δp\| 中位数 | **0.00011** | 一半 token 的两侧概率差在 1e-4 量级——低 p token(p≈1e-9)即使 logprob 差 1,绝对 p 差也近零,**对 pearson 无贡献** |
+| \|Δp\| p99 / max | 0.079 / 0.32 | 尾部全在"高 p 且两侧分歧"的 token 上 |
+| worst-5% token 的平均 p_actor | **0.34**(全体均值 0.079) | **坏 token = 模型很有把握的 token**;它们同时是 logprob 空间"翻转 token"的超集(路由翻转改变了 argmax 分布的尖峰) |
+| drop worst **1%** → probs-pearson | **0.9986** | 全 batch 只有 ~40 个 token 在决定 0.995 这个数字 |
+| drop worst **5%** → | **0.9997** | 50 个 token 内就够到 0.999 之上 |
+
+**这张表如何改变优化判断**:log 空间下我推过"σn 0.24→0.15 需要三块核差整体 ×0.63";probs 空间下
+pearson 对**高置信位置的离散翻转**敏感度远高于对均匀噪声——**翻转数对输入扰动是阈值型(超线性)响应**
+(topk 边界竞争,越界概率 ∝ 扰动幅度),所以"把最大的一块核差减半"可能把 1% 的坏 token 数砍掉一半以上,
+pearson 呈跳跃式改善。这重新抬高了"单点对齐"的价值——于是去做了 §4.7 的微基准。
+(同时保留:两批 fast/default dump 的 probs-pearson 0.9942/0.9951 再次确认同步通道不改变一致性。)
 
 ---
 
@@ -181,6 +229,118 @@ model.norm 0.0062;logits(引擎 decode 行 vs trainer row199)0.0064,argmax 一�
    一度用 `stages["ffn_norm"]` 和引擎 router 输入比出 6.6e-3 的差怀疑映射错误;核对
    `probe_module_inputs.py:332–359` 后确认:gate 与 router 的对比两侧吃的是**同一份钉死输入**,
    1e-7 的一致性成立。(6.6e-3 本身也是有用信息:那是自然态下两侧 norm 输出的典型差,~bf16 1 ULP。)
+
+---
+
+### 4.4 attn 地板的子段分解(带 attn hook 的 probe 重跑 + 新工具,13:08–13:2x)
+
+**E2 验证通过先记**:重跑 `probe_module_inputs.py`(输出新目录 `probe_input_real4_fix_attn/`,
+不动 §5.2 引用的旧目录),**12 分钟跑完**(4 变体×2 长度;上次 20 min 是共享 NPU 排队,现在独占);
+8 份 dump 全部带 20 个 attn_op 键;**回归:新旧 `in_all` 的 next_logprobs 逐位相同(max diff 0.0)**。
+
+新工具 `analyze_attn_floor_offline.py`(CPU ~1 min):引擎的 attention 是**按头切到 8 个 worker rank**
+(每 rank q=(200,8,512),全部 200 token;训练侧本地 64 头),头映射实测为**连续切块**
+(contiguous rel_err 0.0000 vs strided 1.0974)。逐层结果(in_all,存档 `/tmp/attn_floor_real4_fix.txt`):
+
+```
+L    eps_q  eps_core  q≠0元素  eps_module   core per-token med/p99
+0   0.0000    0.0026    896      0.0052      0.0019/0.0054
+1   0.0000    0.0024    208      0.0048      0.0020/0.0048
+2   0.0000    0.0036   2532      0.0057      0.0029/0.0085
+3   0.0000    0.0038     57      0.0060      0.0032/0.0085
+```
+
+- **q 投影(wq_a/q_norm/wq_b/rope)基本消灭**:rel_err <1e-4,不一致元素 57–2532 / 6.55M
+  (0.001–0.04%,全是 bf16 1 ULP)→ 两侧 GEMM 在这个形状上几乎逐位一致。
+- **attention core(SparseFlashMla vs 训练侧 indexed_sparse_attention)≈0.0024–0.0038**。
+- **core 之后的 inverse-rope + o_proj 尾巴是 attn 地板大头**:0.0026→0.0052(module),
+  正交合成 ≈0.0045 出自这一段。
+- **attn_sink 值不对称(仅 harness 态!)**:训练侧 sink 是 bf16 值(`|sink−bf16(sink)|=0`,它是要梯度的
+  parameter,被 FSDP 转 bf16),引擎 harness 态持 ckpt-fp32 原值;fp32→bf16 往返 rel_err =
+  **1.55e-3 / 1.83e-3 / 1.77e-3 / 1.55e-3**(层 0–3,safetensors 直读)。sink 进 softmax 分母,
+  这 ~0.16–0.19% 的**值差**就藏在 eps_core 里 → 生产里开局同步会把它抹平(上篇 §7.2 的降级机制,
+  这反而是"生产地板 < harness 地板"的一项)。**判读:attn core 的纯核差 ≲ 0.002**。
+
+### 4.5 合成为"生产相关性地板表"
+
+| 子段 | harness 地板 | 生产态(已同步)估计 | 性质 |
+|---|---|---|---|
+| MoE router | **0**(§4.3-1) | 0 | 已对齐(fp32 bias 修复) |
+| attn q 投影 | <1e-4 | <1e-4 | 基本无差 |
+| attn core | 0.0024–0.0038 | **~0.002**(去掉 sink 值差) | 核差(mask/metadata/scale 参数待对齐,§7A′) |
+| attn 尾(inverse-rope+o_proj) | **~0.0045** | ~0.0045 | **核差,attn 侧最大项** |
+| MoE GEMM/combine | 0.0034–0.0045 | 同 | 核差,全局最大单一项 |
+| norm/head | 0.0062 / 0.0064(累积) | 同量级 | 上面各项的传播 |
+
+→ ~~"压 σn 0.24→0.15 = 压三块均匀核差"~~(**此判断被 §3.1/§4.7 修正**:probs 空间下 pearson 由
+~1% 高置信翻转 token 主导、微基准又证明 o_proj 形态无罪 → 三块核差是并行布局级的结构差,不可单点消除);
+离散/参数级的仗确实打完了(§4.3-1 路由零残差;sink/hc 生产态由同步抹平)。
+
+### 4.6 归因的代码级收口(13:2x,静态读码)
+
+把 §4.4/4.5 的三块核差落到**具体哪个算子不同**(训练侧读 `FSDPTurbo`,引擎侧读
+`vllm-ascend-v41-private/vllm_ascend/attention/dsa_v41.py`):
+
+1. **attn 尾 ≈ o_proj,不是 rope**:q 侧两侧都做了 rope 而 eps_q<1e-4 → rope 公式/数值表两侧
+   实现基本同值。**o_proj 不同**:`model.py:911–915` 训练侧是"inverse `apply_rotary_emb` +
+   block-diag `wo_a` 的 **einsum**(注释:ckpt fp8 已 dequant 成 bf16)";引擎是
+   `inplace_partial_rotary_mul(-sin, interleave)` CANN op + `_forward_o_proj`。
+   einsum(分组小 GEMM)vs 融合 matmul 的 **累加序**差 = 那个 ~0.0045 尾巴的最可能来源。
+2. **MoE GEMM 地板 0.0034–0.0045 不是 GEMM 本身不同**:训练侧 `experts.py:183/200` 用的就是
+   **`torch_npu.npu_grouped_matmul`**(`ops/npu/grouped_matmul.py:32`),与 Ascend 融合 MoE 同族;
+   差在 **combine/加权求和的顺序与累加 dtype**(引擎 mc2 融合 dispatch→gemm→combine;
+   训练侧 grouped matmul 后再按 topk 权重 fp32 求和)。
+3. **core ≈0.002**:SparseFlashMla 的元数据/掩码模式(`topk_value_mode=1/ori_mask_mode=4`)两侧
+   同一族 op,残差主要是 kv 侧 rope(interleave in-place vs complex mul)+ PA 元数据分块;
+   harness 里还叠着 sink 值不对称(生产无,§4.4)。
+
+**含义:0.999 没有"改一行"的参数级路;三个可选攻势(按性价比)**:
+- ~~**C(fulldet A/B)**:引擎换 batch-invariant 内核~~ **已证伪关闭**(§5.5:脚本 252/261 行
+  默认就开着 `rl_config.enable_batch_invariant=true`,基线 0.995 就是它的结果;增量只是训练侧
+  复现标志,不动核差;这次还在 wake_up 处 NPU OOM)。
+- **TIS/IS 消化(推荐主路)**:`algorithm.rollout_correction`(`rollout_is: token` +
+  `rollout_is_threshold: 2.0` = 截断重要性采样;或 `decoupled_seq_is` 预设)。它不动内核,
+  把 0.995 的训推差以重要性权重形式**正确计入 PG loss**——RL 语义上这才是终点;pearson 本身
+  不会变,但"差距对训练的影响"归零。(注意默认配置下该差不进 ratio:old_logprobs 是训练侧重算的。)
+- ~~**深对齐**:训练侧 o_proj 换引擎的 CANN matmul 调用式、MoE combine 换融合通道、kv-rope 换
+  interleave~~ **已被 §4.7 微基准提前证伪**(o_proj 两种调用式 99.98% 逐位一致——"换皮"收益为零;
+  真差在 TP 切分+HCCL reduce 结构,不是 op 形态)。要统一只剩"引擎放弃 attention 头切分"一条,
+  代价是 rollout 吞吐,不建议。
+
+### 4.7 o_proj/rope 调用形态微基准:**einsum-vs-matmul 被证伪,尾巴归因修正为"并行结构差"**(14:36,NPU×1)
+
+新工具 `oproj_rope_parity_microbench.py`(单 NPU、无分布式;真实 ckpt `wo_a (8192,4096)` bf16 +
+真实记录的层 0 core 输出 + 合成对照;两种布局都测)。结果:
+
+```
+[T2] o_proj grouped GEMM: einsum("sgd,grd->sgr") vs npu_transpose_batchmatmul(perm=(1,0,2),(0,1,2),(1,0,2))
+  recorded 输入: bit-exact 99.98%,rel_err 3.3e-5;两者到 fp32 参考的距离相同(1.659e-3)
+  synthetic 输入: bit-exact 99.99%,rel_err 2.7e-5
+[T1] inverse rope: op 不可用('_C_ascend' 未注册——bench 里 import vllm_ascend 不足以加载 C++ 扩展;
+     见"错误"段)
+```
+
+**这张表如何读**:行 = 两种 o_proj 调用形态在**同一输入**上的输出对比;`bit-exact %` 是逐位相同元素占比;
+`到 fp32 参考距离相同`意味着 einsum 与 transpose_batchmatmul **不是"谁更糙"的关系,而是同一个 kernel 的两种皮**
+(误差都只是 bf16 输出舍入)。
+
+**推论(修正 §4.5/§4.6-1)**:attn 尾的 ~0.0045 **不来自调用形态**(3e-5 可忽略)。真正候选是
+**并行结构差**:引擎 attention 按头切到 8 rank(每 rank 8 头),每 rank 只算自己 group 的
+partial o_proj,模块输出还要经过 **HCCL all-reduce 求和**——训练侧是 64 头本地一次 einsum,
+**没有这次 reduce**。8 份 bf16 partial 的求和顺序/舍入 vs 一次全量 einsum,量级正是 ~1 ULP×√8≈0.4%。
+`dsa_v1.py:1559` 注释也印证引擎把 wo_a 重排成 [groups, hidden, rank] 的 A3 布局配合这个切分。
+**→ 尾巴属于"两套栈的并行布局"层,不能靠换 op 皮消除;核差三块全部升级为"结构性"**。
+结合 §3.1(pearson 由 1% 高置信 token 主导、翻转对扰动呈阈值响应),现实的杠杆排序变成:
+
+1. **TIS(rollout_correction)**:不碰核差,把翻转 token 的后果以 IS 权重计入 PG——正在跑(§5.8)。
+2. 引擎侧把 attention 从"TP 头切+all-reduce"换成与训练侧同形的本地全头计算(改引擎,EP8 布局下 = 放弃
+   attention 的 TP,rollout 吞吐代价,工程量大)——不建议。
+3. 40 层复跑时按"结构差"预期基线,把验收指标定在 TIS 生效上而非 pearson 阈值。
+
+**错误与修复**:T1 失败因 `torch.ops._C_ascend` 需要引擎完整启动流程才注册(bench 只 import 到插件注册层,
+`vllm_ascend/__init__` 走的是 platform plugin,不加载 `_C` so)。T2 已足以否定"形态差"假设,T1 未再补;
+若将来要测,加载方式为 `import vllm_ascend._ops`(或从 `torch.ops._C_ascend` 改用
+`vllm_ascend.utils` 里的 helper)——留给 §7 记录,不在关键路径上。
 
 ---
 
@@ -238,7 +398,93 @@ SYNC-PROFILE sender: 670 tensors, 16.37 GiB, 30 buckets | export 0.1–0.9s, flu
 drop-5% → 0.99929/0.99937 vs 0.99934)——**同步通道不改变噪声结构**,fast 通道完全可用于一致性验证。
 (顺带:两次运行的 pearson 步间波动 ±0.001,量级 ~噪声,后续 A/B 判读时把它当底线。)
 
-### 5.5 重跑中踩到/修掉的两个 harness 问题
+### 5.5 fulldet A/B(2026-09-23 13:2x 启动,与 fast-sync 唯一差异 = `full_determinism=True`)
+
+```bash
+LOCAL_EXPERT_EXPORT=1 STEPS=2 EXPERIMENT_NAME=GRPO-DSV41-real4-fulldet \
+VERL_DSV41_DUMP_BATCH=/tmp/dsv41_batch_real4_fulldet \
+bash scripts/dsv41_consistency/sh/run_real4_grpo.sh \
+  actor_rollout_ref.rollout.full_determinism=True
+```
+
+(`run_real4_grpo.sh` 为此加了一处透传:`"$@"` 追加到 examples 脚本调用——见 §6。)
+预期:`main_ppo.py:47-50` 会向全 actor 广播 `VERL_FULL_DETERMINISM=1 + VLLM_BATCH_INVARIANT=1`
++ 固定 `PYTHONHASHSEED`;判据 = 与 §5.4 对照 pearson / diff std(离线 dump 分解)是否改善。
+
+**结果(14:03):失败于引擎 wake_up 的 NPU OOM,且该杠杆判定为死路,不再重试。** 三层信息:
+
+1. **直接死因**:step1 完成、开局同步正常(`SYNC-PROFILE step2 (receive+load) 12.8s`)后,
+   下一次 rollout 前的 sleep/wake 循环里 C++ terminate:
+   `aclrtMallocPhysical failed ... 207001(OOM)` @ `vllm-ascend-v41-private/csrc/camem_allocator.cpp:67`
+   → Executor 崩 → `wake_up cancelled` → 任务退出。fulldet 在 vLLMHttpServer 里额外打开的
+   确定性路径(`enable_full_determinism`:HCCL_DETERMINISTIC、`VERL_DISABLE_FLASH_ATTN_CE` 等,
+   `workers/engine/utils.py:31-51`)带来常驻 workspace,`gpu_memory_utilization=0.6` 的预算装不下。
+2. **为什么这是死路(关键发现)**:启动脚本 `run_deepseek_v41_grpo_fsdp_turbo_npu.sh:252/261`
+   **默认就传了** `rl_config.enabled=true + rl_config.enable_batch_invariant=true` ——
+   引擎侧 batch-invariant **早就开着**,§5.4 的 0.9942/0.9955 基线就是它的结果。
+   `full_determinism` 的增量只剩训练侧可复现性标志(降 CE kernel、NCCL ring 之类),
+   它不改变"两套栈的 dense kernel 不同"这件事 → **就算不 OOM,也几乎不会动 pearson**。
+   残余核差(einsum-vs-融合matmul、grouped-matmul-vs-mc2-combine)不是开关能对齐的。
+3. 处置:杠杆 C 关闭;fulldet 若将来为"复现性"再开,需同时降 `ROLLOUT_GPU_MEM_UTIL`(0.6→0.5)
+   再试。**主路转为 D(rollout_correction/TIS)**;A′ 微基准仅保留"钉死归因"的记录价值。
+   失败现场的 ray 残骸已清理(`pkill -9 -f "ray::|raylet|gcs_server"`,14:08,NPU/host 已释放)。
+
+### 5.8 TIS A/B(2026-09-23 14:38 启动,结果待回填)
+
+```bash
+LOCAL_EXPERT_EXPORT=1 STEPS=2 EXPERIMENT_NAME=GRPO-DSV41-real4-tis \
+VERL_DSV41_DUMP_BATCH=/tmp/dsv41_batch_real4_tis \
+bash scripts/dsv41_consistency/sh/run_real4_grpo.sh \
+  algorithm.rollout_correction.rollout_is=token \
+  algorithm.rollout_correction.rollout_is_threshold=2.0
+```
+
+配置树里 `algorithm@algorithm.rollout_correction` 已默认存在(此前 `rollout_is: null` = 关闭);
+本次打开 token 级 TIS。实现链路(读码确认,微观依据):`ray_trainer.py:1574/1655-1658`
+(fit 中计算 IS 权重并加入 batch)→ `rollout_corr_helper.py:522 compute_rollout_correction_weights`
+(权重 + `rollout_is_*` 指标)→ `workers/utils/losses.py:87-111` 把 `rollout_is_weights` 传进
+policy loss → `core_algos.py:931-933` 以 ρ̄² 缩放 W(最小化截断 IS 的 MSE 修正)。
+
+**判据**:
+- 新指标出现且合理:`rollout_is_mean`(≈1)、`rollout_is_max/min`、
+  `rollout_is_ratio_fraction_high`(超阈 token 占比,参照 §3.1 应在 1–5% 量级)、`rollout_is_oob_ratio`;
+- 对照:pearson/diff_mean 应与 §5.4 **基本不变**(TIS 不改前向,只改 loss 加权)——它同时是本
+  A/B 的"没有误伤前向"检查;
+- dsv41 recipe 首次走 `bypass_mode=False`(Decoupled,3 policies)+ vanilla GRPO:跑通即集成验证成功。
+**结果(15:05 跑完,exit 0):三条判据全过,TIS 在 dsv41 recipe 上宣布可用。**
+
+| 指标(行=指标;列=含义+读数) | step1 | step2 | 怎么读 |
+|---|---|---|---|
+| `rollout_is_mean` | 0.9919 | 0.9977 | IS 权重均值 ≈1 → 权重整体中性,没有系统性放大/压扁 |
+| `rollout_is_max` | **2.0** | **2.0** | 恰等于 threshold → **截断在发生**(TIS 的"truncated"生效) |
+| `rollout_is_min` | 0.110 | **0.033** | 另一侧被压到 1/30 —— 翻转 token 被大幅降权,正是 §3.1 那批高置信分歧 token |
+| `rollout_is_ratio_fraction_high` | **0.68%** | **0.93%** | 超阈 token 占比 —— **与 §3.1 独立测得的"worst ~1% 高 p token 决定 pearson"数量级互证**:两条不同的路(dump 离线分解 vs 训练在线统计)指向同一批 token |
+| `training/rollout_actor_probs_pearson_corr` | 0.9946 | 0.9929 | 与 §5.4 基线同带(**预期不变**:TIS 不改前向),证明"没误伤" |
+| `timing_s/step` | 178.5 | 113.9 | fast-sync 收益保持;TIS 计算本身零成本(在已有张量上逐元素) |
+| `actor/pg_clipfrac` / `pg_loss` | 0 / 0 | 0 / 0 | ⚠️ 仍是 reward 全 −1 → advantage 0 的数据退化,**IS 权重对梯度端的实际影响还没被这次 A/B 检验**——权重链路正确性以 `rollout_is_*` 指标 + `core_algos.py:931-933` 读码为证;要检验训练效果需要让 reward 有方差(更长 response/更好数据或真实模型) |
+
+配置生效证据:日志中 resolved config `algorithm.rollout_correction.rollout_is: 'token'`、
+`rollout_is_threshold: 2.0`(其余与 §5.5 fast-sync 跑完全一致);集成路径
+`ray_trainer.py:1655-1658 → rollout_corr_helper.py:522 → losses.py:87-111 → core_algos.py:931-933`
+首次在此 recipe 上走通(Decoupled,3 policies,`bypass_mode=False`)。
+日志:`logs/DeepSeek-V4.1-Flash-4layer-real-20260923_143811.log`;dump:
+`/tmp/dsv41_batch_real4_tis/batch_step{0,1}.pt`。
+
+**dump 侧交叉验证(15:1x,CPU)**:`ratio = exp(old_log_probs − rollout_log_probs)` 在 mask 上统计:
+
+```
+step0: frac(ratio>2.0) = 0.68%   max 6.53  min 0.110   frac(ratio<0.5) = 2.12%
+step1: frac(ratio>2.0) = 0.93%   max 3.25  min 0.033   frac(ratio<0.5) = 1.83%
+```
+
+与训练进程内指标(`rollout_is_ratio_fraction_high 0.68%/0.93%`、`rollout_is_min 0.110/0.033`)
+**逐位吻合** → IS 权重链路端到端数值一致,`rollout_is_*` 不是装饰性指标。
+**错误记录(自查)**:第一版验证脚本把 ratio 写成了 `exp(a)/mask`(量纲都不对,得到 95.68% 的荒谬值)——
+提醒:mask 用于选取元素(`tensor[mask]`),不参与除法;改对后秒级吻合。另注意 ratio<0.5 的低侧占比(≈2%)
+比高侧大 2-3 倍:**翻转主要把训练侧概率压低**(高置信 token 两侧 argmax 分歧 → actor 给低概率),
+这与 §3.1 "坏 token 是高 p token" 一致。
+
+### 5.6 重跑中踩到/修掉的两个 harness 问题
 
 **E1(真 bug):`install_attention_op_hooks` 的跨样本陈旧闭包。**
 修复回归的 smoke 日志打印 `len=64 … stages=57` 而 `len=200 … stages=37`——差 20 = 4 层×5 个
@@ -270,31 +516,43 @@ len64 文件干净、len200 文件缺项)。
 |---|---|---|
 | `scripts/dsv41_consistency/analyze_moe_floor_offline.py` | **新增**:钉输入地板的子段离线分解(router/MoE/attn/head),纯 CPU,读现有 dump | §4 的问题不用重新占 NPU 就能答;可复用于 40 层复跑 |
 | `scripts/dsv41_consistency/sh/run_real4_grpo.sh` | 注释更新:fast-sync 已在真实 384 专家权重两次验证(09:38/§5.4),real4 迭代默认用 `LOCAL_EXPERT_EXPORT=1` | 防止下一个跑再吃 1032s 同步 |
-| `scripts/dsv41_consistency/dump_trainer_stages.py:339` | **修 bug**(§5.5 E1):attn-op hook 每样本重绑定 sink,不再被 `_dump_wrapped` 早退守卫钉死在第一个样本 | 否则除首个样本外所有 dump 都没有 attn 子段 |
-| `scripts/dsv41_consistency/probe_module_inputs.py:364+` | **加能力**(§5.5 E2):变体循环装 `install_attention_op_hooks`,attn 内部量随 probe dump 落盘 | 0.005 attn 地板的下钻测量(§7A) |
+| `scripts/dsv41_consistency/dump_trainer_stages.py:339` | **修 bug**(§5.6 E1):attn-op hook 每样本重绑定 sink,不再被 `_dump_wrapped` 早退守卫钉死在第一个样本 | 否则除首个样本外所有 dump 都没有 attn 子段 |
+| `scripts/dsv41_consistency/probe_module_inputs.py:364+` | **加能力**(§5.6 E2):变体循环装 `install_attention_op_hooks`,attn 内部量随 probe dump 落盘 | 0.005 attn 地板的下钻测量(§4.4,已完成) |
+| `scripts/dsv41_consistency/analyze_attn_floor_offline.py` | **新增**:attn 地板子段离线分解(q vs core vs 尾;头映射实测 contig;sink 校验) | §4.4 的产出工具 |
+| `scripts/dsv41_consistency/sh/run_real4_grpo.sh` | 追加 `"$@"` 透传 hydra 覆盖项 | §5.5/§5.8 的开关 A/B 不用改脚本 |
+| `scripts/dsv41_consistency/oproj_rope_parity_microbench.py` | **新增**:注意力尾两段的调用形态逐位对比(单 NPU) | §4.7 的证伪实验——把"换 op 皮能对齐"的假设提前杀死,避免动生产代码 |
 
-(未改动任何训练/引擎**生产**代码路径——本轮两个问题一个是环境开关,一个是测量分析;改动全部在
-`scripts/dsv41_consistency/` 的 harness 内。)
+新数据产物:`dump/probe_input_real4_fix_attn/`(带 attn_op 的 8 份 dump + 2 份 report;
+`in_all` 与旧目录 logprob **逐位一致**,旧目录未动)、`trainer_real4_fix/`(重录,两长度都 57 stages)、
+`/tmp/attn_floor_real4_fix.txt`、`/tmp/dsv41_batch_real4_fast/`。
+(未改动任何训练/引擎**生产**代码路径——改动全部在 `scripts/dsv41_consistency/` 的 harness 内。)
 
 ---
 
-## 7. 下一步(按性价比)
+## 7. 状态板与下一步(13:3x 更新)
 
-- **A. attn 地板的内部分解**(占 NPU ~25 min):给探针加 attn 子段 hook(qkv/rope/core/o_proj;引擎侧
-  `multistream_preprocess/_attention/forward` 已有键),把 0.005 的地板落到具体算子 → 才谈得上"改哪个核"。
-  同理 MoE 侧想区分 grouped-GEMM 的 tile/split-k 序,可尝试在训练侧把 expert GEMM 换成参考实现
-  (fp32 累加路径)做一次 A/B。
-- **B. "已同步生产态"对照(上篇 §6.2 遗留,可离线半步)**:修复后两侧仅差 hc_*/attn_sink 这 28 个
-  ckpt-fp32 参数在生产的开局同步中被降级成 bf16 值。可先**离线**评估其量级:在钉输入对比里把训练侧
-  `hc_pre/hc_post` 相关张量与引擎值(`hc_pre@layer{i}[j]` 已 dump)逐点比 —— 引擎在生产态=bf16 舍入值,
-  与 harness 态(ckpt fp32)的差即该项贡献,不需要重跑。若占比可忽略,遗留项直接关闭。
-- **C. 现成杠杆 A/B(便宜)**:`actor_rollout_ref.rollout.full_determinism=True`(main_ppo.py:47-50 →
-  `VERL_FULL_DETERMINISM=1 + VLLM_BATCH_INVARIANT=1`,vllm-ascend 有 batch-invariant 内核),
-  各 2 step 看 σn 是否下降;这是唯一"不改代码就可能压核差"的开关。
-- **D. RL 之外的正解**:`algorithm.rollout_correction`(TIS)已存在于配置树
-  (`rollout_correction: {'bypass_mode': False...}`,log 522 行)——若 A/C 到不了 0.999,
-  一致性差距用重要性修正消化,而不是继续追内核。
-- **E. 40 层复跑**(上篇计划方向 3)不变。
+- **A attn 子段分解:完成,且尾归因已被微基准改写**(§4.4→§4.7)——地板:core≈0.002、尾≈0.0045,
+  但 §4.7 证明尾**不是** einsum-vs-matmul 形态差(99.98% 逐位一致),而是引擎"TP 头切+HCCL all-reduce
+  求和"vs 训练侧"本地全头一次 einsum"的**并行结构差**;q 侧 <1e-4,rope 无罪。
+- **A′(可选,NPU 5–10 min)rope/o_proj 微基准钉死归因**:同一 NPU 上对同一 bf16 张量分别跑
+  训练侧 `apply_rotary_emb(·, inverse=True)`+einsum(wo_a) vs 引擎
+  `inplace_partial_rotary_mul(-sin)`+`_forward_o_proj`,逐位比。预期:rope 差 ~0(与 eps_q 一致)、
+  einsum-vs-matmul 差 ~1 ULP。它不改变行动(三块核差都已定位),只是把 §4.6-1 从"最可能"变成"实测"。
+- **B sink/hc 值不对称:离线完成一半**(§4.4:sink fp32→bf16 rel 1.55–1.83e-3/层,生产被同步抹平)。
+  另一半(精确扣除 sink 后的 harness core 值)需要 emulated-sync 引擎 dump(40–70 min),
+  优先级降低——只影响 harness 数字的解释,不影响生产。
+- **C fulldet A/B:已关闭**(§5.5——引擎 batch-invariant 本来就是脚本默认开,该开关无增量;
+  这次还以 OOM 收场。0.995 的残余**没有现成开关**能压)。
+- **D TIS(rollout_correction)**:**已实施并验证**(§5.8,token 级 threshold=2.0,三判据全过;
+  遗留 F=梯度端效果待有方差的 reward)。
+- **F(新)让 reward 有方差,验证 TIS 的训练端效果**:三个便宜选项——① `MAX_RESPONSE_LEN=512`
+  让模型有机会不撞长度截断(现在是 clip_ratio 1.0 → 全员 −1);② 换 `TRAIN_FILE` 里更短/更易的样本;
+  ③ 用 scaled fixture 造一个"答案在词表里"的合成任务。判据:`actor/pg_clipfrac>0`、
+  `rollout_is_mean≠1.0` 且 pg_loss 非零、开/关 TIS 两跑的 advantage-weighted gradient 差异可测。
+- **E 40 层复跑**:前置检查见上篇 §7.3;建议带上 `LOCAL_EXPERT_EXPORT=1`(§5.4)+ D 的 correction 一起排期。
+
+(原始候选清单存档如下,已被上面取代:
+A=attn 内部分解→已完成;B=同步态对照→离线半完成;C=full_determinism→在跑;D=TIS→升为主路;E=40 层→不变。)
 
 ---
 
@@ -314,6 +572,9 @@ EOF
 # §4 地板子段分解(CPU ~1 min,~7 GB host)
 python3 scripts/dsv41_consistency/analyze_moe_floor_offline.py --length 200 --variant in_all
 python3 scripts/dsv41_consistency/analyze_moe_floor_offline.py --length 64  --variant in_all
+
+# §4.4 attn 子段分解(读 probe_input_real4_fix_attn/,CPU ~1 min)
+python3 scripts/dsv41_consistency/analyze_attn_floor_offline.py --length 200
 
 # §5 fast-sync 重跑
 LOCAL_EXPERT_EXPORT=1 STEPS=2 bash scripts/dsv41_consistency/sh/run_real4_grpo.sh
