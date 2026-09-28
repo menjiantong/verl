@@ -96,10 +96,11 @@ case "${DEVICE}" in
     gpu)
         ;;
     npu)
-        # vllm-ascend's patches branch on this env var (see scripts/run_vllm2.sh): the
-        # v41-private branch is written against the 0.27.1 API surface, and the installed
-        # dev build (0.28.1rc1.dev...) is not a parseable version for their version check.
-        export VLLM_VERSION=${VLLM_VERSION:-0.27.1}
+        # vllm-ascend's `vllm_version_is()` branches read this env var first, then fall
+        # back to `vllm.__version__`. Value follows the installed engine pairing:
+        #   * vllm-ascend main + vLLM v0.30.0 (current)          -> 0.30.0
+        #   * the old `sp_feature` fork + vLLM v0.27.x (09-27 runs) -> 0.27.1
+        export VLLM_VERSION=${VLLM_VERSION:-0.30.0}
         # EP MoE dispatch/combine (mc2) partitions its comm window from HCCL_BUFFSIZE:
         # too small and the operator tiling fails at vLLM engine warm-up
         # ("HCCL_BUFFSIZE_EP is too SMALL"). Value follows scripts/run_vllm2.sh.
@@ -156,6 +157,17 @@ HOOK_MODULES="['model.layers.{*}']"
 # vLLM engine args that the V4.1 Ascend path needs (see scripts/run_vllm2.sh).
 # Set as individual overrides: hydra cannot parse a JSON blob containing `{}`.
 VLLM_ADDITIONAL_CONFIG_ROOT="+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config"
+
+# additional_config keys that only the legacy vllm-ascend fork accepts (see ROLLOUT below).
+VERL_DSV41_ENGINE_LEGACY=${VERL_DSV41_ENGINE_LEGACY:-0}
+if [ "${VERL_DSV41_ENGINE_LEGACY}" = "1" ]; then
+    ENGINE_LEGACY_OVERRIDES=(
+        "${VLLM_ADDITIONAL_CONFIG_ROOT}.enable_engram=false"
+        "${VLLM_ADDITIONAL_CONFIG_ROOT}.engram_storage=int8"
+    )
+else
+    ENGINE_LEGACY_OVERRIDES=()
+fi
 
 ########################### parameter arrays ###########################
 
@@ -255,8 +267,11 @@ ROLLOUT=(
     # ~32GB, so a large bucket is what tips the card over.
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=512
     "${VLLM_ADDITIONAL_CONFIG_ROOT}.mc2_comm_alg=fullmesh_v2"
-    "${VLLM_ADDITIONAL_CONFIG_ROOT}.enable_engram=false"
-    "${VLLM_ADDITIONAL_CONFIG_ROOT}.engram_storage=int8"
+    # `enable_engram` / `engram_storage` were additional_config keys of the vllm-ascend
+    # `sp_feature` fork (paired with vLLM 0.27.x). The upstream line now validates with
+    # `extra="forbid"` and carries no such keys -- engram lives in the model config there --
+    # so only pass them for the legacy pairing (VERL_DSV41_ENGINE_LEGACY=1).
+    "${ENGINE_LEGACY_OVERRIDES[@]}"
     "${VLLM_ADDITIONAL_CONFIG_ROOT}.ascend_compilation_config.enable_npugraph_ex=false"
     "${VLLM_ADDITIONAL_CONFIG_ROOT}.ascend_compilation_config.enable_static_kernel=false"
     # RL weight updates need weight_nz_mode=0 (FRACTAL_NZ breaks synced-weight precision);
