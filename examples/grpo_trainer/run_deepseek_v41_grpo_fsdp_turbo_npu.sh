@@ -75,6 +75,18 @@ if [ "${LOCAL_EXPERT_EXPORT}" = "1" ] && [ "${GEN_EP}" != "${EP_SIZE}" ]; then
     LOCAL_EXPERT_EXPORT=0
 fi
 export VERL_DSV41_LOCAL_EXPERT_EXPORT=${LOCAL_EXPERT_EXPORT}
+
+# Train-vs-inference consistency A/B (wiki/work_log/pearson_0999/): the engine's batch-invariant
+# kernels below are NOT what the offline harness measured against (the historical `engine_real4`
+# dump was taken with `dump_engine_stages.py`'s default, i.e. batch invariance OFF), yet every
+# production run has had it ON -- and production shows ~2.4x the harness's logprob mismatch.
+# Set VERL_DSV41_ALIGN_NOBI=1 to run the engine with `rl_config.enable_batch_invariant=false`.
+ALIGN_NOBI=${VERL_DSV41_ALIGN_NOBI:-0}
+if [ "${ALIGN_NOBI}" = "1" ]; then
+    BATCH_INVARIANT=false
+else
+    BATCH_INVARIANT=true
+fi
 ########################### end user-adjustable ###########################
 
 ########################### derived defaults ###########################
@@ -258,7 +270,7 @@ ROLLOUT=(
     # `enable_training_consistency` additionally switches to the FA3 backend, which only
     # supports non-MLA/non-SFA attention, so it stays off for V4.1 (its MLA + sparse
     # attention must keep the plugin backend).
-    "${VLLM_ADDITIONAL_CONFIG_ROOT}.rl_config.enable_batch_invariant=true"
+    "${VLLM_ADDITIONAL_CONFIG_ROOT}.rl_config.enable_batch_invariant=${BATCH_INVARIANT}"
 )
 
 TRAINER=(

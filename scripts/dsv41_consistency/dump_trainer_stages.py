@@ -85,6 +85,16 @@ def parse_args():
                         help="Work around the A2/A3 tiling check for window-only layers.")
     parser.add_argument("--fp32-attention", action="store_true",
                         help="Run the eager indexed attention with fp32 scores/probabilities (A/B).")
+    parser.add_argument("--logprob-probe", action="store_true",
+                        help="Compare the trainer's logprob kernel (torch_npu.npu_cross_entropy_loss "
+                             "via verl's logprobs_from_logits) against the engine's formula "
+                             "(`log_softmax` + gather) on identical logits. Any difference enters "
+                             "dlogp undiluted.")
+    parser.add_argument("--padding-probe", default="",
+                        help="Comma-separated left-pad lengths. For each, re-run the same token "
+                             "stream left-padded to (pad + len) with an attention mask -- the layout "
+                             "verl's padded batch path produces -- and log the next-token logprob "
+                             "difference against the unpadded (engine-layout) run. Empty = off.")
     return parser.parse_args()
 
 
@@ -409,6 +419,7 @@ def install_hooks(model, torch, max_elements, stage_sink):
 
 def main():
     args = parse_args()
+    args.padding_probe = [int(x) for x in args.padding_probe.split(",") if x.strip()]
     if not args.model_path:
         raise SystemExit("--model-path (or MODEL_PATH) is required")
     if args.sparse_flash_attn:
@@ -542,6 +553,7 @@ def main():
 
     for sample in samples:
         length = sample["target_len"]
+        real_len = length
         input_ids = torch.tensor([sample["input_ids"]], dtype=torch.long, device=device)
         attention_mask = torch.ones_like(input_ids)
         stage_sink: dict[str, torch.Tensor] = {}
@@ -595,6 +607,91 @@ def main():
                 f"roll_last={rolled_logprobs[-1].item():.4f} logits absmax={payload['logits_absmax']:.2f} "
                 f"stages={len(stage_sink)} ({sizes} ...)")
             log(f"len={length}: wrote {path}")
+        # Logprob-kernel probe (2026-09-27, wiki/work_log/pearson_0999/).
+        # The *last* operation in the comparison is not a model kernel but the logprob formula.
+        # The engine samples with `logits.log_softmax(dim=-1, dtype=torch.float32)`
+        # (vllm/v1/sample/sampler.py `compute_logprobs`). The trainer goes through
+        # `verl/utils/torch_functional.logprobs_from_logits`, and on NPU (no flash-attn) that
+        # dispatches to `logprobs_from_logits_torch_npu` = `torch_npu.npu_cross_entropy_loss`
+        # -- a completely different fused kernel over the 129280-way reduction. Any difference
+        # here enters dlogp *undiluted* (nothing downstream averages it out), unlike the
+        # per-layer kernel differences.
+        if args.logprob_probe:
+            from verl.utils.torch_functional import (
+                logprobs_from_logits,
+                logprobs_from_logits_v2,
+            )
+
+            labels = input_ids[0, 1:]
+            logits_flat = logits[0, :-1].float()
+            trainer_way = logprobs_from_logits(
+                logits=logits_flat.unsqueeze(0), labels=labels.unsqueeze(0)
+            ).squeeze(0)
+            engine_way = torch.log_softmax(logits_flat, dim=-1).gather(
+                -1, labels.unsqueeze(-1)
+            ).squeeze(-1)
+            d = engine_way - trainer_way
+            # also the pure-pytorch fallback path, to separate "cross-entropy kernel" from
+            # "log_softmax variant"
+            fallback_way = logprobs_from_logits_v2(
+                logits_flat.unsqueeze(0), labels.unsqueeze(0)
+            ).squeeze(0)
+            d2 = engine_way - fallback_way
+            if rank == 0:
+                log(
+                    f"LOGPROB-PROBE len={real_len} npu_cross_entropy vs log_softmax: "
+                    f"mean={d.mean():+.5f} std={d.std():.5f} med|d|={d.abs().median():.5f} "
+                    f"max|d|={d.abs().max():.5f} bits_eq={(d == 0).float().mean() * 100:.2f}%"
+                )
+                log(
+                    f"LOGPROB-PROBE len={real_len} v2(torch) vs log_softmax:        "
+                    f"mean={d2.mean():+.5f} std={d2.std():.5f} med|d|={d2.abs().median():.5f} "
+                    f"max|d|={d2.abs().max():.5f} bits_eq={(d2 == 0).float().mean() * 100:.2f}%"
+                )
+            dist.barrier()
+
+        # Padding probe (2026-09-27, wiki/work_log/pearson_0999/).
+        # The engine always sees `prompt + response` with positions 0..N-1 and no padding. The
+        # trainer's padded batch path (agent_loop.py: `padding_side="left"` to
+        # `rollout_config.prompt_length`) hands the model a *left-padded* row, and
+        # `FSDPTurboDSV41EngineWithLMHead.prepare_model_inputs` deliberately drops `position_ids`
+        # ("the V4.1 reference forward indexes its RoPE tables by absolute position"). So the
+        # trainer evaluates the very same tokens at RoPE positions `pad + i` instead of `i`.
+        # This probe measures that effect on its own: run the identical token stream twice, once
+        # unpadded (engine layout) and once left-padded with an attention mask (trainer layout),
+        # and compare the next-token logprobs of the real tokens.
+        for pad in args.padding_probe:
+            real = input_ids.shape[1]
+            padded_ids = torch.cat(
+                [torch.full((1, pad), 0, dtype=torch.long, device=device), input_ids], dim=1
+            )
+            padded_mask = torch.cat(
+                [
+                    torch.zeros(1, pad, dtype=torch.long, device=device),
+                    torch.ones(1, real, dtype=torch.long, device=device),
+                ],
+                dim=1,
+            )
+            for name, buffer in model.named_buffers():
+                if name.endswith("kv_cache"):
+                    buffer.zero_()
+            with torch.no_grad():
+                out_padded = model(input_ids=padded_ids, attention_mask=padded_mask)
+            lp_padded = torch.log_softmax(out_padded.logits.float(), dim=-1)
+            nxt_padded = lp_padded[0, :-1].gather(
+                -1, padded_ids[0, 1:].unsqueeze(-1)
+            ).squeeze(-1)
+            # the real token at padded column `pad + t` is predicted by column `pad + t - 1`
+            b = nxt_padded[pad : pad + real - 1]
+            d = next_logprobs - b
+            if rank == 0:
+                log(
+                    f"PADDING-PROBE len={real} pad={pad} (parity {'even' if pad % 2 == 0 else 'odd'}): "
+                    f"dlogp mean={d.mean():+.4f} std={d.std():.4f} med|d|={d.abs().median():.4f} "
+                    f"p99={d.abs().quantile(0.99):.4f} max={d.abs().max():.4f} "
+                    f"|d|>0.5={(d.abs() > 0.5).float().mean() * 100:.1f}%"
+                )
+            dist.barrier()
         # The ring buffers (window/compress KV) must start clean for the next sample, the way a
         # fresh engine request would.
         for name, buffer in model.named_buffers():
