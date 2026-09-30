@@ -63,6 +63,8 @@ logger = logging.getLogger(__name__)
 _EXPERT_WEIGHT_PATTERN = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w1|w2|w3)\.weight$")
 # The adapter wraps the backbone as ``self.model``, the checkpoint names the backbone.
 _MODEL_PREFIX = "model."
+# Host-offload Engram table suffix (both Engram layers, ``layers.{1,14}.engram.embed``).
+_ENGRAM_EMBED_SUFFIX = ".engram.embed.weight"
 # Fallback sequence length: covers prompt+response of the GRPO config; only sizes the
 # RoPE tables and the per-layer attention scratch caches.
 _DEFAULT_MAX_SEQ_LEN = 8192
@@ -103,6 +105,15 @@ def _checkpoint_weight_map(ckpt_dir: Path) -> dict[str, str]:
     return weight_map
 
 
+def _engram_checkpoint_rows(checkpoint_dir: Path, checkpoint_name: str) -> int:
+    """Row count of an Engram table in the checkpoint, read from the shard header."""
+    from safetensors import safe_open
+
+    shard_file = _checkpoint_weight_map(checkpoint_dir)[checkpoint_name]
+    with safe_open(str(checkpoint_dir / shard_file), framework="pt", device="cpu") as handle:
+        return int(handle.get_slice(checkpoint_name).get_shape()[0])
+
+
 def checkpoint_buffer_meta(module) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     """Shapes/dtypes of the buffers that the checkpoint owns.
 
@@ -123,6 +134,31 @@ def checkpoint_buffer_meta(module) -> dict[str, tuple[tuple[int, ...], torch.dty
         for name, buffer in module.named_buffers()
         if buffer is not None and name not in parameters and name in module.state_dict()
     }
+
+
+def host_offload_engram_tables(module) -> list[tuple[str, object]]:
+    """``(checkpoint tensor name, module)`` for every host-offload Engram table.
+
+    The tables are ``TorchHostOffloadEmbedding`` modules: the weight is a plain CPU
+    parameter (row-sharded over the EP mesh, one separate table per Engram layer), not
+    a DTensor, and it is deliberately kept out of FSDP's managed parameter groups (see
+    ``FSDPTurbo.apply_pre_fsdp_module_hooks``). Two consequences the engine has to
+    handle: DCP must not be asked to materialize it (the loader below fills each
+    rank's rows straight from the checkpoint), and the weight sync must not stream it.
+
+    Names are taken before FSDP-Turbo wraps the model, while the module tree still is
+    the adapter's own (``model.layers.<N>.engram.embed``); the checkpoint spells the
+    same tensor without the adapter's ``model.`` prefix.
+    """
+    tables = []
+    for module_name, submodule in module.named_modules():
+        if not getattr(submodule, "uses_host_offload", False):
+            continue
+        checkpoint_name = (
+            module_name[len(_MODEL_PREFIX) :] if module_name.startswith(_MODEL_PREFIX) else module_name
+        )
+        tables.append((f"{checkpoint_name}.weight", submodule))
+    return tables
 
 
 def place_checkpoint_buffers_for_load(module, buffer_meta, log=None) -> list[str]:
@@ -330,6 +366,14 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
 
         from .utils import split_fused_expert_tensor
 
+        if name.endswith(_ENGRAM_EMBED_SUFFIX):
+            # Host-offload Engram tables: frozen (the rollout engine also keeps them
+            # requires_grad=False) and host-resident. Streaming them would move
+            # 2 x 24.6 GiB per rank *per step* to say what the engine already has from
+            # the same checkpoint. A generated param the engine never receives simply
+            # keeps its loaded value, which is the point.
+            return
+
         if not name.endswith(self._FUSED_EXPERT_SUFFIXES) or not isinstance(param, DTensor) or param.dim() != 3:
             yield from super()._export_param(name, param)
             return
@@ -402,12 +446,17 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
             prepare_deepseek_v41_model_for_fsdp,
         )
 
-        # Engram is a V4.1 structure that neither the text-only bring-up nor the
-        # sparse-attention path uses yet; the checkpoint has no engram tables.
+        # Engram storage: ``host_offload`` is the only backend the current FSDP-Turbo
+        # still implements (``row_sharded`` was dropped in 0769938; passing it now raises
+        # for any model that declares Engram layers -- and the top64 checkpoint does,
+        # layers 1 and 14). The host-offload tables stay in CPU memory and are sharded
+        # over the EP mesh by FSDP-Turbo's ``pre_fsdp_hook``; this engine loads each
+        # rank's row range from the checkpoint afterwards (see
+        # :meth:`_load_host_engram_tables`).
         training_model = build_deepseek_v41_model(
             tokenizer=self.model_config.tokenizer,
             engram_meta_init=True,
-            engram_storage_backend="row_sharded",
+            engram_storage_backend="host_offload",
             use_sparse_flash_attn=False,
             # The routed experts stay on meta until the checkpoint loader
             # materializes each rank's shard.
@@ -430,6 +479,12 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
         # parameters into (nested) DTensors: the loader needs global shapes/dtypes.
         param_meta = {name: (tuple(param.shape), param.dtype) for name, param in module.named_parameters()}
         buffer_meta = checkpoint_buffer_meta(module)
+        # Host-offload Engram tables are handled outside DCP (see
+        # :func:`host_offload_engram_tables`); DCP must not see them, and they are
+        # deliberately absent from ``param_meta`` so it never tries.
+        engram_tables = host_offload_engram_tables(module)
+        for checkpoint_name, _ in engram_tables:
+            param_meta.pop(_MODEL_PREFIX + checkpoint_name, None)
         module = FSDPTurbo(self.fsdp_turbo_config, module).model
 
         offload_policy = None
@@ -439,10 +494,10 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
             offload_policy = True
             self._uses_fsdp2_cpu_offload_policy = True
 
-        self._materialize_dsv41_parameters(module, param_meta, buffer_meta, offload_policy)
+        self._materialize_dsv41_parameters(module, param_meta, buffer_meta, offload_policy, engram_tables)
         return module
 
-    def _materialize_dsv41_parameters(self, module, param_meta, buffer_meta, offload_policy):
+    def _materialize_dsv41_parameters(self, module, param_meta, buffer_meta, offload_policy, engram_tables=()):
         """Load the rollout checkpoint into the sharded model (rank 0 reads, everyone
         receives) and finish the device placement the meta construction skipped."""
         from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
@@ -512,11 +567,101 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
 
         refresh_dsv41_expert_metadata(module, device)
 
+        self._load_host_engram_tables(engram_tables, checkpoint_dir)
+
         still_meta = [name for name, parameter in module.named_parameters() if parameter.is_meta]
         if still_meta:
             raise RuntimeError(
                 "DeepSeek-V4.1 parameters were left on the meta device, e.g. {}. "
                 "Check that the checkpoint covers every parameter.".format(still_meta[:5])
+            )
+
+    def _load_host_engram_tables(self, engram_tables, checkpoint_dir: Path) -> None:
+        """Fill each rank's host-offload Engram rows from the checkpoint, then freeze.
+
+        The tables are EP row-sharded host tensors, so unlike the DCP-loaded parameters
+        every rank reads *its own* row range straight out of the checkpoint shards: a
+        ``safe_open`` slice read, never the whole 196 GB tensor. Rows past
+        ``logical_num_embeddings`` are alignment padding the hash never addresses; they
+        keep their initial values, the same way the engine's table leaves its padding.
+
+        The tables are then frozen (``requires_grad=False`` + no autograd hookup). This
+        matches the rollout engine, which builds its Engram parameters with
+        ``requires_grad=False`` and loads them from this same checkpoint, so actor and
+        engine stay identical without ever streaming ~393 GB per weight sync -- and no
+        AdamW state for two 24.6 GB tables per rank is ever allocated. Detaching
+        ``_grad_keepalive`` also keeps ``_TorchHostFetch`` from recording a backward, so
+        no sparse Engram gradients pile up in host memory between steps.
+        """
+        if not engram_tables:
+            return
+        from safetensors import safe_open
+
+        weight_map = _checkpoint_weight_map(checkpoint_dir)
+        handles: dict[str, object] = {}
+        started = time.time()
+        layout: list[tuple[str, int, int]] = []
+        total_bytes = 0
+        for checkpoint_name, table in engram_tables:
+            if table.weight.is_meta or table.mesh is None:
+                raise RuntimeError(
+                    f"Engram table {checkpoint_name} was not EP-sharded by FSDP-Turbo before the load "
+                    "(shard_() runs in pre_fsdp_hook); cannot read it back."
+                )
+            start = table.row_start
+            end = min(start + table.local_rows, table.logical_num_embeddings)
+            if checkpoint_name not in weight_map:
+                raise ValueError(f"Checkpoint {checkpoint_dir} has no tensor named {checkpoint_name!r}.")
+            shard_file = weight_map[checkpoint_name]
+            if shard_file not in handles:
+                handles[shard_file] = safe_open(str(checkpoint_dir / shard_file), framework="pt", device="cpu")
+            rows = handles[shard_file].get_slice(checkpoint_name)[start:end]
+            with torch.no_grad():
+                # ``rows`` are checkpoint rows [start, end); they land at the front of the
+                # owner-local table, whose row 0 is exactly global row ``row_start``.
+                table.weight[: end - start].copy_(rows)
+                if not torch.equal(table.weight[0], rows[0]):
+                    raise RuntimeError(f"Engram table {checkpoint_name}: checkpoint rows landed shifted.")
+            layout.append((checkpoint_name, start, end))
+            total_bytes += (end - start) * table.embedding_dim * table.weight.element_size()
+            print(
+                f"[fsdp_turbo_dsv41] engram {checkpoint_name}: checkpoint rows [{start}, {end}) "
+                f"-> local rows [0, {end - start}) of {table.local_rows} "
+                f"({table.local_rows - (end - start)} padding rows left as initialized); "
+                f"logical {table.logical_num_embeddings}",
+                flush=True,
+            )
+            table.weight.requires_grad_(False)
+            table._grad_keepalive = torch.zeros((), dtype=torch.float32, device=table._grad_keepalive.device)
+        del handles
+
+        # Every rank must own a disjoint slice of the checkpoint's row space, and together
+        # they must cover it: a gap silently zeroes a row range for *every* lookup, and an
+        # overlap feeds different values to trainer and engine for the same hash id.
+        gathered = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, [(name, start, end) for name, start, end in layout])
+        if dist.get_rank() == 0:
+            by_name: dict[str, list[tuple[int, int]]] = {}
+            for rank_layout in gathered:
+                for name, start, end in rank_layout:
+                    by_name.setdefault(name, []).append((start, end))
+            for name, pieces in by_name.items():
+                pieces.sort()
+                expected = 0
+                for start, end in pieces:
+                    if start != expected:
+                        raise RuntimeError(f"Engram table {name}: rows are not tiled across ranks at {start}.")
+                    expected = end
+                checkpoint_rows = _engram_checkpoint_rows(checkpoint_dir, name)
+                if expected != checkpoint_rows:
+                    raise RuntimeError(
+                        f"Engram table {name}: ranks cover {expected} rows, the checkpoint has {checkpoint_rows}."
+                    )
+            _log_rank0(
+                "host-offload Engram tables loaded: %d table(s), %.1f GiB per rank in %.1fs (frozen)",
+                len(engram_tables),
+                total_bytes / 1024**3,
+                time.time() - started,
             )
 
     def _dsv41_model_path(self) -> str:
