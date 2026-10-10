@@ -50,6 +50,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 
 from verl.utils.device import get_device_id
 
@@ -65,6 +66,16 @@ _EXPERT_WEIGHT_PATTERN = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w1|w
 _MODEL_PREFIX = "model."
 # Host-offload Engram table suffix (both Engram layers, ``layers.{1,14}.engram.embed``).
 _ENGRAM_EMBED_SUFFIX = ".engram.embed.weight"
+# Fused (stacked) routed-expert parameters: the checkpoint stores one tensor per expert
+# (``layers.N.ffn.experts.E.w1/w2/w3.weight``) and the model packs them per layer --
+# ``gate_up_proj`` dim 1 is ``[w1 ; w3]``, ``down_proj`` is ``w2`` -- the same fused
+# layout vLLM's loader uses (see read_dsv41_checkpoint_state_dict, which builds it by
+# hand). The direct shard loader assembles only the window each rank owns.
+_FUSED_EXPERT_LAYER_PATTERN = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(gate_up_proj|down_proj)$")
+_FUSED_EXPERT_PARTS = {
+    "gate_up_proj": (("w1",), ("w3",)),
+    "down_proj": (("w2",),),
+}
 # Fallback sequence length: covers prompt+response of the GRPO config; only sizes the
 # RoPE tables and the per-layer attention scratch caches.
 _DEFAULT_MAX_SEQ_LEN = 8192
@@ -159,6 +170,465 @@ def host_offload_engram_tables(module) -> list[tuple[str, object]]:
         )
         tables.append((f"{checkpoint_name}.weight", submodule))
     return tables
+
+
+def _is_host_engram_param(name: str, param) -> bool:
+    """Whether an exported parameter is one of the host-offload Engram tables.
+
+    The name alone is not enough: ``TorchHostOffloadEmbedding._save_to_state_dict`` rewrites the
+    key to ``<module>.weight`` + ``_checkpoint_suffix()``, i.e. ``...engram.embed.weight`` +
+    ``.ep_shard_00006_of_00008``, so a test on the *end* of the name never fires and the table
+    is exported anyway -- which is what killed the first weight sync of the top32/top64 runs
+    (a 22.9 GiB host tensor handed to a device-IPC path, see
+    wiki/worklog_dsv41_top64_grpo.md §5.7.4). Prefer the marker FSDPTurbo itself puts on the
+    parameter (``_engram_host_offload``, the same attribute its optimizer uses to skip the
+    tables) and keep a substring test as the backstop for a view that lost the attribute.
+    """
+    return bool(getattr(param, "_engram_host_offload", False)) or _ENGRAM_EMBED_SUFFIX in name
+
+
+def _assemble_fused_expert_window(local_shape, offset, part_groups, part_rows, read_slice, dtype):
+    """One rank's window of a fused expert tensor, built from per-expert checkpoint slices.
+
+    Fused layout (identical to :func:`read_dsv41_checkpoint_state_dict` and vLLM's
+    loader): dim 0 enumerates experts, so a dim-0 window is a plain range of expert ids;
+    dim 1 concatenates the ``part_groups`` -- ``(("w1",), ("w3",))`` for gate_up_proj
+    (w1 then w3, each ``part_rows[kind]`` rows), a single ``(("w2",),)`` for down_proj.
+    ``read_slice(kind, expert_id, rows, cols)`` reads one source window. Windows may
+    span the w1/w3 boundary or a subset of both; each expert's slab is assembled in the
+    fused order and stacked along dim 0.
+    """
+    win1_lo, win1_hi = offset[1], offset[1] + local_shape[1]
+    win2_lo, win2_hi = offset[2], offset[2] + local_shape[2]
+    blocks = []
+    for expert_id in range(offset[0], offset[0] + local_shape[0]):
+        pieces = []
+        cursor = 0
+        for group in part_groups:
+            kind = group[0]
+            span = part_rows[kind]
+            lo, hi = max(win1_lo, cursor), min(win1_hi, cursor + span)
+            if hi > lo:
+                pieces.append(
+                    read_slice(kind, expert_id, slice(lo - cursor, hi - cursor), slice(win2_lo, win2_hi))
+                )
+            cursor += span
+        if not pieces:
+            raise RuntimeError("fused expert window intersects no source rows")
+        slab = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+        blocks.append(slab)
+    if not blocks:
+        return torch.empty(local_shape, dtype=dtype)
+    stacked = blocks[0].unsqueeze(0) if len(blocks) == 1 else torch.stack(blocks, dim=0)
+    return stacked.to(dtype)
+
+
+def _plan_direct_shard_load(module, checkpoint_dir: Path, param_meta, buffer_meta):
+    """Plan the per-rank slice reads for ``VERL_DSV41_DIRECT_SHARD_LOAD=1``.
+
+    Every rank derives, from each tensor's own DTensor spec, the exact slice of the
+    checkpoint tensor it needs. ``compute_local_shape_and_global_offset`` is the same
+    helper DTensor itself uses, so the offsets match by construction, and each rank
+    then pulls only that slice out of the safetensors shard -- the trick the Engram
+    loader already uses. This replaces the rank-0-reads-the-full-state-dict-and-Gloo-
+    broadcasts-it path, which is fast on one node (loopback) but collapses to
+    ~30 MB/s across machines (measured 2026-10-09: 964 sequential per-tensor
+    broadcasts, hours instead of minutes).
+
+    Returns ``(plan, None)``, or ``(None, reason)`` when a layout cannot be reasoned
+    about (nested placements, missing checkpoint key, local shape disagreement). The
+    caller then falls back to the broadcast path rather than loading blind.
+    """
+    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+
+    weight_map = _checkpoint_weight_map(checkpoint_dir)
+
+    def ckpt_name_of(module_name: str) -> str:
+        return module_name[len(_MODEL_PREFIX):] if module_name.startswith(_MODEL_PREFIX) else module_name
+
+    def build_entry(name, tensor, meta, plan) -> str | None:
+        """Fill ``plan[name]``; returns a rejection reason or None."""
+        from torch.distributed.tensor.placement_types import _StridedShard
+
+        full_shape, dtype = meta[name]
+        ckpt_name = ckpt_name_of(name)
+        fused_match = _FUSED_EXPERT_LAYER_PATTERN.match(ckpt_name)
+        entry = {"ckpt_name": ckpt_name, "full_shape": tuple(full_shape), "dtype": dtype}
+        if fused_match:
+            entry["fused_experts"] = {
+                "layer": int(fused_match.group(1)),
+                "parts": _FUSED_EXPERT_PARTS[fused_match.group(2)],
+            }
+        else:
+            shard_file = weight_map.get(ckpt_name)
+            if shard_file is None:
+                return f"checkpoint has no tensor named {ckpt_name!r}"
+            entry["shard_file"] = shard_file
+        if isinstance(tensor, DTensor):
+            if any(isinstance(p, (list, tuple)) for p in tensor.placements):
+                return f"nested DTensor placements on {name}: {tensor.placements}"
+            if any(isinstance(p, _StridedShard) and p.split_factor != 1 for p in tensor.placements):
+                # A strided shard is not a contiguous window of the source tensor; the
+                # committed loader cannot reconstruct it from one get_slice window.
+                return f"strided shard placements on {name}: {tensor.placements}"
+            local_shape, offset = compute_local_shape_and_global_offset(
+                tuple(full_shape), tensor.device_mesh, tensor.placements
+            )
+            actual = tuple(tensor.to_local().shape)
+            if actual != tuple(local_shape):
+                return f"computed local shape {tuple(local_shape)} != actual {actual} on {name}"
+            entry.update(
+                kind="shard",
+                local_shape=tuple(local_shape),
+                offset=tuple(offset),
+                mesh=tensor.device_mesh,
+                placements=tuple(tensor.placements),
+            )
+        else:
+            entry.update(kind="full")
+        if fused_match:
+            fused = entry["fused_experts"]
+            if entry["kind"] == "shard":
+                expert_lo, expert_hi = entry["offset"][0], entry["offset"][0] + entry["local_shape"][0]
+            else:
+                expert_lo, expert_hi = 0, full_shape[0]
+            for expert_id in range(expert_lo, expert_hi):
+                for group in fused["parts"]:
+                    source = f"layers.{fused['layer']}.ffn.experts.{expert_id}.{group[0]}.weight"
+                    if source not in weight_map:
+                        return f"checkpoint has no tensor named {source!r}"
+        entry["param"] = tensor
+        plan[name] = entry
+        return None
+
+    plan: dict[str, dict] = {}
+    for name, param in module.named_parameters():
+        if name not in param_meta:
+            continue  # routed experts stay meta; Engram tables were popped in _build_fsdp_module
+        reason = build_entry(name, param, param_meta, plan)
+        if reason:
+            return None, reason
+    for name, buffer in module.named_buffers():
+        if name not in buffer_meta or name in plan:
+            continue
+        reason = build_entry(name, buffer, buffer_meta, plan)
+        if reason:
+            return None, reason
+    expected = len(param_meta) + len(buffer_meta)
+    if len(plan) != expected:
+        return None, f"planned {len(plan)} tensors, expected {expected} (param_meta + buffer_meta)"
+    return plan, None
+
+
+def _read_direct_shards(plan, checkpoint_dir: Path) -> tuple[dict[str, torch.Tensor], int]:
+    """Read this rank's share of the planned tensors (a slice for sharded ones).
+
+    Fused expert parameters are assembled from their per-expert checkpoint tensors --
+    only the experts and rows this rank's window covers are read, never the whole
+    stacked tensor.
+    """
+    from safetensors import safe_open
+
+    weight_map = _checkpoint_weight_map(checkpoint_dir)
+    handles: dict[str, object] = {}
+
+    def handle_for(shard_file: str):
+        handle = handles.get(shard_file)
+        if handle is None:
+            handle = safe_open(str(checkpoint_dir / shard_file), framework="pt", device="cpu")
+            handles[shard_file] = handle
+        return handle
+
+    values: dict[str, torch.Tensor] = {}
+    total_bytes = 0
+    try:
+        for name, entry in plan.items():
+            if entry.get("fused_experts"):
+                fused = entry["fused_experts"]
+                if entry["kind"] == "shard":
+                    window_shape, window_offset = entry["local_shape"], entry["offset"]
+                else:
+                    window_shape = entry["full_shape"]
+                    window_offset = (0,) * len(window_shape)
+                part_rows = {}
+                for group in fused["parts"]:
+                    source = f"layers.{fused['layer']}.ffn.experts.{window_offset[0]}.{group[0]}.weight"
+                    part_rows[group[0]] = int(handle_for(weight_map[source]).get_slice(source).get_shape()[0])
+
+                def read_slice(kind, expert_id, rows, cols, _layer=fused["layer"]):
+                    source = f"layers.{_layer}.ffn.experts.{expert_id}.{kind}.weight"
+                    return handle_for(weight_map[source]).get_slice(source)[(rows, cols)]
+
+                tensor = _assemble_fused_expert_window(
+                    tuple(window_shape), tuple(window_offset), fused["parts"], part_rows, read_slice, entry["dtype"]
+                )
+                expected_shape = window_shape
+            elif entry["kind"] == "shard":
+                handle = handle_for(entry["shard_file"])
+                local_shape, offset = entry["local_shape"], entry["offset"]
+                if any(size == 0 for size in local_shape):
+                    tensor = torch.empty(local_shape, dtype=entry["dtype"])
+                else:
+                    window = tuple(slice(o, o + size) for o, size in zip(offset, local_shape))
+                    tensor = handle.get_slice(entry["ckpt_name"])[window].reshape(local_shape)
+                expected_shape = entry["local_shape"]
+            else:
+                handle = handle_for(entry["shard_file"])
+                tensor = handle.get_tensor(entry["ckpt_name"])
+                expected_shape = entry["full_shape"]
+            if tuple(tensor.shape) != tuple(expected_shape):
+                raise RuntimeError(
+                    f"direct shard read for {name}: got shape {tuple(tensor.shape)}, "
+                    f"expected {tuple(expected_shape)}."
+                )
+            value = tensor.to(entry["dtype"])
+            values[name] = value
+            total_bytes += value.numel() * value.element_size()
+    finally:
+        del handles
+    return values, total_bytes
+
+
+def _load_direct_shards(module, plan, values, engram_tables, cpu_offload: bool = False) -> None:
+    """Write this rank's shards into the model, mirroring torch's distribution protocol.
+
+    Reference: ``_distribute_tensors`` in ``torch/distributed/_state_dict_utils.py``
+    (the tail of the rank0-broadcast load). A real (non-meta) parameter is written
+    **in place** through ``param.to_local().copy_`` and its object is left untouched;
+    only a meta-initialized parameter is *replaced*, with a DTensor built from the
+    existing parameter's own mesh/placements/shape/stride. Replacing the real
+    parameters instead -- the first direct-load draft -- broke the FSDP-Turbo
+    parameter bookkeeping: the weight-sync export then died with "Attempted to set
+    the storage of a tensor on device cpu to a storage on different device npu:N"
+    (2026-10-09 09:20). The partial ``assign=True`` load is limited to the replaced
+    (meta) keys; completeness of the rest is enforced by the planning pass. The Engram
+    tables stay hidden for the walk for the same reason as in the broadcast path:
+    they sit in the module tree but are deliberately absent from the loaded state.
+
+    ``cpu_offload`` mirrors `StateDictOptions(cpu_offload=...)` of the broadcast path:
+    a replacement must end up with its local tensor on **CPU** for CPU-offloaded FSDP
+    groups. ``DTensor.from_local`` silently moves a CPU value onto the mesh device
+    ("convert the local tensor to desired device base on device mesh's device type"),
+    which handed FSDP npu-local shards and blew up at the first forward with
+    "FSDP parameters should be materialized on CPU when enabling CPU offloading"
+    (2026-10-09 09:5x, single-node smoke). The broadcast path lands on CPU through
+    DCP's own ``local_state_dict[key].cpu()`` after ``_distribute_tensors``; the
+    explicit ``.cpu()`` below reproduces that end state (probe: from_local(cpu).cpu()
+    and DCP cpu_offload=True give the same param device, both forward clean under
+    fully_shard + CPUOffloadPolicy).
+    """
+    from torch.distributed.tensor import DTensor
+
+    replacements: dict[str, torch.Tensor] = {}
+    for name, entry in plan.items():
+        param = entry["param"]
+        value = values[name]
+        if entry["kind"] == "shard" and isinstance(param, DTensor):
+            local = param.to_local()
+            if local.is_meta:
+                replacement = DTensor.from_local(
+                    value,
+                    param.device_mesh,
+                    list(param.placements),
+                    shape=param.shape,
+                    stride=param.stride(),
+                )
+                if cpu_offload:
+                    replacement = replacement.cpu()
+                replacements[name] = replacement
+            else:
+                with torch.no_grad():
+                    local.copy_(value)
+            continue
+        if param.is_meta:
+            replacements[name] = value
+        else:
+            with torch.no_grad():
+                param.data.copy_(value)
+    if replacements:
+        detached_engram = hide_engram_tables(module, engram_tables)
+        try:
+            module.load_state_dict(replacements, strict=False, assign=True)
+        finally:
+            restore_modules(detached_engram)
+
+
+def _verify_direct_shards(plan, checkpoint_dir: Path, module) -> int:
+    """Rank-0 sample check: its loaded shard must equal the checkpoint slice exactly.
+
+    The planning pass already proved every rank's *shape* against its DTensor spec;
+    this catches the data-level mistakes shapes cannot see (offset off-by-one, slice
+    interpretation). It compares rank 0's own loaded local tensor against the same
+    window of a full read, for up to ``VERL_DSV41_DIRECT_SHARD_LOAD_VERIFY`` (default
+    3) small parameters -- cheap, and it exercises the whole read->from_local->copy
+    chain. Every other rank uses the identical code path and offset formula; the
+    run's consistency metrics (training/rollout_probs_diff_*) are the end-to-end net.
+    """
+    if dist.get_rank() != 0:
+        return 0
+    sample = int(os.environ.get("VERL_DSV41_DIRECT_SHARD_LOAD_VERIFY", "3"))
+    if sample <= 0:
+        _log_rank0("direct shard load: verification disabled by VERL_DSV41_DIRECT_SHARD_LOAD_VERIFY=0")
+        return 0
+    from safetensors import safe_open
+
+    parameters = dict(module.named_parameters())
+    candidates = []
+    for name, entry in plan.items():
+        if entry["kind"] != "shard" or name not in parameters or len(entry["offset"]) == 0:
+            continue
+        numel = 1
+        for size in entry["local_shape"]:
+            numel *= size
+        byte_size = numel * torch.empty((), dtype=entry["dtype"]).element_size()
+        if 0 < byte_size <= 64 * 1024**2:
+            candidates.append((byte_size, name))
+    candidates.sort()
+    handles: dict[str, object] = {}
+    checked = 0
+    try:
+        for _, name in candidates[:sample]:
+            entry = plan[name]
+            handle = handles.get(entry["shard_file"])
+            if handle is None:
+                handle = safe_open(str(checkpoint_dir / entry["shard_file"]), framework="pt", device="cpu")
+                handles[entry["shard_file"]] = handle
+            full = handle.get_tensor(entry["ckpt_name"]).to(entry["dtype"])
+            window = tuple(slice(o, o + size) for o, size in zip(entry["offset"], entry["local_shape"]))
+            expected = full[window].reshape(entry["local_shape"])
+            actual = parameters[name].to_local()
+            if actual.is_meta:
+                raise RuntimeError(
+                    f"direct shard load left {name} on the meta device (the assign load did "
+                    "not materialize it); refusing to continue with a meta parameter."
+                )
+            if actual.device.type != "cpu":
+                actual = actual.cpu()
+            if not torch.equal(expected, actual.to(entry["dtype"])):
+                raise RuntimeError(
+                    f"direct shard load verification failed for {name}: rank0's loaded shard does not "
+                    "match the checkpoint slice. The slice mapping is wrong -- retry with "
+                    "VERL_DSV41_DIRECT_SHARD_LOAD=0 and investigate before trusting this run."
+                )
+            checked += 1
+    finally:
+        del handles
+
+    # Fused expert parameters get their own check: rank0 independently assembles the
+    # whole stacked tensor (the same recurrence read_dsv41_checkpoint_state_dict uses)
+    # and compares its own loaded window against it. This covers the window->per-expert
+    # mapping, including windows that span the w1/w3 boundary.
+    weight_map = _checkpoint_weight_map(checkpoint_dir)
+    for suffix, label in (
+        (".ffn.experts.gate_up_proj", "gate_up_proj"),
+        (".ffn.experts.down_proj", "down_proj"),
+    ):
+        name = next((candidate for candidate in plan if candidate.endswith(suffix)), None)
+        if name is None or name not in parameters:
+            continue
+        entry = plan[name]
+        fused = entry["fused_experts"]
+        kinds = [group[0] for group in fused["parts"]]
+        handles = {}
+        try:
+            full = torch.empty(entry["full_shape"], dtype=entry["dtype"])
+            for expert_id in range(entry["full_shape"][0]):
+                cursor = 0
+                for kind in kinds:
+                    source = f"layers.{fused['layer']}.ffn.experts.{expert_id}.{kind}.weight"
+                    shard_file = weight_map[source]
+                    handle = handles.get(shard_file)
+                    if handle is None:
+                        handle = safe_open(str(checkpoint_dir / shard_file), framework="pt", device="cpu")
+                        handles[shard_file] = handle
+                    piece = handle.get_tensor(source).to(entry["dtype"])
+                    if len(kinds) == 1:
+                        full[expert_id] = piece
+                    else:
+                        full[expert_id, cursor : cursor + piece.shape[0]] = piece
+                        cursor += piece.shape[0]
+        finally:
+            del handles
+        if entry["kind"] == "shard":
+            window = tuple(slice(o, o + s) for o, s in zip(entry["offset"], entry["local_shape"]))
+            expected_shape = entry["local_shape"]
+        else:
+            window = tuple(slice(0, s) for s in entry["full_shape"])
+            expected_shape = entry["full_shape"]
+        expected = full[window].reshape(expected_shape)
+        actual = parameters[name].to_local()
+        if actual.is_meta:
+            raise RuntimeError(
+                f"direct shard load left {name} on the meta device (the assign load did not "
+                "materialize it); refusing to continue with a meta parameter."
+            )
+        if actual.device.type != "cpu":
+            actual = actual.cpu()
+        if not torch.equal(expected, actual.to(entry["dtype"])):
+            raise RuntimeError(
+                f"direct shard load verification failed for {name} (fused experts): rank0's loaded "
+                "shard does not match the checkpoint. Retry with VERL_DSV41_DIRECT_SHARD_LOAD=0 and "
+                "investigate before trusting this run."
+            )
+        checked += 1
+        _log_rank0("direct shard load verified: %s assembled independently and matched (fused expert)", label)
+
+    if checked == 0:
+        raise RuntimeError(
+            "direct shard load: no verifiable sample parameter found; refusing to proceed "
+            "unverified (set VERL_DSV41_DIRECT_SHARD_LOAD_VERIFY=0 to override explicitly)."
+        )
+    _log_rank0("direct shard load verified: %d sampled shard(s) bit-exact on rank0", checked)
+    return checked
+
+
+def hide_engram_tables(module, engram_tables) -> list[tuple[object, str, object]]:
+    """Detach the host-offload Engram modules from the tree while DCP enumerates it.
+
+    DCP derives the model-side keys by recursing the module tree
+    (``_iterate_valid_model_state``) and loads with ``strict=True``. The Engram tables
+    *are* parameters of the model but are deliberately absent from the state dict handed
+    to DCP -- they are filled row-by-row from the checkpoint in
+    :meth:`_load_host_engram_tables` -- so the load aborts with ``Missing key:
+    model.layers.<N>.engram.embed.weight``. Taking the modules out of the tree for the
+    duration of the load (rather than relaxing ``strict``) keeps the fail-closed
+    behaviour for every other parameter. They are put back right after, so the forward
+    graph, ``pre_fsdp_hook``'s ``shard_()`` result and FSDP-Turbo's ignored-module
+    bookkeeping are untouched.
+
+    Returns the ``(parent, attribute, submodule)`` triples for :func:`restore_modules`.
+    """
+    wanted = {id(table): checkpoint_name for checkpoint_name, table in engram_tables}
+    detached = []
+    found = set()
+    # Located by identity, not by rebuilding the module path from the checkpoint name: the
+    # path an FSDP wrapper exposes is not the caller's business, and a mismatch has to be
+    # an error rather than a silently wrong key space.
+    for module_name, submodule in module.named_modules(remove_duplicate=False):
+        if id(submodule) not in wanted:
+            continue
+        parent_path, _, attribute = module_name.rpartition(".")
+        if not attribute:
+            raise RuntimeError(f"Engram table {wanted[id(submodule)]} is the root module; cannot detach it.")
+        parent = module.get_submodule(parent_path) if parent_path else module
+        found.add(id(submodule))
+        detached.append((parent, attribute, submodule))
+    missing = sorted(name for table_id, name in wanted.items() if table_id not in found)
+    if missing:
+        raise RuntimeError(
+            f"Engram tables {missing} are not in the module tree that DCP is about to walk; "
+            "their keys would be reported missing."
+        )
+    for parent, attribute, _ in detached:
+        setattr(parent, attribute, nn.Module())
+    return detached
+
+
+def restore_modules(detached) -> None:
+    """Put back the modules :func:`hide_engram_tables` detached."""
+    for parent, attribute, module in detached:
+        setattr(parent, attribute, module)
 
 
 def place_checkpoint_buffers_for_load(module, buffer_meta, log=None) -> list[str]:
@@ -366,7 +836,7 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
 
         from .utils import split_fused_expert_tensor
 
-        if name.endswith(_ENGRAM_EMBED_SUFFIX):
+        if _is_host_engram_param(name, param):
             # Host-offload Engram tables: frozen (the rollout engine also keeps them
             # requires_grad=False) and host-resident. Streaming them would move
             # 2 x 24.6 GiB per rank *per step* to say what the engine already has from
@@ -470,6 +940,52 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
             device=torch.accelerator.current_accelerator(),
             parameter_dtype=torch.bfloat16,
         )
+
+        # [mem-debug 2026-10-09] The actor update plateaus at ~60 GB/card regardless of the
+        # response length (512 x B8 in the 10th run and 1024 x B2 in the 12th both peaked
+        # at ~60.8 GB and one of them OOM'd on a 300 MiB alloc), so the dominant consumer
+        # is something per-layer that does not scale with tokens. These hooks print
+        # alloc/reserved/peak at every decoder layer's forward entry/exit and after its
+        # backward, which localizes the consumer to a layer index and a direction.
+        # Enable with FSDP_TURBO_MEM_DEBUG=1 (rank filter: FSDP_TURBO_MEM_DEBUG_RANKS).
+        if os.environ.get("FSDP_TURBO_MEM_DEBUG") == "1":
+            import re as _re
+
+            import torch.distributed as _dist
+
+            _ranks = {
+                int(r) for r in os.environ.get("FSDP_TURBO_MEM_DEBUG_RANKS", "0").split(",") if r.strip()
+            }
+            try:
+                _rank = _dist.get_rank()
+            except Exception:
+                _rank = 0
+            if _rank in _ranks:
+
+                def _mem() -> str:
+                    return (
+                        f"alloc={torch.npu.memory_allocated() / 2**30:.2f} "
+                        f"resv={torch.npu.memory_reserved() / 2**30:.2f} "
+                        f"max={torch.npu.max_memory_allocated() / 2**30:.2f}"
+                    )
+
+                def _mk_hook(tag):
+                    def _fn(module, *args):
+                        print(f"[mem-debug] r{_rank} {tag} {_mem()}", flush=True)
+
+                    return _fn
+
+                _n = 0
+                for _name, _mod in training_model.named_modules():
+                    # Blocks ("...layers.7") and their direct children ("...layers.7.mlp"): the
+                    # child granularity is what attributes the ~1.1 GB/layer saved-for-backward.
+                    if _re.fullmatch(r".*layers\.\d+(\.[^.]+)?", _name):
+                        _tag = _name.split("layers.", 1)[1]
+                        _mod.register_forward_pre_hook(_mk_hook(f"L{_tag} FWD-in"))
+                        _mod.register_forward_hook(_mk_hook(f"L{_tag} FWD-out"))
+                        _mod.register_full_backward_hook(_mk_hook(f"L{_tag} BWD"))
+                        _n += 1
+                print(f"[mem-debug] installed {_n} layer hook sets on rank {_rank}", flush=True)
         return training_model
 
     def _build_fsdp_module(self, module):
@@ -498,8 +1014,16 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
         return module
 
     def _materialize_dsv41_parameters(self, module, param_meta, buffer_meta, offload_policy, engram_tables=()):
-        """Load the rollout checkpoint into the sharded model (rank 0 reads, everyone
-        receives) and finish the device placement the meta construction skipped."""
+        """Load the rollout checkpoint into the sharded model and finish the device
+        placement the meta construction skipped.
+
+        Two load paths (2026-10-09): with ``VERL_DSV41_DIRECT_SHARD_LOAD=1`` every rank
+        slice-reads its own shards straight from the checkpoint, so no weight data
+        crosses the machines. Otherwise rank 0 reads the full state dict and DCP
+        broadcasts it to everyone -- fast on one node (loopback), but the per-tensor
+        Gloo broadcast collapses across machines (measured ~30 MB/s on the
+        80.5.25.x link) and turns the load into hours.
+        """
         from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
         checkpoint_dir = Path(self._dsv41_model_path())
@@ -510,6 +1034,12 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
             checkpoint_dir,
         )
         started = time.time()
+        if os.environ.get("VERL_DSV41_DIRECT_SHARD_LOAD", "0") == "1":
+            if self._load_dsv41_parameters_directly(
+                module, checkpoint_dir, param_meta, buffer_meta, offload_policy, engram_tables, started
+            ):
+                self._finish_dsv41_materialization(module, engram_tables, checkpoint_dir)
+                return
         if os.environ.get("VERL_DSV41_RANDOM_INIT", "0") == "1":
             _log_rank0("VERL_DSV41_RANDOM_INIT=1: skipping checkpoint weights, deferring experts at N(0, 0.02)")
             full_state = _random_state_dict(param_meta) if dist.get_rank() == 0 else {}
@@ -542,7 +1072,14 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
         expected_buffers = (
             {name: full_state[name].clone() for name in buffer_meta if name in full_state} if dist.get_rank() == 0 else {}
         )
-        set_model_state_dict(module, full_state, options=options)
+        # DCP walks the module tree and loads ``strict=True``; the Engram tables are in the
+        # tree but not in ``full_state`` (see :func:`host_offload_engram_tables`), so they are
+        # detached for the duration of the load instead of relaxing the strictness.
+        detached_engram = hide_engram_tables(module, engram_tables)
+        try:
+            set_model_state_dict(module, full_state, options=options)
+        finally:
+            restore_modules(detached_engram)
         if dist.get_rank() == 0:
             current = dict(module.named_buffers())
             unloaded = [
@@ -559,6 +1096,10 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
         del full_state
         _log_rank0("parameters materialized in %.1fs", time.time() - started)
 
+        self._finish_dsv41_materialization(module, engram_tables, checkpoint_dir)
+
+    def _finish_dsv41_materialization(self, module, engram_tables, checkpoint_dir: Path) -> None:
+        """Tail shared by both parameter-load paths (broadcast and direct shards)."""
         # Buffers are built with real values (only parameters were deferred) but on
         # the host: attention tables and scratch caches must follow the parameters'
         # compute device, the way fsdp2_load_full_state_dict does for HF models.
@@ -575,6 +1116,48 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
                 "DeepSeek-V4.1 parameters were left on the meta device, e.g. {}. "
                 "Check that the checkpoint covers every parameter.".format(still_meta[:5])
             )
+
+    def _load_dsv41_parameters_directly(
+        self, module, checkpoint_dir, param_meta, buffer_meta, offload_policy, engram_tables, started
+    ) -> bool:
+        """``VERL_DSV41_DIRECT_SHARD_LOAD=1``: every rank slice-reads its own shards.
+
+        Returns False when the plan cannot be built, in which case the caller runs the
+        rank0 read + broadcast path instead; True once the load completed, including
+        the same checkpoint-buffer bit-exactness check the broadcast path runs.
+        """
+        plan, reason = _plan_direct_shard_load(module, checkpoint_dir, param_meta, buffer_meta)
+        if plan is None:
+            _log_rank0(
+                "VERL_DSV41_DIRECT_SHARD_LOAD=1 rejected (%s); falling back to rank0 read + broadcast",
+                reason,
+            )
+            return False
+        place_checkpoint_buffers_for_load(module, buffer_meta, log=_log_rank0)
+        values, total_bytes = _read_direct_shards(plan, checkpoint_dir)
+        _log_rank0(
+            "checkpoint read: %d tensors slice-read directly (%.2f GiB this rank; no cross-rank broadcast)",
+            len(values),
+            total_bytes / 1024**3,
+        )
+        _load_direct_shards(module, plan, values, engram_tables, cpu_offload=bool(offload_policy))
+        if dist.get_rank() == 0:
+            current = dict(module.named_buffers())
+            unloaded = [
+                name
+                for name in buffer_meta
+                if name in values and (name not in current or not torch.equal(values[name], current[name]))
+            ]
+            if unloaded:
+                raise RuntimeError(
+                    f"checkpoint buffers were not loaded into the model: {unloaded[:3]}. "
+                    "See place_checkpoint_buffers_for_load / checkpoint_buffer_meta."
+                )
+            _log_rank0("checkpoint buffers loaded: %d (bit-exact against the checkpoint)", len(buffer_meta))
+        del values
+        _verify_direct_shards(plan, checkpoint_dir, module)
+        _log_rank0("parameters materialized in %.1fs (direct shard load)", time.time() - started)
+        return True
 
     def _load_host_engram_tables(self, engram_tables, checkpoint_dir: Path) -> None:
         """Fill each rank's host-offload Engram rows from the checkpoint, then freeze.
@@ -635,9 +1218,18 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
             table._grad_keepalive = torch.zeros((), dtype=torch.float32, device=table._grad_keepalive.device)
         del handles
 
-        # Every rank must own a disjoint slice of the checkpoint's row space, and together
-        # they must cover it: a gap silently zeroes a row range for *every* lookup, and an
-        # overlap feeds different values to trainer and engine for the same hash id.
+        # Within one EP replica the ranks must tile the checkpoint's row space exactly: a
+        # gap silently zeroes a row range for *every* lookup, and an overlap feeds
+        # different values to trainer and engine for the same hash id. Replicas
+        # (world_size / EP > 1, e.g. the FSDP=16 / EP=8 one-node topology) deliberately
+        # hold the *same* rows, so each distinct range must be held by exactly one rank
+        # per replica -- once in each of the EP groups -- and the distinct ranges must
+        # cover [0, checkpoint rows) without gaps. (Comparing the raw sorted pieces
+        # against a running cursor, as this check used to, treats a replica's second copy
+        # of range 0 as "not tiled across ranks at 0".)
+        copies_per_range = {
+            name: dist.get_world_size() // table.mesh.size() for name, table in engram_tables
+        }
         gathered = [None] * dist.get_world_size()
         dist.all_gather_object(gathered, [(name, start, end) for name, start, end in layout])
         if dist.get_rank() == 0:
@@ -647,8 +1239,11 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
                     by_name.setdefault(name, []).append((start, end))
             for name, pieces in by_name.items():
                 pieces.sort()
+                counts: dict[tuple[int, int], int] = {}
+                for piece in pieces:
+                    counts[piece] = counts.get(piece, 0) + 1
                 expected = 0
-                for start, end in pieces:
+                for start, end in sorted(counts):
                     if start != expected:
                         raise RuntimeError(f"Engram table {name}: rows are not tiled across ranks at {start}.")
                     expected = end
@@ -656,6 +1251,14 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
                 if expected != checkpoint_rows:
                     raise RuntimeError(
                         f"Engram table {name}: ranks cover {expected} rows, the checkpoint has {checkpoint_rows}."
+                    )
+                expected_copies = copies_per_range[name]
+                misheld = {piece: n for piece, n in counts.items() if n != expected_copies}
+                if misheld:
+                    raise RuntimeError(
+                        f"Engram table {name}: row ranges {misheld} are held by a number of ranks other "
+                        f"than the {expected_copies} EP replica(s); the rows are not tiled once per "
+                        "replica."
                     )
             _log_rank0(
                 "host-offload Engram tables loaded: %d table(s), %.1f GiB per rank in %.1fs (frozen)",

@@ -48,9 +48,54 @@ def rebuild_ipc(handle: tuple[Callable, tuple], device_id: int | None = None) ->
     if device_id is not None:
         # the key is to change device id to the current device id
         # in case two processes have different CUDA_VISIBLE_DEVICES
+        if len(list_args) < 7:
+            raise RuntimeError(
+                f"Weight handle from {getattr(func, '__qualname__', func)} carries only "
+                f"{len(list_args)} arguments, so it is not an accelerator IPC handle and its "
+                "device index cannot be patched. Handle-producing code must pass a tensor that "
+                f"already lives on the sender's device (see {_stage_on_device_for_ipc.__name__})."
+            )
         list_args[6] = device_id
     buffer = func(*list_args)
     return buffer
+
+
+def _stage_on_device_for_ipc(weight: torch.Tensor, name: str = "") -> torch.Tensor:
+    """Return ``weight`` as a tensor of the sender's accelerator device.
+
+    ``reduce_tensor`` only produces a device IPC handle for an accelerator-resident tensor. A
+    host tensor goes through the CPU reduction instead (``rebuild_tensor``, three arguments), and
+    :func:`rebuild_ipc` then dies with ``IndexError: list assignment index out of range`` in the
+    rollout worker -- observed on Ascend with ``offload_policy=True``, where the generic export
+    path hands over parameters that are not DTensors and therefore stay on the host. The receiver
+    copies the weight onto its own card anyway, so staging it here costs one host-to-device copy
+    and nothing else.
+    """
+    device_name = get_device_name()
+    if weight.device.type == device_name:
+        return weight
+    # Fail fast rather than OOM the card: a host tensor this code is asked to publish is only
+    # supposed to be a single weight (embed/head at ~1.2 GiB). Bigger means something upstream
+    # stopped excluding what it should have (a host-resident Engram table is 187 GiB) and the
+    # honest answer is an error naming the tensor, not a device allocation failure minutes later.
+    free_bytes, _ = get_torch_device().mem_get_info(get_device_id())
+    if weight.nbytes > free_bytes // 2:
+        raise RuntimeError(
+            f"Oversized weight {name or '<unnamed>'} ({weight.nbytes / 2**30:.1f} GiB) is on "
+            f"{weight.device} and would not fit in the {free_bytes / 2**30:.1f} GiB free on "
+            f"{device_name}:{get_device_id()}. This tensor should not be synced to the rollout "
+            "engine -- check the engine's export exclusions before assuming the transfer is broken."
+        )
+    staged = weight.to(f"{device_name}:{get_device_id()}")
+    # The handle is published to another process as soon as this returns, so the copy has to be
+    # complete, not merely enqueued.
+    get_torch_device().synchronize()
+    print(
+        f"[bucketed-sync] staged oversized weight {name or '<unnamed>'} "
+        f"{tuple(weight.shape)} {weight.dtype} from {weight.device} onto {device_name} for IPC",
+        flush=True,
+    )
+    return staged
 
 
 def create_shared_memory(size: int, name: str):
@@ -264,7 +309,11 @@ class BucketedWeightSender:
         """Send a weight larger than the bucket size via cuda ipc or share memory."""
         logger.debug(f"Direct sending large weight {name}({weight.shape}, {weight.dtype})")
         # TODO: support fallback to shared memory
-        handle = reduce_tensor(weight)
+        # Keep the device-side tensor bound until the receiver acks: it is the object whose
+        # storage the peer is about to map, and the bucket path follows the same discipline
+        # (see _cleanup, which releases the buffer only after the ack).
+        staged = _stage_on_device_for_ipc(weight, name)
+        handle = reduce_tensor(staged)
         bucket_meta: dict[str, TensorMetadata] = {}
         bucket_meta[name] = {
             "name": name,
