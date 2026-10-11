@@ -933,6 +933,7 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
             experts_meta_init=True,
             config_path=_config_path_from_model_path(self._dsv41_model_path()),
             max_seq_len=self._dsv41_max_seq_len(),
+            max_batch_size=self._dsv41_max_batch_size(),
         )
         initialize_deepseek_v41_model(training_model)
         training_model = prepare_deepseek_v41_model_for_fsdp(
@@ -1143,10 +1144,21 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
         _load_direct_shards(module, plan, values, engram_tables, cpu_offload=bool(offload_policy))
         if dist.get_rank() == 0:
             current = dict(module.named_buffers())
+            # [2026-10-10] With offload_policy/param_offload=False the buffers live on the
+            # NPU while `values` comes from the (CPU) checkpoint read; compare on CPU.
+            # Buffers are small, so the cast is free. (The earlier CPU-only compare held
+            # only because the proven config offloaded everything to CPU.)
             unloaded = [
                 name
                 for name in buffer_meta
-                if name in values and (name not in current or not torch.equal(values[name], current[name]))
+                if name in values
+                and (
+                    name not in current
+                    or not torch.equal(
+                        values[name],
+                        current[name].cpu() if current[name].device.type != "cpu" else current[name],
+                    )
+                )
             ]
             if unloaded:
                 raise RuntimeError(
@@ -1281,3 +1293,13 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
         if override:
             return int(override)
         return _DEFAULT_MAX_SEQ_LEN
+
+    def _dsv41_max_batch_size(self) -> int:
+        # Per-rank micro batch for the Engram/compressor state buffers. ModelArgs
+        # defaults to 4; larger micro batches crash in engram.py's hash-cache write
+        # ("expanded size (4) must match existing size (8)"), so thread the real
+        # value through VERL_DSV41_MAX_BATCH_SIZE (launchers set it to MICRO_BSZ).
+        override = os.environ.get("VERL_DSV41_MAX_BATCH_SIZE")
+        if override:
+            return int(override)
+        return 4

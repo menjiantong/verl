@@ -129,6 +129,11 @@ _MODEL_TYPE_TO_FAMILY: dict[str, ContinuousTokenModelFamily] = {
     "deepseek_v2": ContinuousTokenModelFamily.DEEPSEEK,
     "deepseek_v3": ContinuousTokenModelFamily.DEEPSEEK,
     "deepseek_v4": ContinuousTokenModelFamily.DEEPSEEKV4,
+    # [2026-10-11] DeepSeek-V4.1 checkpoints declare model_type="deepseek_v41"; the
+    # template-less tokenizer makes the default builder's jinja path unusable, so
+    # without this exact entry the RL rollout renders malformed prompts (observed:
+    # every response ran to the length cap, reward pinned at -1).
+    "deepseek_v41": ContinuousTokenModelFamily.DEEPSEEKV4,
     # Vision-language models. The processor is still required at construction.
     "qwen2_vl": ContinuousTokenModelFamily.QWEN_VL,
     "qwen2_5_vl": ContinuousTokenModelFamily.QWEN25_VL,

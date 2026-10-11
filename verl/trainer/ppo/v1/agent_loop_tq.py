@@ -159,6 +159,27 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
         await self._compute_score(outputs, kwargs=kwargs)
 
+        # [2026-10-11] debug dump: reward was pinned at -1 with every response at the cap; capture
+        # the first few REAL trajectories (prompt tail, response text, reward) per worker process.
+        _dump_dir = os.environ.get("VERL_AGENT_DUMP", "/tmp/agent_dump.txt")
+        _n_seen = getattr(self, "_agent_dump_count", 0)
+        if _n_seen < 4:
+            self._agent_dump_count = _n_seen + len(outputs)
+            try:
+                _tok = self.tokenizer
+                with open(f"{_dump_dir}.{os.getpid()}", "a") as _fh:
+                    for _o in outputs[:4 - _n_seen]:
+                        _ptxt = _tok.decode([int(x) for x in _o.prompt_ids])
+                        _rtxt = _tok.decode([int(x) for x in _o.response_ids])
+                        _fh.write(f"=== uid={uid} sid={session_id} reward={_o.reward_score} "
+                                  f"plen={len(_o.prompt_ids)} rlen={len(_o.response_ids)}\n")
+                        _fh.write(f"PROMPT-TAIL: {_ptxt[-300:]!r}\n")
+                        _fh.write(f"RESP-HEAD: {_rtxt[:600]!r}\n")
+                        _fh.write(f"RESP-TAIL: {_rtxt[-400:]!r}\n")
+                        _fh.write(f"RESP-LAST-IDS: {[int(x) for x in list(_o.response_ids)[-6:]]}\n\n")
+            except Exception as _e:
+                logger.error(f"[agent-dump] failed: {_e!r}")
+
         final_output = outputs[-1]
         # TODO: Support output:list[AgentLoopOutput]
         await self._compute_teacher_logprobs(

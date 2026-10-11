@@ -204,3 +204,146 @@
 - [ ] `run_grpo_2node.sh`/`run_grpo_top64.sh` 已默认导出直载 + 性能开关；`.124` 同步后直接起
 - [ ] `.124` 取一次 raylet 死因实锤（dmesg OOM）—— 该机现被其他租户占用，等释放
 - [ ] 本节点卡是共享的：起任务前 `pick_devices()` 已内置，但若运行中被外容器抢卡仍会 OOM（误报签名见 §一 09:33 行）
+
+## 七、重要事实修正（2026-10-10）：机器是 16 卡/台，我们一直只用了 8
+
+- **实测**：`npu-smi info` 全表 **16 行 Ascend910**；`npu-smi info -l` = `Total Count: 8` NPU × `Chip Count: 2` = 16 chip/台（8 张双芯 NPU）；`/dev/davinci0..15` 共 16 个设备节点。
+- **自证来源**：`worklog_dsv41_top64_grpo.md:543` 早就记过"不带 `ASCEND_RT_VISIBLE_DEVICES` 启动 raylet 会注册 **16 NPU**"——那就是物理卡数；:527/:561 的 chip 2 避让与 `0,1,3,4,5,6,7,8` 列表也说明 chip id 空间是 0..15。
+- **影响**：所有 run（含本文件 §六 全部）均以 `ASCEND_RT_VISIBLE_DEVICES=0..7` 只用了每台前 8 颗 = **双机 16/32 卡**；`pick_devices()` 的"前 8 颗空闲即停"是主动截断。脚本中"8-chip machines"注释为过时认知。
+- **升级 32 卡要动**：pick_devices 取 16；`FSDP_SIZE=32`、`GEN_TP=8 × 4 replicas`、整除断言 `%32==0`；双节点各 16 rank ≥ Enram 分片总量不变但进程数翻倍，主机内存账需复核。
+- **容量结论（top64 @ 32 卡）**：推理 TP8×4（权重 23.5GB/卡）或 TP16×2（11.75GB/卡）均可；训练 FSDP32（参数+梯度 11.7GB/卡）→ update 平台顶 ≈57GB < 61.3GiB，**无需额外杠杆即可跑**。**TP=16 当前被 Engram 校验 {1,2,4,8} 拒绝**（run_grpo_2node.sh:27），但 16 卡/节点下可做成"节点内 TP16"，作为后续 v2 工程（需扩校验+引擎验证+rank↔replica 映射调整，且 EP 保持 8）。
+
+## 八、vLLM 部署方案入档（2026-10-10，用户提供）：DP2 单机充满 16 卡 + Engram 共享表
+
+**动机**：双机各 16 卡，但 rollout 是 TP8×2 replicas（每节点 1 个）→ 每节点只用 8 卡，一半闲置。用户给出的解法：
+
+```
+--engram-config '{"cpu_offload":true,"dp_shared_memory":true}' \
+--data-parallel-size 2 --data-parallel-size-local 2 \
+--tensor-parallel-size 8 --enable-expert-parallel
+```
+
+**代码验证（为什么成立，全部有出处）**：
+- `embedding.py:81-85`：`dp_shared_memory=true` → **`self.dp_size = 1`**（注释："Sharing replaces the per-step DP lookup collectives: every replica looks up its own tokens over the mapped table"）→ `_get_shard_info()`（:135）返回 `(tp_size, tp_rank)` → **表分片 = 纯 TP8**（24 哈希列 % 8 = 0，过 "uniform head shards" 校验 ✓）。
+- 两条硬校验同样满足：TP 组必须同节点（:69-71）✓ 8 卡/节点；EDP（engram DP）副本必须同节点且共享内存命名空间（:75-79）✓ `--data-parallel-size-local 2`。
+- 共享模式**无逐 step 收集**：`gather_engram_hashes(..., dp_shared_memory=True)` 直接原样返回（parallel.py:60 "Sharing has no per-step collectives, so it opts out"）；`embed_gathered` 里 `dp_size==1` 跳过 `_gather_engram_rows`；只剩 TP all_gather ✓。
+- 内存账：每节点物理表一份（393GB 主机，由该节点 2 个 DP 副本共享），显存每卡只放 TP8 分片（1 头 ≈ 24.6GiB 主机侧 + 推理权重）。
+- **对照：非共享模式不可用**——`dp_shared_memory=false` 且 EDP>1 时表按 `TP×EDP` 分片（`_get_shard_info` 走 `engram_head_shard_rank()`），本模型 24 列下 TP8×EDP2=16 **整除不了**（24%16≠0）→ 必然报 "uniform head shards"。共享模式恰好绕开，这就是这组参数的正确用法。
+- 平台校验对照（platform.py:1520）：TP=8 ∈{1,2,4,8} ✓、DP=2 ≥1 ✓、PP/PCP/DCP=1 ✓、elastic_ep 关 ✓。
+
+**对 verl/RL 复用的注意（后续）**：rollout 换 DP2/node 后，colocate 的 **trainer rank i ↔ engine rank i 映射**（LOCAL_EXPERT_EXPORT 与睡眠/权重同步的前提）需要重做——每节点 8 个 trainer rank 对 16 个 engine 进程（2 副本×TP8），映射要按"TP 位"拆分而不是 1:1。此方案对 **SFT/纯推理**无影响（不涉及权重同步）。
+
+## 九、SFT 热启动后 GRPO 复跑 + reward 恒 -1 的真根因与修复（2026-10-11）
+
+### 9.1 复跑配置（2 步 smoke，用户目标：reward 有数值）
+- `MODEL_PATH=/mnt/share/m00899630/dsv41/weights/DeepSeek-V4.1-Flash-top32-sft116`（SFT-116 步导出，见 `worklog_dsv41_sft.md` 阶段④）；
+- 新增 `EFSDP_SIZE=2` 透传（`run_grpo_2node.sh` 已补 `${EFSDP_SIZE:-2}`；与 SFT 的显存修复同源，专家三件套每卡减半）；
+- 其余沿用 proven 2 节点配置（2×8 卡 = 16 NPU，FSDP16/EP8/SAMPLE_N=8）。
+- 日志：`verl/logs/grpo_top64_steps2_20261011_051247.log`。
+
+### 9.2 结果：管线全通，但 reward 仍恒 -1
+- **训推一致性健康**：`rollout_probs_diff_mean 5.7e-4 / pearson 0.61（首步）/ rollout_corr/kl 0.31`；sync `1364 张量/20.6GiB，export 0.5s+flush 7.9s`（LOCAL_EXPORT 快路径）；step 时 406s/372s（gen 270s）。
+- **症状**：`critic/rewards mean=max=min=-1.0`、`response_length mean=min=max=1024.0 clip_ratio=1.0`（64/64 全部顶格）、`actor/grad_norm 0`。
+- 首次复跑途中 master 侧一个 DataLoader worker 被 OOM-kill（不影响训练，内存 2.4TB 机器 page-cache 压力所致，后续正常）。
+
+### 9.3 根因（三层证据链）
+1. **模型本身已被 SFT 治好**：用 DP2 serve + GSM8K 16 题对照——plain/`<think>`/`</think>`/无标签 4 种 prompt 变体、greedy 与 **T=1.0 采样全部正常收尾**（15-16/16 stop）。→ 采样、prompt 措辞均非原因。
+2. **差异在 RL 侧渲染**：rollout prompt 渲染在 AgentLoop（`RLHFDataset` 注释："apply_chat_template has been moved to AgentLoop"），走 `ContinuousTokenBuilder`；日志出现 `No model-specific Continuous Token builder is registered for config.json model_type='deepseek_v41'` → **回退 DEFAULT builder**。
+3. **为什么 DEFAULT 必坏**：原 ckpt 的 tokenizer **没有 chat_template**（`apply_chat_template` 直接 ValueError；`deepseek.py` 注释亦称 "The checkpoint ships no usable jinja template"）。V4 专用 `DeepSeekV4ContinuousTokenBuilder` 走自带 Python 编码器 `encode_messages`（无需 jinja），但 `_MODEL_TYPE_TO_FAMILY` 表只有 `"deepseek_v4"`，**没有 `"deepseek_v41"`** → 本项目所有 RL run（含 SFT 前时代）实际都在用错的多轮边界协议渲染 prompt → 模型进坏上下文 → 顶格 1024 → reward -1。"模型 never-EOS" 的历史结论需改写为此渲染 bug + 裁剪退化两因素。
+4. 对照验证：修复后 `build_initial_tokens` 渲染 = `<｜begin▁of▁sentence｜><｜User｜>{q}<｜Assistant｜></think…`（与 serve 侧手渲染一致）。
+
+### 9.4 修复
+- `verl/utils/tokenizer/continuous_token_wiring.py`：`_MODEL_TYPE_TO_FAMILY` 增加 `"deepseek_v41": ContinuousTokenModelFamily.DEEPSEEKV4`（带注释）；已 sync 双机。
+- 备用开关（若需 thinking 模式）：`+data.apply_chat_template_kwargs.enable_thinking=True` → 渲染尾为 `<｜Assistant｜><think>`（同 SFT 前 eval 的 proven 格式）。
+- 复跑验证进行中（本次 §9.2 之后重发）。
+
+### 9.5 复现实验证据链（命令与结果原文）
+- serve 侧（DP2 16 卡，`MODEL_PATH=<sft116 导出>` `bash scripts/run_vllm_top32_dp2.sh`）三路对照（`scripts/eval_gsm8k_serve.py`，16 题）：
+```
+[eval] plain+greedy    : n=16 closed(stop)=15 has_answer=15 correct=4
+[eval] plain+T=1.0     : n=16 closed(stop)=16 has_answer=16 correct=1     ← 采样假设否决
+[eval] rl-prompt+greedy: n=16 closed(stop)=15 has_answer=15 correct=1     ← prompt 措辞假设否决
+[eval] rl+</think>     : n=16 closed(stop)=16 has_answer=16 correct=5
+[eval] rl+无标签      : n=16 closed(stop)=15 has_answer=15 correct=4     ← 全部变体正常收尾
+```
+- tokenizer 直证（python 一行测试）：
+```
+== rl_tokenizer:        tail='...after "Answer:".<｜Assistant｜><think>'   ✓ 渲染正常
+== model_dir_tokenizer: ValueError: Cannot use chat template functions because
+                        tokenizer.chat_template is not set ...              ← 原 ckpt 无 jinja 模板
+```
+- RL 侧采样参数核验：`verl/workers/config/rollout.py:40-42`（temperature=1.0/top_k=-1/top_p=1.0，recipe 未覆盖）= 与 serve 实验 E2 完全一致 → 参数非因。
+- vLLM 引擎侧默认（`verl/workers/rollout/vllm_rollout/vllm_async_server.py:640`）：`ignore_eos` 默认 False ✓。
+
+### 9.6 调试设施（长期保留，env 门控/默认关闭可回收）
+1. `verl/experimental/agent_loop/agent_loop.py::_postprocess` — 加了 `VERL_AGENT_DUMP` 门控 dump（该点后来确认 TQ 流程不经过，保留无害）。
+2. **`verl/trainer/ppo/v1/agent_loop_tq.py::AgentLoopWorkerTQ._agent_loop_postprocess`** — 真正的 per-sample 出口（V1/TQ 训练流）：在 `_compute_score` 之后 dump 前 4 条 `(prompt_ids, response_ids, reward_score)` 解码原文到 `/tmp/agent_dump.txt.<pid>`（**当前默认开启**，查完改回 env 门控）。
+   - 关键结构发现：**V1 路径不经 base 的 `_postprocess` 批量拼装**，而是 per-sample `tq.async_kv_batch_put` 入 TransferQueue；reward 由 `_compute_score`（base:967）经 **reward loop worker** 异步计算（TaskRunnerV1"reward loop manager initialized"）。
+3. reward 侧解码路径核验：`verl/workers/reward_manager/batch.py:53-59` — 用 `attention_mask[:, prompt_len:].sum()` 切有效长度后 decode（**无 padding 污染** ✓）；不需要动。
+
+### 9.7 训推一致性（用户关注目标之一）现状与告警
+| 指标 | SFT-116 模型（今日 3 次 RL smoke） | 2026-10-10 原模型期 |
+|---|---|---|
+| `training/rollout_probs_diff_mean` | 5.6-5.7e-4 | 同量级 ✓ |
+| `rollout_actor_probs_pearson_corr` | **0.61-0.70** | **0.978** |
+| `rollout_corr/kl` | 0.31 | 0.23 |
+
+- diff_mean 极小（模型两侧一致），但 pearson 显著下降 → 待查：相关性指标对 logprob 分布的敏感性（健康模型的 logprob 分布更平坦/多样，相关系数天然变化）还是引擎/vLLM 某处半精度路径问题。列为 reward 修复后的第二优先项。
+
+### 9.8 dump 实锤（07:51，uid 同一 prompt ×8 samples，131+128 全 rank）：**输出是乱码词沙拉，不是循环思考**
+```
+prompt plen=185 ✓ 完好: '...Remember to put your answer on its own line after "Answer:".<｜Assistant｜></think>'
+response rlen=1024, reward=-1.0:
+RESP-HEAD: " upon RA Design » not. First version barMarialространal Here, procedure can derive by
+            RTGoal§ITRotud..."   ← 多语种/unicode 碎片混排
+（128 侧样本相同形态；含大量常见英文词+俄/中/阿拉伯碎片 = 分布被打平的采样噪声）
+```
+→ "顶格 1024" 的机理修正：不是落回思考循环，而是**权重损坏后语言模型退化为噪声分布**（EOS 概率极低 → 全部顶格）。
+
+### 9.9 定位实验矩阵（每步一条决定性证据）
+| # | 实验 | 命令要点 | 结果 | 结论 |
+|---|---|---|---|---|
+| E-a | serve 导出目录（vLLM 文件加载）| `MODEL_PATH=<sft116> bash scripts/run_vllm_top32_dp2.sh` + eval | 正常答题 25-31% | **文件加载路径 ✓** |
+| E-b | SFT 引擎加载导出目录（索引驱动，与 RL actor 同 loader）| `MODEL_PATH=<sft116> bash scripts/run_sft_dsv41_2node.sh master 2` | **train/loss=0.681**（step1；原模型同数据 1.855；损坏应 >5）+ "direct shard load verified bit-exact" | **引擎加载路径 ✓** |
+| E-c | RL 1 步 + `EFSDP_SIZE=1`（历史 proven 几何，LOCAL_EXPORT 快路径生效）| `EFSDP_SIZE=1 bash scripts/run_grpo_2node.sh master 1` | 进行中 | 若正常 → **损坏在 efsdp=2 下 engine→vLLM sync 的未验证回退路径**（我今晚新引入）|
+
+**推理链（E-a+E-b 之后）**：两端加载都健康 → 唯一剩下的通道 = **每步 update_weights 的 sync**。efsdp=2 时 `_export_local_experts` 因"两个 mesh 维同切 dim0"走 `super()._export_param` 回退（默认全 gather 路径），该组合从未随 RL 验证过；efsdp=1 才是历史 0.978 pearson / 13s sync 的 proven 路径。
+
+### 9.10 ✅ E-c 实验判定：**EFSDP=1 修复一切**（2026-10-11 08:29-08:36）
+**1 步 RL（`EFSDP_SIZE=1`，其余不变；日志 `grpo_top64_steps1_20261011_081117.log`）**
+
+| 指标 | 修前（efsdp=2，3 次一致） | **修后（efsdp=1）** |
+|---|---|---|
+| critic/score max | -1.0 | **+1.0（有答对样本）** |
+| critic/score mean | -1.0 | -0.9688（1/64 对；dapo 竞赛题） |
+| critic/advantages/mean (max) | 0.0 | **-0.0124（2.47）← 组内有差** |
+| actor/grad_norm | 0.0 | **0.3528 ← 梯度在流** |
+| response_length mean (clip) | 1024 (1.0) | **500 (0.297)** |
+| training/rollout_probs_diff_mean | 5.7e-4 | 0.028 |
+| **rollout_actor_probs_pearson_corr** | 0.61-0.70 | **0.9798 ← 复现历史健康值** |
+| rollout_corr/kl | 0.31 | 0.245（≈历史 0.23） |
+
+- dump 实证（08:27-29）：efsdp=1 下 rlen=41-291，含完美样本如
+  `:2015 cards = 2015/7 = 1266, remainder 5 … Answer: 6<｜end▁of▁sentence｜>`（EOS 收尾 ✓）。
+- **结论**：`EFSDP_SIZE=2`（今晚我为省显存给 RL 新增）→ 权重 sync 走 `_export_local_experts` 的**回退路径**（两个 mesh 维同切 dim0 时 `len(shard_mesh_dims)!=1` → `super()._export_param` 全 gather 路径，未随 RL 验证）→ vLLM 权重损坏 → 全乱码。**RL 侧保持 EFSDP=1**（历史 proven；SFT 侧 efsdp=2 与 sync 无关、维持不变——两侧用同一脚本不同 env 即可）。
+- 已发 **50 步正式跑**（`EFSDP_SIZE=1`，08:39，`/tmp/grpo50_master.log`；dump 补丁保留为证据，每 worker 仅写一次小文件）。
+
+### 9.11 待办/观察项
+1. 50 步曲线：reward mean/max 走势、consistency 稳定性、step2+ 的 HBM（efsdp=1 下 update 峰值需盯，历史 ~60GB 顶）。
+2. efsdp=2 下 sync 回退路径的具体损坏机制（代码级）——不阻塞，留档。
+3. dump 补丁回收：`agent_loop_tq.py` 默认开启 → 收尾后改回 env 门控。
+
+### 9.12 efsdp=2 sync 损坏的代码线索（TODO，不阻塞）
+SYNC-PROFILE 对比（同模型同导出，仅 efsdp 不同）：
+```
+efsdp=1（正常）: sender 1364 tensors, 25.87 GiB, 51 buckets | export 0.4s, flush 10.2s
+efsdp=2（损坏）: sender 1364 tensors, 20.60 GiB, 43 buckets | export 0.5s, flush 7.9s
+```
+- 张量计数相同、**字节数与 bucket 数不同**（20.60 vs 25.87 GiB）→ 发送集内容不同。
+- 代码路径：`fsdp_turbo_dsv41_impl.py::_export_local_experts` 要求“dim0 仅一个 mesh 维切分”（`len(shard_mesh_dims)==1`）；efsdp=2 时 efsdp 与 ep **两个维都切 dim0** → 回退 `super()._export_param`（全 gather 融合张量）+ `unfuse_moe_params`→`split_fused_expert_tensor(first_expert_id=0)` 对**每个 rank 都产出全 32 专家的 w1/w3/w2**，而 LOCAL 模式的接收端契约是“rank i 收发同段专家”（docstring 原文）；两条语义混合后接收端错位 → vLLM 专家权重损坏 → 乱码。
+- 未逐位复现到行号级（需 receiver 侧日志/trace）；修复选项（后续）：① RL 保持 EFSDP=1（当前采用）；② 修 `_export_local_experts` 支持双维（StridedShard）切分；③ efsdp>1 时禁用 LOCAL_EXPORT 并整体走全量 gather 契约。
+
+### 9.13 已备好：GSM8K 对齐版 RL 数据（演示真实上升曲线用）
+- **动机**：50 步的 dapo 曲线 = 稀疏 +1（竞赛题难度远超 GSM8K-SFT 模型水平，dump 实证 -1 样本格式全对、答案真错）。约 6% 样本有 +1 → 组内信号存在但稀疏。
+- **数据**：`/mnt/share/m00899630/dsv41/rl_data/gsm8k_train_rl.parquet`（512 行，由 gsm8k_main_train_sft.parquet 转：同一 instruction 包裹、`Answer: N` 格式、`reward_model={ground_truth, style:'rule-lighteval/MATH_v2'}`、`data_source='math_dapo'` 同打分器）。模型在该分布上 ~25% 正确 → 组内（8 采样）大概率有对有错 → 强 GRPO 信号。
+- **启动方式（待定）**：把 GRPO recipe/启动的 `data.train_files` 换成本文件即可（其余不变，EFSDP_SIZE=1）；建议在 50 步 dapo 曲线出来后按需执行。
