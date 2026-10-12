@@ -466,7 +466,30 @@ class CheckpointEngineManager:
     @auto_await
     async def sleep_replicas(self):
         """Sleep all rollout replicas: free weight and kv_cache device memory."""
-        await asyncio.gather(*[r.sleep() for r in self.replicas])
+        # [sleep-debug] temporary instrumentation, see wiki/worklog_dsv41_direct_shard_load.md
+        import logging
+
+        _lg = logging.getLogger("verl.checkpoint_engine")
+        _lg.warning(
+            "[sleep-debug] sleep_replicas: %d replica(s); classes=%s; bound_sleep=%s",
+            len(self.replicas),
+            [type(r).__name__ for r in self.replicas],
+            [
+                f"{getattr(type(r), 'sleep', None).__module__}.{getattr(type(r), 'sleep', None).__qualname__}"
+                for r in self.replicas
+            ],
+        )
+
+        async def _one(r):
+            try:
+                await r.sleep()
+                _lg.warning("[sleep-debug] replica %s: sleep returned", type(r).__name__)
+            except Exception as e:  # noqa: BLE001
+                _lg.warning("[sleep-debug] replica %s: sleep RAISED %r", type(r).__name__, e)
+                raise
+
+        await asyncio.gather(*[_one(r) for r in self.replicas])
+        _lg.warning("[sleep-debug] sleep_replicas: done")
 
     @auto_await
     async def wake_up_replicas(self):

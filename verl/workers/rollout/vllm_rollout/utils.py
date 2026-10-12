@@ -20,6 +20,7 @@ import os
 import platform
 import signal
 import threading
+import time
 from collections.abc import Mapping
 from types import MethodType
 from typing import Any, Literal, Optional, get_args
@@ -254,6 +255,11 @@ class vLLMColocateWorkerExtension:
             # fall back to the worker's local rank on the current accelerator.
             self.device = torch.device(f"{get_device_name()}:{self.local_rank}")
 
+        # Profiling hook (VERL_SYNC_PROFILE=1): split the sync across the three steps below
+        # (step 1 layout revert, step 2 bucketed receive + load, step 3 post-load transforms).
+        prof = os.environ.get("VERL_SYNC_PROFILE") == "1"
+        t_start = time.perf_counter()
+
         # =========================== step 1: prepare for weight loading ===========================
         quant_reload_states = None
 
@@ -265,6 +271,17 @@ class vLLMColocateWorkerExtension:
 
             for model in self._iter_all_models():
                 restore_moe_expert_maps(model)
+
+        # Ascend leaves the fused MoE expert weights in a transposed inference layout
+        # (w13 [E, hidden, 2*inter], w2 [E, inter, hidden]); the expert loaders and the
+        # trainer's per-expert tensors are checkpoint layout, so revert before the load.
+        # The Ascend linears re-apply their own layouts while loading (wo_a, ...) and
+        # step 3 re-runs process_weights_after_loading, which transposes the experts
+        # back for the kernels.
+        if is_npu_available and not (peft_config and base_sync_done):
+            from verl.utils.vllm.npu_expert_layout import restore_expert_checkpoint_layout
+
+            restore_expert_checkpoint_layout(self._iter_all_models())
 
         if self._is_qat_model:
             # QAT (compressed-tensors): Prepare for weight loading BEFORE receiving any buckets
@@ -294,6 +311,7 @@ class vLLMColocateWorkerExtension:
                 patch_vllm_moe_model_weight_loader(model)
 
         # =========================== step 2: receive weights and update ===========================
+        t_step1 = time.perf_counter()
         receiver = BucketedWeightReceiver(
             zmq_handle=self._get_zmq_handle(),
             device=self.device,
@@ -324,6 +342,7 @@ class vLLMColocateWorkerExtension:
             )
 
         receiver.receive_weights(on_bucket_received=on_bucket_received)
+        t_step2 = time.perf_counter()
 
         # =========================== step 3: process weights after loading ===========================
         if self._is_qat_model:
@@ -351,6 +370,15 @@ class vLLMColocateWorkerExtension:
 
             for model, model_config in self._iter_all_models_with_config():
                 process_weights_after_loading(model, model_config, self.device)
+
+        if prof:
+            print(
+                f"SYNC-PROFILE step1 (revert) {t_step1 - t_start:.1f}s, "
+                f"step2 (receive+load) {t_step2 - t_step1:.1f}s, "
+                f"step3 (post-load) {time.perf_counter() - t_step2:.1f}s, "
+                f"total {time.perf_counter() - t_start:.1f}s",
+                flush=True,
+            )
 
     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
         """Apply buffer updates to the main model and any synced MTP drafter.

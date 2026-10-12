@@ -303,7 +303,14 @@ class FSDPEngineConfig(EngineConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        assert self.strategy in ["fsdp", "fsdp2", "fsdp_turbo"], f"strategy {self.strategy} not supported"
+        # fsdp_turbo_dsv41 is a registered backend (engine/fsdp/fsdp_turbo_dsv41_impl.py
+        # @register backends, and trainer/config/engine/fsdp.yaml documents it). The GRPO
+        # actor path never hits this assert because ActorConfig.__post_init__ stamps the
+        # strategy via object.__setattr__ *after* validation; the SFT trainer builds the
+        # engine config directly from yaml, so the value must be legal here too.
+        assert self.strategy in ["fsdp", "fsdp2", "fsdp_turbo", "fsdp_turbo_dsv41"], (
+            f"strategy {self.strategy} not supported"
+        )
 
 
 @dataclass

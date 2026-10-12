@@ -15,13 +15,12 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from omegaconf import MISSING
-from transformers import AutoConfig
 
 from verl.base_config import BaseConfig
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
-from verl.utils.model import get_generation_config, update_model_config
+from verl.utils.model import get_auto_config_with_vllm_fallback, get_generation_config, update_model_config
 
 __all__ = ["HFModelConfig", "MtpConfig"]
 
@@ -183,23 +182,11 @@ class HFModelConfig(BaseConfig):
 
         # construct hf_config
         attn_implementation = self.override_config.get("attn_implementation", "flash_attention_2")
-        try:
-            self.hf_config = AutoConfig.from_pretrained(
-                self.local_hf_config_path,
-                trust_remote_code=self.trust_remote_code,
-                attn_implementation=attn_implementation,
-            )
-        except ValueError as error:
-            lookup_error = error.__cause__ or error.__context__
-            if not isinstance(lookup_error, KeyError) or lookup_error.args != ("deepseek_v4",):
-                raise
-            from vllm.transformers_utils.config import get_config
-
-            self.hf_config = get_config(
-                self.local_hf_config_path,
-                trust_remote_code=self.trust_remote_code,
-                attn_implementation=attn_implementation,
-            )
+        self.hf_config = get_auto_config_with_vllm_fallback(
+            self.local_hf_config_path,
+            trust_remote_code=self.trust_remote_code,
+            attn_implementation=attn_implementation,
+        )
 
         override_config_kwargs = {}
 

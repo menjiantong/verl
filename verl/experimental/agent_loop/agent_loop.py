@@ -1068,6 +1068,32 @@ class AgentLoopWorker:
         attention_mask = torch.cat([input.attention_mask for input in inputs], dim=0)
         input_ids = torch.cat([input.input_ids for input in inputs], dim=0)
         position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
+        # [2026-10-11] env-gated rollout dump: reward was pinned at -1 with every response at the
+        # length cap, so capture what the agent loop ACTUALLY sent and got back. One dump per
+        # worker process, decode-only, harmless when the env var is unset.
+        import os as _os
+
+        _dump_path = _os.environ.get("VERL_AGENT_DUMP")
+        if _dump_path and not getattr(self, "_agent_dump_done", False):
+            self._agent_dump_done = True
+            try:
+                with open(f"{_dump_path}.{_os.getpid()}", "w") as _fh:
+                    for _k, _inp in enumerate(inputs[:4]):
+                        _pids = _inp.prompt_ids
+                        _rids = _inp.response_ids
+                        _pids = _pids[0] if _pids.ndim > 1 else _pids
+                        _rids = _rids[0] if _rids.ndim > 1 else _rids
+                        _ptxt = self.tokenizer.decode([int(x) for x in _pids])
+                        _rtxt = self.tokenizer.decode([int(x) for x in _rids])
+                        _fh.write(f"=== sample {_k}: prompt_len={len(_pids)} resp_len={len(_rids)}\n")
+                        _fh.write(f"PROMPT-HEAD: {_ptxt[:150]!r}\n")
+                        _fh.write(f"PROMPT-TAIL: {_ptxt[-260:]!r}\n")
+                        _fh.write(f"RESP-HEAD: {_rtxt[:700]!r}\n")
+                        _fh.write(f"RESP-TAIL: {_rtxt[-400:]!r}\n")
+                        _fh.write(f"RESP-LAST-IDS: {[int(x) for x in list(_rids)[-8:]]}\n\n")
+                print(f"[agent-dump] wrote {_dump_path}.{_os.getpid()}", flush=True)
+            except Exception as _e:
+                print(f"[agent-dump] failed: {_e!r}", flush=True)
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)

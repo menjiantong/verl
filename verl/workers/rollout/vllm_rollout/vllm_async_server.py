@@ -302,6 +302,24 @@ class vLLMHttpServer:
 
         quantization, hf_overrides = self._apply_quantization()
 
+        # Train-vs-inference consistency A/B (wiki/work_log/pearson_0999/).
+        # vLLM defaults the lm_head to the *model* dtype, i.e. bf16 here, so the engine's logits are
+        # bf16-rounded while the trainer's `ParallelHead` computes them in fp32 (it holds the head
+        # weight in fp32 and does `F.linear(x.float(), w.float())`). vLLM's own documentation for
+        # `ModelConfig.head_dtype` says the fp32 head "is required for RL training-inference
+        # consistency (the trainer computes logits in fp32)". `hf_overrides` is `config.update(...)`
+        # on the HF config, and `LogitsProcessor.__init__` reads `model_config.head_dtype` from it.
+        #
+        # RESULT (2026-09-27, real 4-layer weights, 8-card GRPO, 10 steps each): this made things
+        # *worse* -- the median relative error on high-probability tokens went 0.0049 -> 0.0126
+        # (2.5x) on every single step, pooled pearson 0.99464 -> 0.99403. The vLLM docstring's
+        # premise is "the trainer computes logits in fp32"; here
+        # `prepare_deepseek_v41_model_for_fsdp` normalises *every* floating parameter (including
+        # `ParallelHead.weight`) to bf16, so the engine's default bf16 lm_head is already the
+        # rounding-point match. Keep the default; leave this gate for the record.
+        if os.environ.get("VERL_DSV41_ALIGN_HEAD") == "1":
+            hf_overrides["head_dtype"] = "float32"
+
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):
             compilation_config = json.loads(compilation_config)
@@ -852,7 +870,20 @@ class vLLMHttpServer:
             logger.info("skip wake_up in standalone mode")
 
     async def sleep(self):
+        # [sleep-debug] temporary instrumentation, see wiki/worklog_dsv41_direct_shard_load.md
+        print(
+            f"[sleep-debug] server.sleep: node_rank={self.node_rank} free_cache_engine={self.config.free_cache_engine} mode={self.rollout_mode}",
+            flush=True,
+        )
+        logger.warning(
+            "[sleep-debug] server.sleep: node_rank=%s free_cache_engine=%s mode=%s",
+            self.node_rank,
+            self.config.free_cache_engine,
+            self.rollout_mode,
+        )
         if self.node_rank != 0 or not self.config.free_cache_engine:
+            print("[sleep-debug] server.sleep: skipped by gate", flush=True)
+            logger.warning("[sleep-debug] server.sleep: skipped by gate")
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
@@ -861,6 +892,8 @@ class vLLMHttpServer:
             await self.engine.sleep(level=1)
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
+        print("[sleep-debug] server.sleep: engine sleep call returned", flush=True)
+        logger.warning("[sleep-debug] server.sleep: engine sleep call returned")
 
     async def clear_kv_cache(self):
         if self.node_rank == 0:
@@ -1377,8 +1410,15 @@ class vLLMReplica(RolloutReplica):
     async def sleep(self):
         """Sleep each rollout server."""
         # Drain DP engines for safe sleep.
+        # [sleep-debug] temporary instrumentation, see wiki/worklog_dsv41_direct_shard_load.md
+        print("[sleep-debug] replica.sleep: draining requests", flush=True)
+        logger.warning("[sleep-debug] replica.sleep: draining requests")
         await self.servers[0].wait_for_requests_to_drain.remote()
+        print(f"[sleep-debug] replica.sleep: drained; sleeping {len(self.servers)} server(s)", flush=True)
+        logger.warning("[sleep-debug] replica.sleep: drained; sleeping %d server(s)", len(self.servers))
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
+        print("[sleep-debug] replica.sleep: all servers returned", flush=True)
+        logger.warning("[sleep-debug] replica.sleep: all servers returned")
 
     async def abort_all_requests(self) -> dict[str, Any]:
         """Abort all ongoing generation requests across all servers.
