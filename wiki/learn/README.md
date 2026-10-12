@@ -17,6 +17,7 @@
 | # | 文档 | 主题 | 相关 worklog |
 |---|---|---|---|
 | 01 | [`01_weight_sync_get_per_tensor_param.md`](01_weight_sync_get_per_tensor_param.md) | `BaseEngine.get_per_tensor_param` 及其姊妹方法:调用链、I/O 契约、五个后端的物化策略对比(重点 `FSDPEngine`) | [`../worklog_dsv41_weight_sync_export.md`](../worklog_dsv41_weight_sync_export.md)(export 段的实测与快慢路径) |
+| 03 | [`03_verl_weight_load_offload_memory.md`](03_verl_weight_load_offload_memory.md) | 训练引擎(fsdp_turbo_dsv41)的**权重加载/offload/显存账**:初始化调用链、三条装载路径(直载分片/rank0+广播/resume)及实测字节与耗时、offload 三个开关的真实语义(FSDP2 CPUOffloadPolicy vs 手动逐参搬运 vs engram host 表)、逐阶段显存公式与全配置实测对照、8 条实测坑 | [`../dsv41_memory_and_parallel_archive.md`](../dsv41_memory_and_parallel_archive.md)(逐阶段数字全表) · [`../worklog_dsv41_sft.md`](../worklog_dsv41_sft.md)(SFT 显存战时间线) |
 | 02 | [`02_dsv41_indexer_scatter_marker_e9.md`](02_dsv41_indexer_scatter_marker_e9.md) | V4.1 索引器写缓存的整条链(`forward`→`update_keys`→`scatter_cache_sk`→`npu_scatter_nd_update_sk` 的 aclnn/tiling/kernel),以及 `[-1,-1]` marker 为什么被当成真实坐标(E9 的根因、地址算术、复现工具与"改了源码没改二进制"的现状) | [`../worklog_dsv41_top64_grpo.md`](../worklog_dsv41_top64_grpo.md) §5.7.8(E9 的时间线) |
 
 > 新增一篇就往这张表里加一行。命名:`NN_topic.md`,`NN` 只表示阅读顺序,不表示依赖。

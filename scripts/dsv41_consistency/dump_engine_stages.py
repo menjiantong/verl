@@ -60,8 +60,9 @@ def main():
 
     additional_config = {
         "mc2_comm_alg": "fullmesh_v2",
-        "enable_engram": False,
-        "engram_storage": "int8",
+        # [2026-10-11] enable_engram/engram_storage were extra keys of an earlier vllm-ascend
+        # branch; the current fork's AscendConfig rejects them (pydantic extra=forbid) and
+        # Engram auto-configures itself from the checkpoint's engram_layer_ids.
         "ascend_compilation_config": {"enable_npugraph_ex": False, "enable_static_kernel": False},
         # Same RL switch the GRPO script sets: weight_nz_mode=0, no expandable segments.
         "rl_config": {"enabled": True, "enable_batch_invariant": args.batch_invariant},
@@ -127,10 +128,12 @@ def main():
             stages = written
             print(f"[dump-engine] len={length}: stage dumps {written[:2]}", flush=True)
 
-        print(f" ---------------------------------- result.prompt_logprobs shape is {result.prompt_logprobs.shape} ----------------------------")
+        # [2026-10-11] prompt_logprobs is a list of per-position dicts ({token_id: Logprob})
+        # in the current fork (was a tensor); the old debug prints called .shape on both and
+        # killed the run after the stage dumps. Keep them version-agnostic.
+        print(f" ---------------------------------- result.prompt_logprobs n_positions={len(result.prompt_logprobs)} ----------------------------")
         scored, argmax = [], []
         for position, entry in enumerate(result.prompt_logprobs):
-            print(f" ---------------------------------- entry shape is {entry.shape} ----------------------------")
             if entry is None:  # position 0 has no context
                 continue
             scored_token = ids[position]

@@ -161,7 +161,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
         # [2026-10-11] debug dump: reward was pinned at -1 with every response at the cap; capture
         # the first few REAL trajectories (prompt tail, response text, reward) per worker process.
-        _dump_dir = os.environ.get("VERL_AGENT_DUMP", "/tmp/agent_dump.txt")
+        _dump_dir = os.environ.get("VERL_AGENT_DUMP")
         _n_seen = getattr(self, "_agent_dump_count", 0)
         if _n_seen < 4:
             self._agent_dump_count = _n_seen + len(outputs)

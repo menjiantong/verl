@@ -347,3 +347,47 @@ efsdp=2（损坏）: sender 1364 tensors, 20.60 GiB, 43 buckets | export 0.5s, f
 - **动机**：50 步的 dapo 曲线 = 稀疏 +1（竞赛题难度远超 GSM8K-SFT 模型水平，dump 实证 -1 样本格式全对、答案真错）。约 6% 样本有 +1 → 组内信号存在但稀疏。
 - **数据**：`/mnt/share/m00899630/dsv41/rl_data/gsm8k_train_rl.parquet`（512 行，由 gsm8k_main_train_sft.parquet 转：同一 instruction 包裹、`Answer: N` 格式、`reward_model={ground_truth, style:'rule-lighteval/MATH_v2'}`、`data_source='math_dapo'` 同打分器）。模型在该分布上 ~25% 正确 → 组内（8 采样）大概率有对有错 → 强 GRPO 信号。
 - **启动方式（待定）**：把 GRPO recipe/启动的 `data.train_files` 换成本文件即可（其余不变，EFSDP_SIZE=1）；建议在 50 步 dapo 曲线出来后按需执行。
+
+## 十、GSM8K 作 RL 数据（2026-10-12 起）
+
+### 10.1 任务与背景（用户指示）
+上一轮 reward 太低（dapo 竞赛级题 × SFT-GSM8K 模型，信号步 58% 但 +1 稀疏）；本轮改用 **GSM8K 做 RL 数据**。
+用户要求：先查有没有现成脚本（有则用，没有则写）；**转换可做、训练启动等指令**；全程记录任务/执行/错误/修改。
+
+### 10.2 现状核查（执行记录）
+- 昨天已内联生成 512 行 `/mnt/share/m00899630/dsv41/rl_data/gsm8k_train_rl.parquet`（worklog §9.13），
+  **无独立脚本** → 按指示新写 `scripts/prepare_gsm8k_rl.py`。
+- 新脚本读**官方原始** `question/answer` 列（`#### N` → `ground_truth`，去千分位），逐行产出
+  dapo 兼容 schema（data_source='math_dapo' / prompt=instruction 包裹的 messages / ability / reward_model{style:'rule-lighteval/MATH_v2'} / extra_info.index），
+  与 dapo 生产文件**逐列一致**（脚本内置断言）。instruction 包裹措辞与 dapo/评测一致（已验证该风格 15/16 收尾）。
+
+### 10.3 执行结果（命令与产物）
+```bash
+python3 scripts/prepare_gsm8k_rl.py \
+  --src /mnt/share/m00899630/dataset/gsm8k_official \
+  --dst /mnt/share/m00899630/dsv41/rl_data
+# [ok] gsm8k_main_train_rl.parquet: 7473 rows (0 dropped)
+# [ok] gsm8k_main_test_rl.parquet: 1319 rows (0 dropped)   ← 供 data.val_files
+# [check] columns match dapo; sample gt='72'
+```
+- 一致性核对：与昨天 512 行文件**共享的 512 条 prompt 的 ground_truth 逐条一致（0 mismatch）**。
+- 错误记录：转换本身**零错误**（一次跑通；仅 py_compile 预检通过）。
+
+### 10.4 启动方式（已备，待用户指令；纪律：EFSDP_SIZE=1 + TIS）
+recipe 走 env：`TRAIN_FILE` / `TEST_FILE`；拟用命令——
+```bash
+TRAIN_FILE=/mnt/share/m00899630/dsv41/rl_data/gsm8k_main_train_rl.parquet \
+TEST_FILE=/mnt/share/m00899630/dsv41/rl_data/gsm8k_main_test_rl.parquet \
+MODEL_PATH=/mnt/share/m00899630/dsv41/weights/DeepSeek-V4.1-Flash-top32-sft116 \
+EFSDP_SIZE=1 ROLLOUT_IS=token \
+bash scripts/run_grpo_2node.sh master <STEPS>     # + 128 从机同 env
+```
+
+### 10.5 运维快照（2026-10-12 13:00，任务 1）
+| 机器 | 连通 | HBM | 备注 |
+|---|---|---|---|
+| 131 | ✅ | 每卡 ~14GB 残留（32 个驱动可见/ps 不可见 python3 条目）；实测 44GB 可分配 → 可用 | 重载前建议重启容器回收 |
+| 128 | ❌ sshd refused | — | 需恢复容器/sshd；恢复后 sync_to_128 |
+| 121 | ✅ | 每卡 ~58.8GB 单作业满占（他人进程） | 暂不可用 |
+| 126 | ✅ | 7 卡 ~48GB + 9 卡 ~3GB | 部分可用（9 卡余量~62GB） |
+| 121/126 | | 均有 /mnt/share 与 /workspace-verl（代码版本待核对） | 端口 50001 前缀一致 |

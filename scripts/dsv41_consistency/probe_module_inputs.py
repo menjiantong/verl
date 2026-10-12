@@ -247,10 +247,22 @@ def main():
     config = dt.build_fsdp_turbo_config(_BuildArgs(args))
     init_parallel_state(config)
 
+    # [2026-10-11] the top32 model declares Engram layers, whose compressed token map is
+    # built from the tokenizer (engram.py:182 raises when tokenizer is None). The 4-layer
+    # fixtures this harness was written for have no Engram layers, so None was fine there.
+    from transformers import AutoTokenizer
+
+    _tok = AutoTokenizer.from_pretrained(
+        os.environ.get("TOKENIZER_PATH", "/mnt/share/m00899630/dsv41/rl_tokenizer"),
+        trust_remote_code=True,
+    )
     model = build_deepseek_v41_model(
-        tokenizer=None,
+        tokenizer=_tok,
         engram_meta_init=True,
-        engram_storage_backend="row_sharded",
+        # [2026-10-11] top32 has Engram layers -> must use host_offload (row_sharded was
+        # dropped upstream and now raises for models that actually declare tables; inert
+        # for the engr am-free 4-layer fixtures this harness was built for).
+        engram_storage_backend="host_offload",
         use_sparse_flash_attn=False,  # the engine builds it with False (eager torch)
         experts_meta_init=True,
         config_path=args.model_path,

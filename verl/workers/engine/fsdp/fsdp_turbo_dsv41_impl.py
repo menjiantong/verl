@@ -718,6 +718,20 @@ def read_dsv41_checkpoint_state_dict(
 
     def cast(tensor: torch.Tensor, expected_name: str, shape, dtype) -> torch.Tensor:
         if tuple(tensor.shape) != tuple(shape):
+            # [2026-10-11] Engram embed tables are 2048-row-aligned in the model while the
+            # checkpoint stores the unpadded table (e.g. 384006168 vs 384008192 rows). The
+            # production host-offload loader zero-pads those rows; mirror it here so generic
+            # readers that share this helper (probes) can load the tables too. Both sides of
+            # a comparison end up with the same zero padding.
+            if (
+                ".engram." in expected_name
+                and tensor.dim() == 2
+                and tuple(tensor.shape[1:]) == tuple(shape[1:])
+                and tensor.shape[0] < shape[0]
+            ):
+                padded = tensor.new_zeros(shape)
+                padded[: tensor.shape[0]] = tensor
+                return padded.to(dtype)
             raise ValueError(
                 f"Checkpoint tensor {expected_name} has shape {tuple(tensor.shape)}, "
                 f"the training model expects {tuple(shape)}."
