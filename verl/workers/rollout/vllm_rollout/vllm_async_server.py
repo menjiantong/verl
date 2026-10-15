@@ -25,6 +25,10 @@ from typing import Any, Callable, Optional
 
 import ray
 import vllm.entrypoints.cli.serve
+
+_PLP_DEBUG_DONE = False
+_ENV_PROBE_DONE = False
+_REPLICA_PROBE_DONE = False
 from packaging import version
 from ray.actor import ActorHandle
 from vllm import SamplingParams
@@ -588,6 +592,17 @@ class vLLMHttpServer:
         Args:
             kv_transfer_params: vLLM KV-transfer payload for PD requests.
         """
+        global _ENV_PROBE_DONE
+        if not _ENV_PROBE_DONE:
+            _ENV_PROBE_DONE = True
+            logger.warning(
+                "[VA_V41 env probe] PREFILL=%s EAGER=%s PARTIAL=%s AR=%s logprobs_req=%s",
+                os.environ.get("VA_V41_PREFILL_LOGPROBS"),
+                os.environ.get("VA_V41_ATTN_EAGER"),
+                os.environ.get("VA_V41_OPROJ_FP32_PARTIAL"),
+                os.environ.get("VA_V41_OPROJ_FP32_AR"),
+                sampling_params.get("logprobs") if isinstance(sampling_params, dict) else None,
+            )
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
             return await self._pd_dispatch(
                 prompt_ids,
@@ -730,6 +745,68 @@ class vLLMHttpServer:
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+            # [2026-10-13 task1 (C)] Optional prefill-mode logprobs for the response tokens.
+            # The decode-time values above sit on a different batching path than the trainer's
+            # full-sequence recompute (measured engine-internal decode-vs-prefill gap: most
+            # tokens ~0, a few ±0.04-0.065 nats -> 0.02-0.035 mean|d|, ~40-60% of the RL
+            # diff_mean). Re-running [prompt+response] as one prompt yields per-position
+            # logprobs computed in PREFILL -- the mode the trainer recompute uses -- so the
+            # consistency metric stops mixing decode with prefill. Env-gated; any failure
+            # keeps the decode values.
+            if os.environ.get("VA_V41_PREFILL_LOGPROBS", "0") == "1":
+                try:
+                    full_ids = list(prompt_ids) + list(token_ids)
+                    sp2 = SamplingParams(max_tokens=1, prompt_logprobs=0)
+                    if getattr(sampling_params, "temperature", None) is not None:
+                        sp2.temperature = sampling_params.temperature
+                    res2 = None
+                    async for out2 in self.engine.generate(
+                        prompt=TokensPrompt(prompt_token_ids=full_ids),
+                        sampling_params=sp2,
+                        request_id=f"{request_id}_plp",
+                    ):
+                        res2 = out2
+                    plp = getattr(res2, "prompt_logprobs", None)
+                    vals = []
+                    if plp is not None:
+                        start = len(prompt_ids)
+                        for j in range(start, start + len(token_ids)):
+                            entry = plp[j] if j < len(plp) else None
+                            lp = entry.get(full_ids[j]) if entry else None
+                            if lp is None:
+                                vals = []
+                                break
+                            vals.append(float(lp.logprob))
+                    global _PLP_DEBUG_DONE
+                    if not _PLP_DEBUG_DONE:
+                        _PLP_DEBUG_DONE = True
+                        logger.warning(
+                            "[VA_V41_PREFILL_LOGPROBS debug] req=%s prompt=%d resp=%d plp_type=%s "
+                            "plp_len=%s vals=%d nan=%d sample=%s",
+                            request_id,
+                            len(prompt_ids),
+                            len(token_ids),
+                            type(plp).__name__,
+                            len(plp) if plp is not None else None,
+                            len(vals),
+                            sum(1 for v in vals if v != v),
+                            [round(v, 4) for v in vals[:3]],
+                        )
+                    if len(vals) == len(token_ids) == len(log_probs):
+                        log_probs = vals
+                    else:
+                        logger.warning(
+                            "prefill logprob recompute produced %d/%d values for request %s; "
+                            "keeping decode-time logprobs.",
+                            len(vals),
+                            len(token_ids),
+                            request_id,
+                        )
+                except Exception:
+                    logger.exception(
+                        "prefill logprob recompute failed for request %s; keeping decode-time logprobs.",
+                        request_id,
+                    )
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
@@ -1364,8 +1441,25 @@ class vLLMReplica(RolloutReplica):
             env_vars = {
                 **{var: "1" for var in get_platform().ray_noset_envvars()},
                 **get_platform().rollout_env_vars(),
+                # [2026-10-13 task1] Pass the consistency/experiment switches through
+                # explicitly: the server actor is created with this runtime_env whitelist,
+                # and the engine workers inherit from it. Without this, VA_V41_* /
+                # VERL_DSV41_* exported by the launcher never reach the engine.
+                **{
+                    k: v
+                    for k, v in os.environ.items()
+                    if k.startswith(("VA_V41_", "VERL_DSV41_"))
+                },
             }
 
+            global _REPLICA_PROBE_DONE
+            if not _REPLICA_PROBE_DONE:
+                _REPLICA_PROBE_DONE = True
+                logger.warning(
+                    "[VA_V41 replica env probe] node_rank=%s passthrough=%s",
+                    node_rank,
+                    {k: v for k, v in env_vars.items() if k.startswith(("VA_V41_", "VERL_DSV41_"))},
+                )
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node_id,

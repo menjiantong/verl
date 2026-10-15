@@ -143,6 +143,7 @@ mkdir -p logs
 
 ########################### shared turbo config values ###########################
 ACTOR_TURBO="actor_rollout_ref.actor.fsdp_config.turbo_config"
+REF_TURBO="actor_rollout_ref.ref.fsdp_config.turbo_config"  # [2026-10-14] KL run needs the ref worker on the same turbo topology
 
 # Module names as seen by FSDPTurbo: the adapter wraps the backbone as `model`
 # (DeepseekV41ForCausalLMAdapter.model = Transformer -> embed / layers.{N} / norm / head).
@@ -198,12 +199,13 @@ MODEL=(
 )
 
 ACTOR=(
-    actor_rollout_ref.actor.optim.lr=1e-6
+    actor_rollout_ref.actor.optim.lr=2e-6
     actor_rollout_ref.actor.optim.optimizer=AdamW
     actor_rollout_ref.actor.ppo_mini_batch_size=${TRAIN_BSZ}
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
-    # No KL: see the header. need_reference_policy() then skips the ref worker entirely.
-    actor_rollout_ref.actor.use_kl_loss=False
+    # [2026-10-14 reward run] KL ON (low_var_kl, coef 0.001): the full-fix rerun wants the
+    # reference anchor to stabilise the 2x lr; the ref worker is back (extra forward/step).
+    actor_rollout_ref.actor.use_kl_loss=True
     actor_rollout_ref.actor.entropy_coeff=0
     actor_rollout_ref.actor.use_dynamic_bsz=False
     actor_rollout_ref.actor.strategy=fsdp_turbo_dsv41
@@ -227,6 +229,29 @@ ACTOR=(
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
 )
 
+REF=(
+    # [2026-10-14 KL run] mirror of run_deepseek_v41_grpo_fsdp_turbo_npu.sh's REF block:
+    # the ref worker rebuilds the engram-bearing model, so it needs the same 1-D EP mesh.
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1
+    actor_rollout_ref.ref.strategy=fsdp_turbo_dsv41
+    "${REF_TURBO}.distributed.fully_shard_parallel_size=${FSDP_SIZE}"
+    "${REF_TURBO}.distributed.tensor_parallel_size=${TP_SIZE}"
+    "${REF_TURBO}.distributed.expert_parallel_size=${EP_SIZE}"
+    "${REF_TURBO}.distributed.expert_fully_shard_parallel_size=${EFSDP_SIZE}"
+    "${REF_TURBO}.distributed.ulysses_parallel_size=1"
+    "+${REF_TURBO}.distributed.fsdp_plan.apply_modules=${FSDP_APPLY_MODULES}"
+    "+${REF_TURBO}.distributed.fsdp_plan.hook_modules=${HOOK_MODULES}"
+    "+${REF_TURBO}.distributed.fsdp_plan.cast_forward_inputs=False"
+    "${REF_TURBO}.distributed.fsdp_plan.output_dtype=null"
+    "+${REF_TURBO}.distributed.ep_plan.apply_modules=['model.layers.{*}.ffn.experts']"
+    "+${REF_TURBO}.distributed.ep_plan.dispatcher=fused"
+    actor_rollout_ref.ref.fsdp_config.reshard_after_forward=True
+    actor_rollout_ref.ref.entropy_from_logits_with_chunking=True
+    actor_rollout_ref.ref.use_torch_compile=False
+    actor_rollout_ref.ref.fsdp_config.offload_policy=True
+    actor_rollout_ref.ref.fsdp_config.param_offload=True
+)
+
 ROLLOUT=(
     actor_rollout_ref.rollout.name=${INFER_BACKEND}
     actor_rollout_ref.rollout.ignore_eos=False
@@ -238,7 +263,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.n=${SAMPLE_N}
     actor_rollout_ref.rollout.enable_chunked_prefill=True
     actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PROMPT_LEN + MAX_RESPONSE_LEN))
-    actor_rollout_ref.rollout.free_cache_engine=True
+    actor_rollout_ref.rollout.free_cache_engine=${FREE_CACHE_ENGINE:-True}
     # run_vllm2.sh serves the checkpoint with --enforce-eager.
     actor_rollout_ref.rollout.enforce_eager=True
     actor_rollout_ref.rollout.enable_prefix_caching=False
@@ -287,6 +312,7 @@ python3 -m verl.trainer.main_ppo \
     "${DATA[@]}" \
     "${MODEL[@]}" \
     "${ACTOR[@]}" \
+    "${REF[@]}" \
     "${ROLLOUT[@]}" \
     "${TRAINER[@]}" \
     "$@" 2>&1 | tee "logs/${LOG_TAG}-${start_time}.log"

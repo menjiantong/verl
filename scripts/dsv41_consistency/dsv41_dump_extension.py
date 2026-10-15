@@ -153,7 +153,19 @@ class Dsv41DumpExtension:
 
         # The eager attention impl and the hyper-connection helpers are plain Python, so
         # their exact inputs/outputs can be captured by wrapping the methods.
-        handles.extend(self._dsv41_wrap_methods(store, record, max_calls))
+        # [2026-10-13] Router instances are plain *attributes* of their host modules
+        # (RoutedExperts.router), not submodules -- invisible to named_modules(), which is
+        # why their captures had no layer identity before. Stamp the host module path onto
+        # every router object; the class-level wrapper reads it back via `_dsv41_probe_path`.
+        _router_names = ("AscendFusedTopKRouter", "AscendGroupedTopKRouter")
+        _n_stamped = 0
+        for _mod_name, _module in model.named_modules():
+            for _attr_val in vars(_module).values():
+                if any(_c.__name__ in _router_names for _c in type(_attr_val).__mro__):
+                    _attr_val._dsv41_probe_path = _mod_name
+                    _n_stamped += 1
+        store["__meta__"]["routers_stamped"] = _n_stamped
+        handles.extend(self._dsv41_wrap_methods(store, record, max_calls, model))
         handles.extend(self._dsv41_wrap_functions(store, record, max_calls))
         self._dsv41_handles = handles
         return {"hooked_modules": len(handles)}
@@ -201,18 +213,22 @@ class Dsv41DumpExtension:
                 handles.append((module, function_name, original))
         return handles
 
-    def _dsv41_wrap_methods(self, store, record, max_calls):
+    def _dsv41_wrap_methods(self, store, record, max_calls, model):
         """Wrap the interesting engine-internal methods with recording proxies."""
         import functools
 
         targets = []
         try:
-            from vllm_ascend.attention.dsa_v41 import DeepseekV41EagerAttentionImpl
+            # [2026-10-13] the class is named AscendDSAV41Impl in both stack lines (the
+            # DeepseekV41EagerAttentionImpl spelling silently disabled all attention-internal
+            # captures -- compare_routing/compare_attention found no multistream/_select keys).
+            from vllm_ascend.attention.dsa_v41 import AscendDSAV41Impl as _AttnImpl
 
             targets.append(
                 (
-                    DeepseekV41EagerAttentionImpl,
-                    ["preprocess", "multistream_preprocess", "_select_sparse_indices", "_attention", "forward"],
+                    _AttnImpl,
+                    ["multistream_preprocess", "_write_compressed_source",
+                     "_select_sparse_indices", "_forward_attention"],
                 )
             )
         except Exception:  # noqa: BLE001
@@ -251,7 +267,52 @@ class Dsv41DumpExtension:
             pass
 
         handles = []
+        # [2026-10-13] Router instances carry neither `prefix` nor `layer_idx`, so the
+        # class-level wrapper below collapsed all layers onto ONE key (the first max_calls
+        # calls won; compare_routing then found "no engine router capture"). Wrap the two
+        # router classes per *instance* so the key carries the module path
+        # (language_model.model.layers.N.mlp... -- exactly the prefix compare_routing wants).
+        _ROUTER_CLS_NAMES = ("AscendFusedTopKRouter", "AscendGroupedTopKRouter")
+        _inst_handles = []
         for cls, method_names in targets:
+            if cls.__name__ not in _ROUTER_CLS_NAMES:
+                continue
+            for _mod_name, _module in model.named_modules():
+                if not isinstance(_module, cls):
+                    continue
+                for method_name in method_names:
+                    _marker = f"_dsv41_wrapped_{method_name}"
+                    if _module.__dict__.get(_marker):
+                        continue
+                    _original = getattr(_module, method_name, None)
+                    if _original is None:
+                        continue
+                    _key_prefix = f"{_mod_name}.{method_name}" if _mod_name else f"{cls.__name__}.{method_name}"
+
+                    @functools.wraps(_original)
+                    def _wrapper(*args, __original=_original, __key=_key_prefix, **kwargs):
+                        result = __original(*args, **kwargs)
+                        calls = len(store.get(__key, []))
+                        if calls < max_calls:
+                            if isinstance(result, (tuple, list)):
+                                for index, item in enumerate(result):
+                                    record(f"{__key}[{index}]", item, calls)
+                            else:
+                                record(__key, result, calls)
+                            for index, argument in enumerate(args):
+                                if isinstance(argument, torch.Tensor) and argument.is_floating_point():
+                                    record(f"{__key}#arg{index}", argument, calls)
+                        return result
+
+                    setattr(_module, method_name, _wrapper)
+                    _module.__dict__[_marker] = True
+                    _inst_handles.append((_module, method_name))
+        handles.extend(("inst", module, method_name) for module, method_name in _inst_handles)
+
+        for cls, method_names in targets:
+            # [2026-10-13] routers are NOT in named_modules() (plain host attribute), so the
+            # per-instance pass above cannot see them -- keep wrapping them at class level;
+            # the wrapper locates the layer through the `_dsv41_probe_path` stamp.
             for method_name in method_names:
                 original = getattr(cls, method_name, None)
                 if original is None or getattr(original, "_dsv41_wrapped", False):
@@ -267,6 +328,9 @@ class Dsv41DumpExtension:
                     if not isinstance(prefix, str) or not prefix:
                         layer_idx = getattr(self_or_cls, "layer_idx", None)
                         prefix = f"layer{layer_idx}" if layer_idx is not None else ""
+                    if not prefix:
+                        # routers: host-module path stamped in dsv41_hook_begin (see there)
+                        prefix = getattr(self_or_cls, "_dsv41_probe_path", "") or ""
                     key = f"{__key}@{prefix}" if prefix else __key
                     calls = len(store.get(key, []))
                     if calls < max_calls:
@@ -290,7 +354,12 @@ class Dsv41DumpExtension:
     def dsv41_hook_end(self, out_dir, tag, include_prefixes=None):
         """Stop recording and write this rank's captures to `out_dir`."""
         for handle in getattr(self, "_dsv41_handles", []):
-            if isinstance(handle, tuple):  # method wrapper
+            if isinstance(handle, tuple) and len(handle) >= 2 and handle[0] == "inst":
+                _module, method_name = handle[1], handle[2]
+                _module.__dict__.pop(method_name, None)  # restore the class method
+                for _k in [k for k in _module.__dict__ if k.startswith("_dsv41_wrapped_")]:
+                    _module.__dict__.pop(_k, None)
+            elif isinstance(handle, tuple):  # class-level method wrapper
                 cls, method_name, original = handle
                 setattr(cls, method_name, original)
             else:

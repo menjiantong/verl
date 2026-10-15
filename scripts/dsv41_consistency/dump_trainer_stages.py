@@ -63,12 +63,23 @@ BLOCK_SUFFIXES = [
     # layer 2 owns the compressed KV and the index; layer 3 reads layer 2's selection.
     ".attn.compressor",
     ".attn.indexer",
+    # [2026-10-13 tii q-chain split] prolog intermediates, to compare op-by-op against
+    # the engine eager path (wq_a -> q_norm -> wq_b; wkv -> kv_norm).
+    ".attn.wq_a",
+    ".attn.q_norm",
+    ".attn.wq_b",
+    ".attn.wkv",
+    ".attn.kv_norm",
 ]
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", default=os.environ.get("MODEL_PATH", ""))
+    parser.add_argument("--tokenizer-path",
+                        default=os.environ.get("TOKENIZER_PATH", "/mnt/share/m00899630/dsv41/rl_tokenizer"),
+                        help="Engram needs the tokenizer for its compressed token map (engram.py:182); "
+                             "the revision must match the checkpoint (vocab-size check inside).")
     parser.add_argument("--fixture", default="/mnt/share/m00899630/dsv41/dump/fixture.json")
     parser.add_argument("--out-dir", default="/mnt/share/m00899630/dsv41/dump/trainer")
     parser.add_argument("--lengths", default="", help="Comma separated subset of fixture lengths (default: all).")
@@ -445,7 +456,9 @@ def main():
     from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
     from verl.workers.engine.fsdp.fsdp_turbo_dsv41_impl import (
+        _MODEL_PREFIX,
         checkpoint_buffer_meta,
+        host_offload_engram_tables,
         move_buffers_to_device,
         place_checkpoint_buffers_for_load,
         read_dsv41_checkpoint_state_dict,
@@ -461,10 +474,27 @@ def main():
 
     log("building model (routed experts deferred to meta)")
     started = time.time()
+
+    # [2026-10-13 dtype-probe] locate where the main-stream precision becomes fp32.
+    def _dt(tag: str) -> None:
+        hits = {}
+        for n, p in model.named_parameters():
+            if n.endswith(("attn.wq_a.weight", "attn_norm.weight", "embed_tokens.weight")):
+                hits[".".join(n.split(".")[-3:])] = str(p.dtype)
+        log(f"[dtype-probe] {tag}: {hits}")
+
+    # [2026-10-13 top32] Engram's NgramHashState builds its compressed token map from the
+    # tokenizer (engram.py:182); it must be the revision the checkpoint was trained with
+    # (build_compressed_token_map checks the vocab size against the checkpoint config).
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
     model = build_deepseek_v41_model(
-        tokenizer=None,
+        tokenizer=tokenizer,
         engram_meta_init=True,
-        engram_storage_backend="row_sharded",
+        # [2026-10-13 top32] Engram layers only support host_offload (the adapter forces it
+        # in production); row_sharded was a 4-layer-fixture-only path.
+        engram_storage_backend="host_offload",
         use_sparse_flash_attn=args.sparse_flash_attn,  # the engine builds it with False (eager torch)
         experts_meta_init=True,
         config_path=args.model_path,
@@ -472,59 +502,46 @@ def main():
     )
     initialize_deepseek_v41_model(model)
     model = prepare_deepseek_v41_model_for_fsdp(model, device=device, parameter_dtype=torch.bfloat16)
+    _dt("after prepare(bf16)")
     param_meta = {name: (tuple(param.shape), param.dtype) for name, param in model.named_parameters()}
     buffer_meta = checkpoint_buffer_meta(model)
+    # [2026-10-13 top32] Host-offload Engram tables are loaded outside DCP (production:
+    # fsdp_turbo_dsv41_impl._load_host_engram_tables reads each rank's own row slice). Keep
+    # them out of param_meta so no loader ever materializes the ~366 GiB table -- that
+    # allocation is what blocked top32 probing before (worklog_dsv41_consistency_v2 §4.11).
+    engram_tables = host_offload_engram_tables(model)
+    for checkpoint_name, _ in engram_tables:
+        param_meta.pop(_MODEL_PREFIX + checkpoint_name, None)
     log(f"model built in {time.time() - started:.1f}s ({len(param_meta)} parameters, "
         f"{len(buffer_meta)} checkpoint buffers: {sorted(buffer_meta)[:2]} ...)")
 
     model = FSDPTurbo(config, model).model
+    _dt("after FSDPTurbo wrap")
 
-    log("materializing parameters from checkpoint")
+    log("materializing parameters from checkpoint (production path)")
     started = time.time()
-    place_checkpoint_buffers_for_load(model, buffer_meta, log)
-    # DCP's broadcast load scans every dim>0 tensor of the model state and requires one device
-    # ("Multiple devices found" otherwise). Log that inventory: with cpu_offload the parameters
-    # are CPU-side and the checkpoint buffers must land on the same side.
-    from torch.distributed.checkpoint.state_dict import _iterate_valid_model_state
+    # [2026-10-13 top32] Run the *production* materialization so the Engram host-offload
+    # tables (model.layers.{1,14}.engram.embed) load exactly the way the GRPO trainer loads
+    # them: DCP never sees the ~366 GiB table, every rank row-slice-reads its own range
+    # straight from the checkpoint and freezes it (fsdp_turbo_dsv41_impl._load_host_engram_tables).
+    # The legacy rank0-read + DCP-broadcast path OOM'd on top32 ("Tried to allocate
+    # 183.11 GiB", worklog_dsv41_consistency_v2 §4.11); production code supersedes it.
+    from types import SimpleNamespace
 
-    inventory: dict[str, list[str]] = {}
-    for key, value in _iterate_valid_model_state(model):
-        if torch.is_tensor(value) and value.dim() > 0:
-            inventory.setdefault(str(value.device), []).append(key)
-    log("DCP device scan: " + ", ".join(f"{where}: {len(keys)} e.g. {keys[:2]}" for where, keys in inventory.items()))
-    for where, keys in inventory.items():
-        on_device = [key for key in keys if key in buffer_meta]
-        if on_device:
-            log(f"  checkpoint buffers on {where}: {on_device}")
-    if rank == 0:
-        full_state, ckpt_report = read_dsv41_checkpoint_state_dict(Path(args.model_path), param_meta, buffer_meta)
-        # Otherwise DCP's strict=True raises a generic "Missing key(s)" much later (see H6 in
-        # plans/dsv41-real-weights-4layer/plan.md); fail here with the actual names instead.
-        assert not ckpt_report["missing"], (
-            f"checkpoint {args.model_path} lacks {len(ckpt_report['missing'])} tensors the model needs, "
-            f"e.g. {ckpt_report['missing'][:5]}"
-        )
-    else:
-        full_state = {}
-    # DCP's strict load only prunes state-dict keys it does not find in the model; a model key
-    # that never got a value keeps its initialization and is *not* reported (see
-    # _broadcast_state_dict). Keep the checkpoint values aside (it also overwrites the dict it
-    # was handed) and compare afterwards, so a silently dropped router bias cannot pass as
-    # "loaded".
-    expected_buffers = (
-        {name: full_state[name].clone() for name in buffer_meta if name in full_state} if rank == 0 else {}
+    from verl.workers.engine.fsdp.fsdp_turbo_dsv41_impl import (
+        FSDPTurboDSV41EngineWithLMHead as _EngineCls,
     )
-    options = StateDictOptions(full_state_dict=True, broadcast_from_rank0=True, cpu_offload=True)
-    set_model_state_dict(model, full_state, options=options)
-    if rank == 0:
-        current = dict(model.named_buffers())
-        for name, expected in sorted(expected_buffers.items()):
-            actual = current.get(name)
-            equal = actual is not None and torch.equal(expected, actual)
-            log(f"load check {name}: checkpoint->model {'bit-exact' if equal else 'MISMATCH'}"
-                + ("" if equal else f" (model holds {actual.detach().float().flatten()[:3].tolist()})"))
-    del full_state
+
+    engine_shim = _EngineCls.__new__(_EngineCls)  # uninitialized: only model_config is read
+    engine_shim.model_config = SimpleNamespace(local_hf_config_path=str(args.model_path))
+    engine_shim._materialize_dsv41_parameters(
+        model, param_meta, buffer_meta, offload_policy=True, engram_tables=engram_tables
+    )
     log(f"parameters materialized in {time.time() - started:.1f}s")
+    _dt("after materialize")
+
+    # Note: the production path already places checkpoint buffers and verifies them
+    # bit-exact against the checkpoint (see _materialize_dsv41_parameters / _finish_*).
 
     move_buffers_to_device(model, device, log)
     fp32_mode = os.environ.get("VERL_DSV41_KEEP_FP32_PARAMS", "")

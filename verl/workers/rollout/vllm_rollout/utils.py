@@ -335,6 +335,12 @@ class vLLMColocateWorkerExtension:
                 )
                 lora_weights.clear()
                 return
+            if os.environ.get("VERL_SKIP_WEIGHT_SYNC") == "1":
+                # DEBUG (2026-10-12): buckets are received and drained (so the sender's
+                # ZMQ handshake still completes) but the engine keeps the weights it
+                # loaded at init. Separates "the sync path corrupts the engine" from
+                # "the colocate/sleep path corrupts it".
+                return
             self._update_weights(
                 weights,
                 peft_config=peft_config,

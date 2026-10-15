@@ -7,7 +7,10 @@
 # OMP, and the v41 model code from the local source trees.
 set -xeuo pipefail
 
-export VLLM_VERSION=${VLLM_VERSION:-0.27.1}
+# [2026-10-13] non-login shells (nohup/ssh one-shots) lose the interpreter path; pin it here.
+export PATH=/usr/local/python3.11.15/bin:$PATH
+# [2026-10-13] current stack is the pre-rebase line (0.30.0); 0.27.1 was the fixture-era default.
+export VLLM_VERSION=${VLLM_VERSION:-0.30.0}
 export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-1024}
 export ASCEND_CONNECT_TIMEOUT=${ASCEND_CONNECT_TIMEOUT:-10000}
 export ASCEND_TRANSFER_TIMEOUT=${ASCEND_TRANSFER_TIMEOUT:-10000}

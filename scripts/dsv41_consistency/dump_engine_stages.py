@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 PARAM_PATTERNS = [
@@ -84,6 +85,16 @@ def main():
         enable_chunked_prefill=True,
         max_num_batched_tokens=args.max_model_len,
         disable_log_stats=True,
+        # [2026-10-13 task3 perf] Profiling must be enabled at engine construction;
+        # gated by VA_DUMP_PROFILE=1 (see the start/stop_profile calls below).
+        **(
+            {"profiler_config": __import__("vllm.config", fromlist=["ProfilerConfig"]).ProfilerConfig(
+                profiler="torch",
+                torch_profiler_dir=os.environ.get("VLLM_TORCH_PROFILER_DIR", "/tmp/vllm_prof"),
+            )}
+            if os.environ.get("VA_DUMP_PROFILE", "0") == "1"
+            else {}
+        ),
         additional_config=additional_config,
         **kwargs,
     )
@@ -118,7 +129,24 @@ def main():
         if not args.skip_stages:
             hooked = llm.collective_rpc("dsv41_hook_begin", timeout=600)
             print(f"[dump-engine] len={length}: hooks={hooked}", flush=True)
+        # [2026-10-13 task3 perf] Optional per-worker torch_npu profiling of the main
+        # prefill (engine op-level data for the perf report). vLLM's start/stop_profile
+        # signals every worker; the trace lands under VLLM_TORCH_PROFILER_DIR.
+        _prof = os.environ.get("VA_DUMP_PROFILE", "0") == "1"
+        if _prof:
+            try:
+                llm.start_profile()
+                print("[dump-engine] torch_npu profiler started", flush=True)
+            except Exception as _e:  # noqa: BLE001
+                print(f"[dump-engine] start_profile failed: {_e}", flush=True)
+                _prof = False
         result = llm.generate([{"prompt_token_ids": ids}], sp, use_tqdm=False)[0]
+        if _prof:
+            try:
+                llm.stop_profile()
+                print("[dump-engine] torch_npu profiler stopped", flush=True)
+            except Exception as _e:  # noqa: BLE001
+                print(f"[dump-engine] stop_profile failed: {_e}", flush=True)
         if not args.skip_stages:
             written = llm.collective_rpc(
                 "dsv41_hook_end",

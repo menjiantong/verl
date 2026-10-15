@@ -84,9 +84,12 @@ def main():
             weights_e = first(engine, base0)
 
         print(f"--- layer {layer}")
+        # [2026-10-13] The engine TP-shards the token dim: rank r of TP sees a contiguous
+        # 1/TP block of the prefill (rank0 = first ceil(len/TP) tokens; verified by
+        # nearest-neighbour matching on the gate logits). Compare against that trainer slice.
         if logits_e is not None:
-            ref = raw_t
             other = logits_e.reshape(-1, logits_e.shape[-1]).float()
+            ref = raw_t[: other.shape[0]]
             if ref.shape == other.shape:
                 diff = (other - ref).abs()
                 print(f"  router logits: shape {tuple(ref.shape)} mean|d|={diff.mean():.5f} "
@@ -94,19 +97,26 @@ def main():
             else:
                 print(f"  router logits shape mismatch: trainer {tuple(ref.shape)} engine {tuple(other.shape)}")
         if ids_t is not None and ids_e is not None:
-            a = ids_t.long().reshape(ids_t.shape[-2], -1)
             b = ids_e.long().reshape(ids_e.shape[0], -1)
-            same_rows = (a == b).all(dim=-1).float().mean().item() if a.shape == b.shape else float("nan")
-            overlap = ((a.unsqueeze(-1) == b.unsqueeze(-2)).any(-1)).float().mean().item()
-            print(f"  selected expert ids: exact top-k set match {same_rows * 100:.2f}% of tokens, "
-                  f"per-slot overlap {overlap * 100:.2f}%")
-            if a.shape == b.shape and same_rows < 1.0:
-                different = (a != b).any(dim=-1).nonzero().flatten()[:3]
-                for row in different.tolist():
-                    print(f"    token {row}: trainer {a[row].tolist()} vs engine {b[row].tolist()}")
+            a = ids_t.long().reshape(ids_t.shape[-2], -1)[: b.shape[0]]
+            if a.shape == b.shape:
+                exact = (a == b).all(dim=-1)
+                setmatch = (a.sort(-1).values == b.sort(-1).values).all(-1)
+                order_only = (setmatch & ~exact)
+                real_flip = ~setmatch
+                n = a.shape[0]
+                print(f"  selected expert ids (per token, n={n}): "
+                      f"set-match {setmatch.float().mean().item() * 100:.2f}% | "
+                      f"order-only diffs {int(order_only.sum())} | real flips {int(real_flip.sum())}")
+                if int(real_flip.sum()):
+                    flips = real_flip.nonzero().flatten()[:4]
+                    for row in flips.tolist():
+                        print(f"    flip token {row}: trainer {sorted(a[row].tolist())} vs engine {sorted(b[row].tolist())}")
+            else:
+                print(f"  selected expert ids: shape mismatch trainer {tuple(a.shape)} engine {tuple(b.shape)}")
         if weights_t is not None and weights_e is not None:
-            wt = weights_t.float().reshape(-1, weights_t.shape[-1])
             we = weights_e.float().reshape(-1, weights_e.shape[-1])
+            wt = weights_t.float().reshape(-1, weights_t.shape[-1])[: we.shape[0]]
             if wt.shape == we.shape:
                 print(f"  top-k weights: mean|d|={(we - wt).abs().mean():.5f}")
 

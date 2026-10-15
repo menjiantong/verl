@@ -46,6 +46,10 @@ def extract_solution(solution_str, method="strict"):
             for final_answer in reversed(answer):
                 if final_answer not in invalid_str:
                     break
+            # [2026-10-14] "Answer: 18." must score as 18 (eval_gsm8k_serve.norm_num
+            # strips the trailing period the same way).
+            if final_answer is not None:
+                final_answer = final_answer.rstrip(".")
     return final_answer
 
 
