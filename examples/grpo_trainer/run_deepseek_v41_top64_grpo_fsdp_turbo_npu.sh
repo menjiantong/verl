@@ -42,14 +42,15 @@ EP_SIZE=${EP_SIZE:-8}
 EFSDP_SIZE=${EFSDP_SIZE:-1}
 ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.6}
 
-MODEL_PATH=${MODEL_PATH:-"/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-top64-bf16"}
+# 默认用 SFT 热启动权重；top64-bf16 原始权重会 never-EOS（F-31）勿直接 RL
+MODEL_PATH=${MODEL_PATH:-"/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-top32-sft116"}
 # Released V4.1 checkpoints ship no chat template; this directory carries the same
 # tokenizer files plus the single-turn template (see scripts/make_dsv41_rl_tokenizer.py).
 # tokenizer.json is byte-identical to the checkpoint's, which matters more now: the Engram
 # token map is built from it and must agree with the engine's.
 TOKENIZER_PATH=${TOKENIZER_PATH:-"/mnt/share/m00899630/dsv41/rl_tokenizer"}
-TRAIN_FILE=${TRAIN_FILE:-"/mnt/share/m00899630/dsv41/rl_data/dapo_math_train_512.parquet"}
-TEST_FILE=${TEST_FILE:-"/mnt/share/m00899630/dsv41/rl_data/dapo_math_val_64.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"/mnt/share/m00899630/dsv41/rl_data/gsm8k_main_train_rl.parquet"}
+TEST_FILE=${TEST_FILE:-"/mnt/share/m00899630/dsv41/rl_data/gsm8k_main_test_rl.parquet"}
 CKPTS_DIR=${CKPTS_DIR:-"/mnt/share/m00899630/dsv41/ckpts/${PROJECT_NAME}/${EXPERIMENT_NAME}"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
@@ -199,13 +200,14 @@ MODEL=(
 )
 
 ACTOR=(
-    actor_rollout_ref.actor.optim.lr=2e-6
+    # lr 由环境变量 LR 控制（默认 5e-6：原 1e-6 步长过小、clipfrac 恒 0，见 worklog task6）
+    actor_rollout_ref.actor.optim.lr=${LR:-5e-6}
     actor_rollout_ref.actor.optim.optimizer=AdamW
     actor_rollout_ref.actor.ppo_mini_batch_size=${TRAIN_BSZ}
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
-    # [2026-10-14 reward run] KL ON (low_var_kl, coef 0.001): the full-fix rerun wants the
-    # reference anchor to stabilise the 2x lr; the ref worker is back (extra forward/step).
-    actor_rollout_ref.actor.use_kl_loss=True
+    # KL 由环境变量 USE_KL 控制（默认 1=开，low_var_kl/coef 0.001 作稳定锚；0=关并跳过 ref worker）
+    actor_rollout_ref.actor.use_kl_loss=$([ "${USE_KL:-1}" = "1" ] && echo True || echo False)
+    actor_rollout_ref.actor.kl_loss_coef=${KL_COEF:-0.001}
     actor_rollout_ref.actor.entropy_coeff=0
     actor_rollout_ref.actor.use_dynamic_bsz=False
     actor_rollout_ref.actor.strategy=fsdp_turbo_dsv41
@@ -229,7 +231,8 @@ ACTOR=(
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
 )
 
-REF=(
+REF=()
+if [ "${USE_KL:-1}" = "1" ]; then REF=(
     # [2026-10-14 KL run] mirror of run_deepseek_v41_grpo_fsdp_turbo_npu.sh's REF block:
     # the ref worker rebuilds the engram-bearing model, so it needs the same 1-D EP mesh.
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1
@@ -250,7 +253,7 @@ REF=(
     actor_rollout_ref.ref.use_torch_compile=False
     actor_rollout_ref.ref.fsdp_config.offload_policy=True
     actor_rollout_ref.ref.fsdp_config.param_offload=True
-)
+); fi
 
 ROLLOUT=(
     actor_rollout_ref.rollout.name=${INFER_BACKEND}

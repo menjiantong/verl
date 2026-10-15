@@ -23,7 +23,7 @@ fi
 export TRAIN_FILE=${TRAIN_FILE:-/mnt/share/m00899630/dsv41/rl_data/gsm8k_main_train_rl.parquet}
 export TEST_FILE=${TEST_FILE:-/mnt/share/m00899630/dsv41/rl_data/gsm8k_main_test_rl.parquet}
 # 注意：不要用原始 top32-bf16 权重跑 RL（never-EOS，F-31）；用 SFT 热启动后的 sft116。
-export MODEL_PATH=${MODEL_PATH:-/mnt/share/m00899630/dsv41/weights/DeepSeek-V4.1-Flash-top32-sft116}
+export MODEL_PATH=${MODEL_PATH:-/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-top32-sft116}
 
 # ---- RL 侧关键开关（proven 配置，改动前先读失败库）----
 export EFSDP_SIZE=${EFSDP_SIZE:-1}            # ⚠ RL 必须 =1（EFSDP=2 会静默损坏权重同步，F-30）。

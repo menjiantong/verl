@@ -12,7 +12,7 @@ export HCCL_NPU_SOCKET_PORT_RANGE=${HCCL_NPU_SOCKET_PORT_RANGE:-61000-61050}
 export PYTHONPATH=/workspace-verl/vllm:/workspace-verl/vllm-ascend-v41-private:/workspace-verl/FSDPTurbo:/workspace-verl/verl:${PYTHONPATH:-}
 cd /workspace-verl/verl
 torchrun --nproc_per_node=8 --master_port=59522 scripts/dsv41_consistency/dump_trainer_stages.py \
-  --model-path ${MODEL_PATH:-/mnt/share/m00899630/dsv41/weights/DeepSeek-V4.1-Flash-top32-sft116} \
+  --model-path ${MODEL_PATH:-/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-top32-sft116} \
   --out-dir ${OUT_DIR:-/mnt/share/m00899630/dsv41/dump/cons_v4_gsm8k/trainer_top32} \
   --lengths ${LENGTHS:-64} \
   ${EXTRA_ARGS:-}
