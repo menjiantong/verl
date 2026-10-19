@@ -96,4 +96,25 @@ class NaiveRewardManager(RewardManagerBase):
 
         reward = score
 
+        # [dsv41 2026-10-17] 打分合理性排查：逐样本 dump（env 门控 VERL_REWARD_DUMP；每 rank 前 400 条）
+        import os as _os_rw, json as _json
+        _dump = _os_rw.environ.get("VERL_REWARD_DUMP", "")
+        if _dump:
+            try:
+                _os_rw.makedirs(_dump, exist_ok=True)
+                _fp = _os_rw.path.join(_dump, f"rank{_os_rw.environ.get('RANK','x')}.jsonl")
+                _n = sum(1 for _ in open(_fp)) if _os_rw.path.exists(_fp) else 0
+                if _n < 400:
+                    with open(_fp, "a") as _f:
+                        _f.write(_json.dumps({
+                            "data_source": data_source,
+                            "gt": str(ground_truth),
+                            "response_len": int(valid_response_length),
+                            "score": float(reward),
+                            "index": str(extra_info.get("index", "")),
+                            "response_tail": response_str[-400:],
+                        }, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+
         return {"reward_score": reward, "reward_extra_info": reward_extra_info}

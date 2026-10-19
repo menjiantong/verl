@@ -245,3 +245,36 @@ torch.OutOfMemoryError: NPU out of memory. Tried to allocate 182.00 MiB
 - `pick_devices` 赋值式（`DEV=$(pick_devices)`）防 exit 1 被 `:-` 吞；
 - `run_vllm_top32_dp2.sh` model_path 改 `${MODEL_PATH:-原目录}` 环境覆盖；
 - ckpt 存盘 HF 段守卫（dsv41 无 `.config`）夜间已验：日志 "Model exposes no .config … skipping"。
+
+---
+
+## 附录 C：启动脚本汇总版 `run_sft_dsv41.sh`（2026-10-16，用户指令）
+
+> 用户："把之前的跑通的双机32卡的verl脚本，汇总输出一份全新脚本"（并指定参考本工作记录）。
+
+- **产物**：`run_sft_dsv41.sh`（single | master | slave 三合一，md5 **5ce01bdf**，`bash -n` ✓）：
+  - 主副本 `/workspace-verl/scripts/run_sft_dsv41.sh`；镜像副本 `…/dsv41-verl/verl/my_scripts/run_sft_dsv41.sh`（两份逐字节一致；128 可直接从 NFS 副本跑，无需本盘同步）。
+- **汇总来源**：`run_sft_dsv41_1node16.sh`（7c063353）+ `run_sft_dsv41_2node.sh`（e29a8815，v5 定稿）。
+- **用法**：
+  ```bash
+  bash run_sft_dsv41.sh single [STEPS]        # 单机 16 卡；默认 1=冒烟
+  bash run_sft_dsv41.sh master [STEPS]        # 双机 32 卡主机；默认 116（gbs64≈1 epoch）
+  bash run_sft_dsv41.sh slave <MASTER_IP>     # 第二台；等 master 打出 waiting
+  ```
+- **模式表**（默认=各来源 proven 值）：
+
+  | 模式 | 拓扑 | 批次 | offload | 默认步数 |
+  |---|---|---|---|---|
+  | single | 16 卡 FSDP16/EP8/**EFSDP1** | gbs16/micro1 | 开（单机 proven） | 1（冒烟） |
+  | master | 2×16=32 卡 FSDP32/EP8/**EFSDP2** | gbs64/micro1 | 全关（v5） | 116（≈1 epoch） |
+
+  ⚠ EFSDP=2 只对 SFT 安全；RL/GRPO 侧必须 EFSDP_SIZE=1（F-30）。
+- **合并校验**：hydra 键集与两来源逐一 diff——两源全部键都在、无多余键（唯一差异 =
+  `trainer.total_training_steps` 收进 run_sft 末尾追加，属设计）。
+- **相较来源的加固**：① sweep 统一三模式（含 `sft_trainer_ray`，清残留防 `only N free chips`）；
+  ② `ulimit -n 65536`（F-64）；③ CANN 自举 + ATB 目录（F-51/F-78，非 login shell 可直接跑）；
+  ④ `detect_ip` 保持 python ioctl（本镜像无 iproute2，F-84 教训）；⑤ slave 加入后打印集群状态；
+  ⑥ `optim.lr_warmup_steps_ratio=0.0` 显式化（引擎默认即 0.0，2node 源未写）。
+- **验证**：`bash -n` ✓、键集 diff ✓；**未实跑**（参数与两来源 proven 完全一致）。
+  上线前建议 1 步冒烟核对：`NPU total=32` / `efsdp=2` / `max_memory_allocated_gb:30.4`（step1）。
+- 旧两脚本**保留未动**；skill（dsv41-sft）仍引用旧名，是否切换由用户定。

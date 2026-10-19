@@ -17,14 +17,14 @@
 #  -> ~1.1 TB of 2 TB. HBM: params+grads ~13 GB/card + short-sequence activations.
 set -eo pipefail
 
-STEPS=${1:-1}
+STEPS=${1:-116}
 NIC=${NIC:-enp48s3u1u1}
-MODEL_PATH=${MODEL_PATH:-/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-top32-bf16}
+MODEL_PATH=${MODEL_PATH:-/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-top32-sft116-noengram}
 TOKENIZER_PATH=${TOKENIZER_PATH:-/mnt/share/m00899630/dsv41/rl_tokenizer}
 TRAIN_FILE=${TRAIN_FILE:-/mnt/share/m00899630/dsv41/sft_data/gsm8k_main_train_sft.parquet}
-CKPT_DIR=${CKPT_DIR:-/workspace-verl/ckpt_sft_dsv41}
+CKPT_DIR=${CKPT_DIR:-/mnt/share/m00899630/dsv41/sft_out}
 MICRO_BSZ=${MICRO_BSZ:-1}
-PARAM_OFFLOAD=${PARAM_OFFLOAD:-True}
+PARAM_OFFLOAD=${PARAM_OFFLOAD:-False}
 OPTIMIZER_OFFLOAD=${OPTIMIZER_OFFLOAD:-True}
 GLOBAL_BSZ=${GLOBAL_BSZ:-16}
 MAX_LEN=${MAX_LEN:-1024}
@@ -33,14 +33,11 @@ SAVE_FREQ=${SAVE_FREQ:-${STEPS}}
 EXPERIMENT=${EXPERIMENT:-gsm8k-top32}
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
 
-export PYTHONPATH="/workspace-verl/vllm:/workspace-verl/vllm-ascend-v41-private:/workspace-verl/FSDPTurbo:${PYTHONPATH:-}"
-MY_IP=$(python3 - "$NIC" <<'PY'
-import fcntl, socket, struct, sys
-nic = sys.argv[1]
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-print(socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", nic.encode()[:15]))[20:24]))
-PY
-)
+MIRROR_ROOT=/mnt/share/m00899630/workspace/dsv41-verl
+export PYTHONPATH="$MIRROR_ROOT/vllm:$MIRROR_ROOT/vllm-ascend:$MIRROR_ROOT/FSDPTurbo:$MIRROR_ROOT/verl:${PYTHONPATH:-}"
+export PATH=/usr/local/python3.11.15/bin:$PATH
+
+MY_IP=80.5.25.123
 export HCCL_IF_IP=${HCCL_IF_IP:-$MY_IP}
 export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-$NIC}
 export HCCL_SOCKET_IFNAME=${HCCL_SOCKET_IFNAME:-$NIC}
@@ -65,7 +62,7 @@ export VERL_DSV41_DIRECT_SHARD_LOAD=${VERL_DSV41_DIRECT_SHARD_LOAD:-1}
 
 FSDP_APPLY_MODULES='{model.embed:{},model.layers.\{*\}:{},model.norm:{},model.head:{}}'
 
-cd /workspace-verl/verl
+cd /mnt/share/m00899630/workspace/dsv41-verl/verl
 mkdir -p logs
 RUN_LOG="logs/sft_dsv41_steps${STEPS}_$(date +%Y%m%d_%H%M%S).log"
 echo "[sft] steps=${STEPS} gbs=${GLOBAL_BSZ} micro=${MICRO_BSZ} lr=${LR} log=${RUN_LOG}"
@@ -77,7 +74,7 @@ python3 -m verl.trainer.sft_trainer_ray \
   trainer.n_gpus_per_node=16 \
   trainer.nnodes=1 \
   trainer.total_training_steps=${STEPS} \
-  trainer.total_epochs=1 \
+  trainer.total_epochs=3 \
   trainer.logger="['console']" \
   trainer.project_name=dsv41-sft \
   trainer.experiment_name=${EXPERIMENT} \

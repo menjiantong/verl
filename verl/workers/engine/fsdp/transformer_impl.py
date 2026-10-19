@@ -230,6 +230,20 @@ class FSDPEngine(BaseEngine):
             grad=self._is_offload_param,
         )
 
+        # [dsv41 2026-10-16] M27: the offload above moves tensors to host but leaves their
+        # device blocks RESERVED in the NPU caching allocator. In the colocated layout the
+        # rollout engines start right after this and size themselves against the FREE
+        # device memory, so the reserve (~20 GB/chip measured, E26) silently caps the
+        # engine's gpu_memory_utilization budget. Release it here (opt-in) so the engine
+        # window sees the real free memory.
+        if os.environ.get("VERL_DSV41_EMPTY_CACHE_AFTER_BUILD", "0") == "1":
+            try:
+                import torch as _torch
+
+                _torch.npu.empty_cache()
+            except Exception:
+                pass
+
         log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
 
     def _init_device_mesh(self):
@@ -459,7 +473,15 @@ class FSDPEngine(BaseEngine):
             if self.engine_config.offload_policy or self.engine_config.forward_only:
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
-                offload_policy = CPUOffloadPolicy(pin_memory=True)
+                # [dsv41 2026-10-15] pin_memory=True routes every offloaded grad/param copy
+                # through the NPU driver's pinned-host allocator (aclrtMallocHostWithCfg),
+                # which fails on these shared multi-NUMA nodes under the full-model load
+                # (task 3.1b..3.1h, worklog_dsv41_119_bringup.md E10/E11/E13).
+                # VERL_DSV41_OFFLOAD_PIN_MEMORY=0 falls back to sync pageable copies
+                # (slower, same semantics). Default 1 keeps the historical behaviour.
+                offload_policy = CPUOffloadPolicy(
+                    pin_memory=os.environ.get("VERL_DSV41_OFFLOAD_PIN_MEMORY", "1") == "1"
+                )
                 self._uses_fsdp2_cpu_offload_policy = True
 
             fsdp_kwargs = {

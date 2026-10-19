@@ -34,13 +34,16 @@ NNODES=${NNODES:-1}
 # vLLM rollout (mirrors scripts/run_vllm2.sh): TP=8 with expert parallel. vllm-ascend's
 # Engram validation requires TP in {1,2,4,8} and PP=PCP=DCP=1.
 GEN_TP=${GEN_TP:-8}
+# Engine data parallel size (vLLM --data-parallel-size). >1 keeps the replicas in ONE
+# logical engine, so expert parallel spans TP x DP (vLLM convention, asserted below).
+GEN_DP=${GEN_DP:-1}
 GEN_EP=${GEN_EP:-8}
 # FSDPTurbo topology (mirrors FSDPTurbo/examples/deepseek_v41/config2.yaml).
 FSDP_SIZE=${FSDP_SIZE:-8}
 TP_SIZE=${TP_SIZE:-1}
 EP_SIZE=${EP_SIZE:-8}
 EFSDP_SIZE=${EFSDP_SIZE:-1}
-ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.6}
+ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.2}
 
 # 默认用 SFT 热启动权重；top64-bf16 原始权重会 never-EOS（F-31）勿直接 RL
 MODEL_PATH=${MODEL_PATH:-"/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-top32-sft116"}
@@ -71,9 +74,10 @@ VAL_BSZ=${VAL_BSZ:-8}
 # the 4-layer 32-expert checkpoint; on 40 layers x 64 experts the gap is far larger (the
 # payload is ~185 GB bf16 and the parameters are CPU-offloaded).
 LOCAL_EXPERT_EXPORT=${LOCAL_EXPERT_EXPORT:-${VERL_DSV41_LOCAL_EXPERT_EXPORT:-1}}
-if [ "${LOCAL_EXPERT_EXPORT}" = "1" ] && [ "${GEN_EP}" != "${EP_SIZE}" ]; then
-    echo "LOCAL_EXPERT_EXPORT=1 pairs trainer rank i with engine rank i, so it needs" \
-         "GEN_EP == EP_SIZE (got ${GEN_EP} vs ${EP_SIZE}); disabling it." >&2
+if [ "${LOCAL_EXPERT_EXPORT}" = "1" ] && { [ "${GEN_EP}" != "${EP_SIZE}" ] || [ "${EFSDP_SIZE}" != "1" ]; }; then
+    echo "LOCAL_EXPERT_EXPORT=1 pairs trainer rank i with engine rank i and streams the rank's" \
+         "contiguous expert slice, so it needs GEN_EP == EP_SIZE and a single expert-dim shard" \
+         "(got GEN_EP=${GEN_EP} EP_SIZE=${EP_SIZE} EFSDP_SIZE=${EFSDP_SIZE}); disabling it." >&2
     LOCAL_EXPERT_EXPORT=0
 fi
 export VERL_DSV41_LOCAL_EXPERT_EXPORT=${LOCAL_EXPERT_EXPORT}
@@ -173,6 +177,43 @@ else
     ENGINE_LEGACY_OVERRIDES=()
 fi
 
+# Engram host table shared between co-located DP replicas (vLLM EngramConfig.dp_shared_memory,
+# the recipe verified in wiki/worklog_dsv41_direct_shard_load.md section 8). Requested here and
+# resolved against the launch topology by vllm-ascend: it stays off unless the node-local DP
+# group holds more than one replica (single-node DP2 -> one shared host table), and on a
+# two-node DP2 layout (one local replica per node) the request resolves to the plain
+# TP-sharded table, which is exactly what the per-node 8 chips need.
+VLLM_ENGRAM_DP_SHARED_MEMORY=${VLLM_ENGRAM_DP_SHARED_MEMORY:-0}
+if [ "${VLLM_ENGRAM_DP_SHARED_MEMORY}" = "1" ]; then
+    ENGINE_ENGRAM_OVERRIDES=(
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.engram_config.cpu_offload=true"
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.engram_config.dp_shared_memory=true"
+    )
+    # dp_shared_memory 要求引擎真的从 checkpoint 读权重（vLLM 校验 load_format 属于
+    # auto/safetensors/pt；verl 的默认 "dummy" 会让 engram 表留空——vllm-ascend 的
+    # model.py 对 dummy 直接跳过 checkpoint 读取）。等价于 §八 已验配方（默认 auto 读盘）。
+    # 顺带用 §八 的多线程 + 懒加载参数加速这次额外的读盘（~114GB）。
+    ENGINE_LOAD_OVERRIDES=(
+        actor_rollout_ref.rollout.load_format=safetensors
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.model_loader_extra_config.enable_multithread_load=true"
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.model_loader_extra_config.num_threads=64"
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.safetensors_load_strategy=lazy"
+    )
+else
+    ENGINE_ENGRAM_OVERRIDES=()
+    ENGINE_LOAD_OVERRIDES=()
+fi
+
+# FSDPTurbo 侧 offload 策略的 pin_memory 默认 True：每个参数 init 都会做 pinned 申请
+# (torch _fsdp_param.py:397 padded_sharded_param.pin_memory())，在本驱动上 207001 高发（E29/task44）。
+# 与 VERL_DSV41_OFFLOAD_PIN_MEMORY=0（M16，verl 侧策略）联动关掉，语义不变（pageable）。
+PIN_OVERRIDES=()
+if [ "${VERL_DSV41_OFFLOAD_PIN_MEMORY:-1}" = "0" ]; then
+    PIN_OVERRIDES=(
+        "+actor_rollout_ref.actor.fsdp_config.turbo_config.distributed.fsdp_plan.pin_memory=false"
+    )
+fi
+
 ########################### parameter arrays ###########################
 
 DATA=(
@@ -260,6 +301,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.ignore_eos=False
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1
     actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP}
+    actor_rollout_ref.rollout.data_parallel_size=${GEN_DP}
     actor_rollout_ref.rollout.expert_parallel_size=${GEN_EP}
     actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL}
     actor_rollout_ref.rollout.max_model_len=$((MAX_PROMPT_LEN + MAX_RESPONSE_LEN))
@@ -283,6 +325,9 @@ ROLLOUT=(
     # cpu_offload defaulting to VLLM_PLE_CPU_OFFLOAD=1 (tables in registered host memory,
     # read through UVA). The trainer mirrors that (frozen host tables), see the impl.
     "${ENGINE_LEGACY_OVERRIDES[@]}"
+    "${ENGINE_ENGRAM_OVERRIDES[@]}"
+    "${ENGINE_LOAD_OVERRIDES[@]}"
+    "${PIN_OVERRIDES[@]}"
     "${VLLM_ADDITIONAL_CONFIG_ROOT}.ascend_compilation_config.enable_npugraph_ex=false"
     "${VLLM_ADDITIONAL_CONFIG_ROOT}.ascend_compilation_config.enable_static_kernel=false"
     # RL weight updates need weight_nz_mode=0 (FRACTAL_NZ breaks synced-weight precision);
@@ -311,6 +356,8 @@ TRAINER=(
 )
 
 ########################### launch ###########################
+echo "[MODEL_PATH] $MODEL_PATH"
+mkdir -p "${VERL_LOG_DIR:-logs}"
 python3 -m verl.trainer.main_ppo \
     "${DATA[@]}" \
     "${MODEL[@]}" \
@@ -318,4 +365,4 @@ python3 -m verl.trainer.main_ppo \
     "${REF[@]}" \
     "${ROLLOUT[@]}" \
     "${TRAINER[@]}" \
-    "$@" 2>&1 | tee "logs/${LOG_TAG}-${start_time}.log"
+    "$@" 2>&1 | tee "${VERL_LOG_DIR:-logs}/${LOG_TAG}-${start_time}.log"
