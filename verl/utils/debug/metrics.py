@@ -12,6 +12,7 @@
 # limitations under the License.
 
 import logging
+import os
 
 import torch
 
@@ -60,6 +61,49 @@ def calculate_log_prob_diff(log_probs1: torch.Tensor, log_probs2: torch.Tensor, 
     return torch.masked_select(full_diff, mask)
 
 
+_BATCH_DUMP_COUNTER = 0
+
+
+def maybe_dump_debug_batch(data: DataProto) -> None:
+    """Dump the tensors behind the rollout/actor logprob metrics (env gated).
+
+    ``VERL_DSV41_DUMP_BATCH=<dir>`` writes one ``batch_step<N>.pt`` per call from rank 0 so
+    the train-vs-rollout logprob gap can be analysed per token position offline, instead of
+    only through the aggregated metrics. Debug-only: does nothing when the env var is unset.
+    """
+    global _BATCH_DUMP_COUNTER
+    dump_dir = os.environ.get("VERL_DSV41_DUMP_BATCH")
+    if not dump_dir:
+        return
+    try:
+        import torch.distributed as dist
+
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
+    except Exception:  # noqa: BLE001 - distributed state is optional here
+        pass
+
+    payload = {}
+    for key in ("rollout_log_probs", "old_log_probs", "ref_log_prob", "responses", "response_mask",
+                "attention_mask", "input_ids", "loss_mask", "advantages", "rm_scores"):
+        value = data.batch.get(key) if hasattr(data.batch, "get") else None
+        if value is None:
+            continue
+        try:
+            tensor = value.values() if hasattr(value, "values") and not isinstance(value, torch.Tensor) else value
+            payload[key] = tensor.detach().float().cpu() if tensor.is_floating_point() else tensor.detach().cpu()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("could not dump %s: %s", key, exc)
+    try:
+        os.makedirs(dump_dir, exist_ok=True)
+        path = os.path.join(dump_dir, f"batch_step{_BATCH_DUMP_COUNTER}.pt")
+        torch.save(payload, path)
+        _BATCH_DUMP_COUNTER += 1
+        print(f"[dsv41-dump] wrote {path} with keys {sorted(payload)}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("batch dump failed: %s", exc)
+
+
 def calculate_debug_metrics(data: DataProto) -> dict:
     """
     calculate rollout vs actor logprobs diff, for debugging purpose
@@ -79,6 +123,8 @@ def calculate_debug_metrics(data: DataProto) -> dict:
             "training/rollout_probs_diff_std": std value of logprob diff of rollout vs. actor
             "training/rollout_actor_probs_pearson_corr": logprob's pearson corrcoef of rollout vs. actor, reference to https://arxiv.org/pdf/2506.13585
     """
+
+    maybe_dump_debug_batch(data)
 
     rollout_old_log_probs = data.batch["rollout_log_probs"]
     actor_old_log_probs = data.batch["old_log_probs"]

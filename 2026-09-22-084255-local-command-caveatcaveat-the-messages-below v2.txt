@@ -1,0 +1,3365 @@
+ ▐▛███▛█   Claude Code v2.1.271
+▝▜██████▀  deepseek-v4-flash · API Usage Billing
+  ▝▝ ▝▝    /workspace-verl/verl
+
+
+❯ /clear                                                                        
+
+❯ @"2026-09-22-030643-verlwikiworklogdsv41rlmd-mn v2.txt" 继续工作              
+
+  Thought for 1s (ctrl+o to expand)
+
+● 我先读取相关记忆和工作日志文件。
+
+  Thought for 16s, read 1 file, listed 4 directories, recalled 1 memory (ctrl+o to expand)
+  ⎿  Loaded verl/CLAUDE.md
+  ⎿  Loaded 2 skills from verl/.claude/skills
+  ⎿  2 skills available
+
+● 我先摸清现有 harness 的结构（引擎侧 dump 有没有存模块输入、graft
+  脚本怎么实现的），同时看 NPU 占用情况。
+
+  Thought for 1m 41s, searched for 1 pattern, read 3 files, ran 16 shell commands (ctrl+o to expand)
+
+❯ 如果没有显存，那么等待即可。如果程序被杀，等待重启即可。                      
+
+  Thought for 6s (ctrl+o to expand)
+
+● User 已说明：显存不足就等、被杀就重启 —— 收到。我继续实现这次的新实验（在
+  模块输入 打桩）。
+
+  先确认引擎侧 json 与 summarize 工具的结构：
+
+  Thought for 16s, ran 2 shell commands (ctrl+o to expand)
+
+● 现在写新的打桩脚本（在模块输入处注入引擎侧记录值）：
+
+● Write(scripts/dsv41_consistency/probe_module_inputs.py)
+  ⎿  Wrote 387 lines to scripts/dsv41_consistency/probe_module_inputs.py
+       1 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Re
+       2 #
+       3 # Licensed under the Apache License, Version 2.0 (the "License")
+       4 # you may not use this file except in compliance with the Licens
+         e.
+       6 #
+       7 #     http://www.apache.org/licenses/LICENSE-2.0
+       9 # Unless required by applicable law or agreed to in writing, sof
+         tware
+         IS,
+     … +481 lines (ctrl+o to expand)
+
+  Thought for 2s (ctrl+o to expand)
+
+● Update(scripts/dsv41_consistency/probe_module_inputs.py)
+  ⎿  Added 1 line, removed 1 line
+      150  
+      151  
+      152  def summarize(variant, graft, input_sink, stages, engine, leng
+           th, scored, engine_argmax,
+      153 -              next_logprobs, baseline, log) -> dict:          
+      153 +              next_logprobs, pred_ids, baseline, log) -> dict:
+      154      """Compare the forced forward against the engine: input di
+           ff (natural) + output diff (forced)."""
+      155      report = {"__inputs__": {}, "__outputs__": {}}
+      156      # (a) what the module input difference *was*, before the p
+           re-hook overwrote it
+
+● Update(scripts/dsv41_consistency/probe_module_inputs.py)
+  ⎿  Added 2 lines, removed 2 lines
+      176              stages["model.norm"], engine_tensor(engine, "langu
+           age_model.model.norm", "model.norm")
+      177          )
+      178      delta = (next_logprobs - scored).float()
+      179 -    agree = 0.0                                               
+      179 +    agree = float("nan")                                      
+      180      if engine_argmax:
+      181          ids = torch.tensor([token for token, _ in engine_argma
+           x], dtype=torch.long)
+      182 -        agree = (ids == next_logprobs.argmax().new_zeros(0)).s
+          -um().item()  # placeholder, replaced below                    
+      182 +        agree = (ids == pred_ids[: ids.numel()].long()).float(
+          +).mean().item()                                               
+      183      report["__logprob__"] = {
+      184          "mean": delta.mean().item(),
+      185          "std": delta.std().item(),
+
+● Update(scripts/dsv41_consistency/probe_module_inputs.py)
+  ⎿  Added 1 line, removed 1 line
+      201      sigma = report["__logprob__"]["std"]
+      202      base_sigma = baseline.get("__logprob__", {}).get("std") if
+            baseline else None
+      203      log(f"[{variant}] logprob Δ: mean={report['__logprob__']['
+           mean']:+.4f} std={sigma:.4f} "
+      204 -        f"|Δ|p99={report['__logprob__']['p99']:.4f}"          
+      204 +        f"|Δ|p99={report['__logprob__']['p99']:.4f} argmax={re
+          +port['__logprob__']['argmax_agree']:.3f}"                     
+      205          + (f"  ({base_sigma / sigma:.1f}× better than baseline
+            σ={base_sigma:.4f})" if base_sigma else ""))
+      206      return report
+      207  
+
+  Thought for 2s (ctrl+o to expand)
+
+● Update(scripts/dsv41_consistency/probe_module_inputs.py)
+  ⎿  Added 2 lines, removed 1 line
+      347              logits = output.logits.float()
+      348              logprobs = torch.log_softmax(logits, dim=-1)
+      349              next_logprobs = logprobs[0, :-1].gather(-1, input_
+           ids[0, 1:].unsqueeze(-1)).squeeze(-1)
+      350 +            pred_ids = logits[0, :-1].argmax(-1).cpu()        
+      351              if fired != {key: 1 for key in graft}:
+      352                  raise SystemExit(f"input hooks did not fire as
+            expected: fired={fired} graft={list(graft)}")
+      353              if rank == 0:
+      354                  report = summarize(variant, graft, input_sink,
+            stage_sink, engine, length, scored,
+      354 -                                   engine_argmax, next_logprob
+          -s.cpu(), baseline, log)                                       
+      355 +                                   engine_argmax, next_logprob
+          +s.cpu(), pred_ids, baseline, log)                             
+      356                  if variant == "baseline":
+      357                      baseline = report
+      358                  reports[variant] = report
+
+  Thought for 4s (ctrl+o to expand)
+
+● Write(scripts/dsv41_consistency/sh/run_probe_inputs.sh)
+  ⎿  Wrote 15 lines to scripts/dsv41_consistency/sh/run_probe_inputs.sh
+       1 set -xeuo pipefail
+       3 export HCCL_CONNECT_TIMEOUT=1500
+       4 # chips 2..9 (NPU 1..4) were free when the run started; chips 0/
+       5 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-2,
+         3,4,5,6,7,8,9}
+       7 export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
+       8 export PYTHONPATH=/workspace-verl/vllm:/workspace-verl/vllm-asce
+         PYTHONPATH:-}
+       9 cd /workspace-verl/verl
+         scripts/dsv41_consistency/probe_module_inputs.py \
+     … +13 lines (ctrl+o to expand)
+
+  Thought for 9s, ran 4 shell commands (ctrl+o to expand)
+
+● 显存空闲（各卡仅 ~3GB 他人常驻）。启动 scaled32 的输入打桩实验：
+
+  Thought for 4s, ran 1 shell command (ctrl+o to expand)
+
+● 趁运行，写汇总脚本：
+
+● Write(scripts/dsv41_consistency/summarize_probe.py)
+  ⎿  Wrote 121 lines to scripts/dsv41_consistency/summarize_probe.py
+       1 """Rebuild the input-probe table from the saved dumps of ``probe
+       2 
+         `report_len<L>.json`` is
+         d re-derives everything:
+       6 * ``in_nat``  -- ||engine_input - trainer_natural_input|| / ||tr
+         ainer_input||, from the
+         uts were to begin with.
+          for every variant, with a
+         alue (so the remaining
+          propag
+     … +154 lines (ctrl+o to expand)
+
+  Thought for 2s (ctrl+o to expand)
+● Update(scripts/dsv41_consistency/probe_module_inputs.py)
+  ⎿  Added 1 line
+      362                          "graft": graft,
+      363                          "input_ids": input_ids[0].cpu(),
+      364                          "next_logprobs": next_logprobs.float()
+           .cpu(),
+      365 +                        "pred_ids": pred_ids,                 
+      366                          "stages": stage_sink,
+      367                          "inputs": input_sink,
+      368                          "forward_s": elapsed,
+
+● Update(scripts/dsv41_consistency/summarize_probe.py)
+  ⎿  Added 6 lines, removed 3 lines
+      110              if payload["variant"] == "baseline":
+      111                  base_sigma = sigma
+      112              ratio = f"{base_sigma / sigma:.1f}×" if base_sigma
+            else "-"
+      113 -            pred_ids = payload["next_logprobs"].argmax()  # un
+          -used: kept for symmetry with the run log                      
+      114 -            del pred_ids                                      
+      113 +            pred_ids = payload.get("pred_ids")                
+      114 +            agree = float("nan")                              
+      115 +            if pred_ids is not None:                          
+      116 +                count = min(pred_ids.numel(), argmax_ids.numel
+          +())                                                           
+      117 +                agree = (pred_ids[:count].long() == argmax_ids
+          +[:count]).float().mean().item()                               
+      118              print(f"{payload['variant']:<20} {delta.mean().ite
+           m():>+8.4f} {sigma:>8.4f} {ratio:>9} "
+      119                    f"{delta.abs().mean().item():>8.4f} {delta.a
+           bs().quantile(0.99).item():>7.3f} "
+      117 -                  f"{delta.abs().max().item():>6.3f} {'-':>7}"
+          -)                                                             
+      120 +                  f"{delta.abs().max().item():>6.3f} {agree:>7
+          +.3f}")                                                        
+      121  
+      122  
+      123  if __name__ == "__main__":
+
+  Thought for 26s, searched for 1 pattern, ran 4 shell commands (ctrl+o to expand)
+
+● 找到崩溃原因：in.all 简写在 parse_variant 里没处理（我漏了）。修复：
+
+● Update(scripts/dsv41_consistency/probe_module_inputs.py)
+  ⎿  Added 5 lines, removed 2 lines
+      115      if spec == "baseline":
+      116          return {}
+      117      graft: dict[str, str] = {}
+      118 -    item_specs = [spec] if spec == "in.all" else spec.split("+
+          -")                                                            
+      119 -    for item in item_specs:                                   
+      118 +    items: list[str] = []                                     
+      119 +    for raw in spec.split("+"):                               
+      120 +        # `in.all` is shorthand for both modules at every laye
+          +r                                                             
+      121 +        items.extend(["in.all.attn", "in.all.ffn"] if raw == "
+          +in.all" else [raw])                                           
+      122 +    for item in items:                                        
+      123          parts = item.split(".")
+      124          if len(parts) != 3 or parts[0] != "in" or parts[2] not
+            in ENGINE_INPUT_KEYS:
+      125              raise SystemExit(
+
+  Thought for 3s (ctrl+o to expand)
+
+● Update(scripts/dsv41_consistency/probe_module_inputs.py)
+  ⎿  Added 5 lines
+      213      args = parse_args()
+      214      if not args.model_path:
+      215          raise SystemExit("--model-path (or MODEL_PATH) is requ
+           ired")
+      216 +    # Fail on a bad --variants string before spending two minu
+          +tes loading the checkpoint.                                   
+      217 +    variants = [v for v in args.variants.split(",") if v]     
+      218 +    for variant in variants:                                  
+      219 +        parse_variant(variant, 1)                             
+      220 +    lengths = [int(x) for x in args.lengths.split(",") if x]  
+      221      torch, dist, device = dt.init_distributed()
+      222      rank = dist.get_rank()
+      223  
+
+● Update(scripts/dsv41_consistency/probe_module_inputs.py)
+  ⎿  Removed 2 lines
+      286  
+      287      with open(args.fixture) as f:
+      288          fixture = json.load(f)
+      289 -    lengths = [int(x) for x in args.lengths.split(",") if x]  
+      289      samples = [s for s in fixture["samples"] if s["target_len"
+           ] in lengths]
+      291 -    variants = [v for v in args.variants.split(",") if v]     
+      290  
+      291      out_dir = Path(args.out_dir)
+      292      if rank == 0:
+
+  Thought for 2s, ran 1 shell command (ctrl+o to expand)
+
+● Update(scripts/dsv41_consistency/probe_module_inputs.py)
+  ⎿  Added 4 lines
+      126                  f"variant {spec!r}: expected baseline | in.<al
+           l|layer>.<attn|ffn> | in.all, got {item!r}"
+      127              )
+      128          layer, module = parts[1], parts[2]
+      129 +        if layer != "all" and not layer.isdigit():            
+      130 +            raise SystemExit(                                 
+      131 +                f"variant {spec!r}: expected baseline | in.<al
+          +l|layer>.<attn|ffn> | in.all, got {item!r}"                   
+      132 +            )                                                 
+      133          layers = range(n_layers) if layer == "all" else [int(l
+           ayer)]
+      134          for index in layers:
+      135              graft[f"model.layers.{index}.{module}"] = ENGINE_I
+           NPUT_KEYS[module].format(i=index)
+
+  Thought for 13s (ctrl+o to expand)
+
+● 解析 bug 已修。重新启动 scaled32（同时我已经拿到关键数据了）：
+
+  Thought for 11s, ran 1 shell command (ctrl+o to expand)
+
+● 发现一个设计缺口：baseline 变体没有记录模块的自然输入（"输入差异本来有多大"这
+  一列会缺）。先停掉刚启动的运行，修好再跑：
+
+  Thought for 10s, ran 2 shell commands (ctrl+o to expand)
+
+● 进程已清干净。现在补上 baseline
+  的自然输入记录，并在汇总里加路由翻转分析（解释"0.6% 输入差 → 6.4%
+  输出差"的放大机制）：
+
+● Update(scripts/dsv41_consistency/probe_module_inputs.py)
+  ⎿  Added 7 lines, removed 2 lines
+      317              input_sink: dict[str, torch.Tensor] = {}
+      318              handles = []
+      319              fired: dict[str, int] = {}
+      320 +            # `baseline` grafts nothing but still records ever
+          +y module input: that is the                                   
+      321 +            # "how far apart were the two stacks' inputs" colu
+          +mn of the report.                                             
+      322 +            record_keys = list(graft) or [                    
+      323 +                f"model.layers.{index}.{module}" for index in 
+          +range(n_layers) for module in ENGINE_INPUT_KEYS               
+      324 +            ]                                                 
+      325              # forward pre-hooks run in registration order: rec
+           ord the natural input first (that
+      326              # is the "input difference" readout), then overwri
+           te it with the engine's value.
+      322 -            for trainer_key in graft:                         
+      327 +            for trainer_key in record_keys:                   
+      328                  module = find_module(trainer_key)
+      324 -                engine_key = graft[trainer_key]               
+      329 +                engine_key = graft.get(trainer_key)           
+      330  
+      331                  def record_in(_module, inputs, key=trainer_key
+           ):
+      332                      if inputs and torch.is_tensor(inputs[0]):
+
+● Update(scripts/dsv41_consistency/probe_module_inputs.py)
+  ⎿  Added 2 lines, removed 1 line
+      347                      return (grafted.reshape(hidden.shape), *in
+           puts[1:])
+      348  
+      349                  handles.append(module.register_forward_pre_hoo
+           k(record_in))
+      350 -                handles.append(module.register_forward_pre_hoo
+          -k(replace_in))                                                
+      350 +                if engine_key is not None:                    
+      351 +                    handles.append(module.register_forward_pre
+          +_hook(replace_in))                                            
+      352              handles += dt.install_hooks(model, torch, args.max
+           _elements, stage_sink)
+      353  
+      354              started = time.time()
+
+  Thought for 2s, read 1 file (ctrl+o to expand)
+
+● Now rewrite summarize so baseline 也报告输入差，并且逐模块打印 in/out：
+
+● Update(scripts/dsv41_consistency/probe_module_inputs.py)
+  ⎿  Added 7 lines, removed 7 lines
+      160                next_logprobs, pred_ids, baseline, log) -> dict:
+      161      """Compare the forced forward against the engine: input di
+           ff (natural) + output diff (forced)."""
+      162      report = {"__inputs__": {}, "__outputs__": {}}
+      163 -    # (a) what the module input difference *was*, before the p
+          -re-hook overwrote it                                          
+      164 -    for trainer_key, engine_key in graft.items():             
+      165 -        natural = input_sink.get(trainer_key)                 
+      166 -        if natural is not None:                               
+      167 -            report["__inputs__"][trainer_key] = describe(     
+      168 -                engine_tensor(engine, engine_key, "module inpu
+          -t"), natural                                                  
+      169 -            )                                                 
+      163 +    # (a) what each module input difference *was*, before the 
+          +pre-hook overwrote it                                         
+      164 +    for trainer_key, natural in input_sink.items():           
+      165 +        parts = trainer_key.split(".")                        
+      166 +        engine_key = ENGINE_INPUT_KEYS[parts[3]].format(i=part
+          +s[2])                                                         
+      167 +        report["__inputs__"][trainer_key] = describe(         
+      168 +            engine_tensor(engine, engine_key, "module input"),
+          + natural                                                      
+      169 +        )                                                     
+      170      # (b) every module's output, forced input where grafted
+      171      for index in range(8):
+      172          for module in ("attn", "ffn"):
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(scripts/dsv41_consistency/probe_module_inputs.py)
+  ⎿  Added 5 lines, removed 7 lines
+      198      parts = []
+      199      for key, value in report["__outputs__"].items():
+      200          name = key.split("layers.")[-1] if key.startswith("mod
+           el.layers") else key
+      201 -        if key in graft:                                      
+      202 -            natural = report["__inputs__"].get(key)           
+      203 -            in_text = f"(in was {natural['rel_err']:.4f})" if 
+          -natural else ""                                               
+      204 -            parts.append(f"{name}=FORCED{in_text}->out={value[
+          -'rel_err']:.4f}")                                             
+      205 -        else:                                                 
+      206 -            parts.append(f"{name}={value['rel_err']:.4f}")    
+      207 -    log(f"[{variant}] " + " ".join(parts))                    
+      201 +        natural = report["__inputs__"].get(key)               
+      202 +        in_text = f" in={natural['rel_err']:.4f}" if natural e
+          +lse ""                                                        
+      203 +        marker = "*" if key in graft else ""                  
+      204 +        parts.append(f"{name}{in_text} out={value['rel_err']:.
+          +4f}{marker}")                                                 
+      205 +    log(f"[{variant}] " + " | ".join(parts) + "   (* = input f
+          +orced to the engine's)")                                      
+      206      sigma = report["__logprob__"]["std"]
+      207      base_sigma = baseline.get("__logprob__", {}).get("std") if
+            baseline else None
+      208      log(f"[{variant}] logprob Δ: mean={report['__logprob__']['
+           mean']:+.4f} std={sigma:.4f} "
+
+  Thought for 9s, ran 1 shell command (ctrl+o to expand)
+
+● 代码修好了，先启动 scaled32 运行（约 5 分钟），随后我补路由分析：
+
+  Thought for 5s, ran 2 shell commands (ctrl+o to expand)
+
+● scaled32 跑完了。看完整结果：
+
+  Thought for 7s, ran 1 shell command (ctrl+o to expand)
+
+● scaled32 全套结果已齐（数字很干净）。现在启动 384
+  专家（scaled，生产配置）的同一实验：
+
+  Thought for 6s, ran 1 shell command (ctrl+o to expand)
+● 趁 384 专家运行，我给汇总脚本加"路由翻转"分析（解释 MoE 的放大机制）：
+
+● Update(scripts/dsv41_consistency/summarize_probe.py)
+  ⎿  Added 41 lines
+      53      return (engine.float() - trainer.float()).norm().item() / (
+          trainer.float().norm().item() + 1e-12)
+      54  
+      55  
+      56 +def per_token_rel_err(trainer: torch.Tensor, engine: torch.Tens
+         +or) -> torch.Tensor:                                           
+      57 +    trainer = trainer.float().reshape(-1, trainer.shape[-1])   
+      58 +    engine = engine.float().reshape(-1, engine.shape[-1])      
+      59 +    diff = (engine - trainer).norm(dim=-1)                     
+      60 +    return diff / (trainer.norm(dim=-1) + 1e-12)               
+      61 +                                                               
+      62 +                                                               
+      63 +def routing_section(payloads, engine, length, out=print):      
+      64 +    """Do tiny input differences flip the MoE's discrete top-6 
+         +choice?                                                        
+      65 +                                                               
+      66 +    The trainer's own routing (``baseline``) is compared agains
+         +t the routing it computes when                                 
+      67 +    its MoE input is forced to the engine's value: same module,
+         + same weights, inputs 0.6-12%                                  
+      68 +    apart. The per-token output error is then split by whether 
+         +that token's expert *set*                                      
+      69 +    changed, which shows whether the error is a continuous effe
+         +ct or a discrete one.                                          
+      70 +    """                                                        
+      71 +    ref = next((p for p in payloads if p["variant"] == "baselin
+         +e"), None)                                                     
+      72 +    forced = next((p for p in payloads if any(key.endswith(".ff
+         +n") for key in p["graft"])), None)                             
+      73 +    if ref is None or forced is None:                          
+      74 +        return                                                 
+      75 +    out(f"\n----- len={length}: routing stability, {ref['varian
+         +t']} vs {forced['variant']} (MoE input forced)")               
+      76 +    out(f"{'layer':<7} {'expert-sets same':>16} {'slot overlap'
+         +:>13} {'flips':>8} "                                           
+      77 +        f"{'rel_err|flip':>13} {'rel_err|same':>13}")          
+      78 +    for index in range(4):                                     
+      79 +        gate_key = f"model.layers.{index}.ffn.gate[1]"         
+      80 +        a, b = ref["stages"].get(gate_key), forced["stages"].ge
+         +t(gate_key)                                                    
+      81 +        ffn_key = f"model.layers.{index}.ffn"                  
+      82 +        if a is None or b is None or ffn_key not in ref["stages
+         +"]:                                                            
+      83 +            continue                                           
+      84 +        sets_a = [set(row.tolist()) for row in a.long()]       
+      85 +        sets_b = [set(row.tolist()) for row in b.long()]       
+      86 +        same = torch.tensor([sa == sb for sa, sb in zip(sets_a,
+         + sets_b)])                                                     
+      87 +        overlap = sum(len(sa & sb) / max(len(sa), 1) for sa, sb
+         + in zip(sets_a, sets_b)) / len(sets_a)                         
+      88 +        errors = per_token_rel_err(ref["stages"][ffn_key], engi
+         +ne_tensor(engine, f"language_model.model.layers.{index}.mlp")) 
+      89 +        count = min(errors.numel(), same.numel())              
+      90 +        errors, same = errors[:count], same[:count]            
+      91 +        flip_mean = errors[~same].mean().item() if (~same).any(
+         +) else float("nan")                                            
+      92 +        keep_mean = errors[same].mean().item() if same.any() el
+         +se float("nan")                                                
+      93 +        out(f"{f'{index}.ffn':<7} {same.float().mean().item():>
+         +16.4f} {overlap:>13.4f} "                                      
+      94 +            f"{int((~same).sum()):>4}/{count:<3} {flip_mean:>13
+         +.4f} {keep_mean:>13.4f}")                                      
+      95 +                                                               
+      96 +                                                               
+      97  def main():
+      98      args = parse_args()
+      99      order = {name: index for index, name in enumerate(args.sort
+          .split(",") if args.sort else [])}
+
+● Update(scripts/dsv41_consistency/summarize_probe.py)
+  ⎿  Added 1 line
+      159              print(f"{payload['variant']:<20} {delta.mean().ite
+           m():>+8.4f} {sigma:>8.4f} {ratio:>9} "
+      160                    f"{delta.abs().mean().item():>8.4f} {delta.a
+           bs().quantile(0.99).item():>7.3f} "
+      161                    f"{delta.abs().max().item():>6.3f} {agree:>7
+           .3f}")
+      162 +        routing_section(payloads, engine, length)             
+      163  
+      164  
+      165  if __name__ == "__main__":
+
+  Thought for 13s, ran 1 shell command (ctrl+o to expand)
+
+● Update(scripts/dsv41_consistency/summarize_probe.py)
+  ⎿  Added 1 line, removed 1 line
+      74          return
+      75      out(f"\n----- len={length}: routing stability, {ref['varian
+          t']} vs {forced['variant']} (MoE input forced)")
+      76      out(f"{'layer':<7} {'expert-sets same':>16} {'slot overlap'
+          :>13} {'flips':>8} "
+      77 -        f"{'rel_err|flip':>13} {'rel_err|same':>13}")          
+      77 +        f"{'rel_err|flip':>13} {'rel_err|same':>13} {'flip shar
+         +e of err²':>18}")                                              
+      78      for index in range(4):
+      79          gate_key = f"model.layers.{index}.ffn.gate[1]"
+      80          a, b = ref["stages"].get(gate_key), forced["stages"].ge
+          t(gate_key)
+
+● Update(scripts/dsv41_consistency/summarize_probe.py)
+  ⎿  Added 3 lines, removed 1 line
+      90          errors, same = errors[:count], same[:count]
+      91          flip_mean = errors[~same].mean().item() if (~same).any(
+          ) else float("nan")
+      92          keep_mean = errors[same].mean().item() if same.any() el
+          se float("nan")
+      93 +        # how much of the squared output error sits on the toke
+         +ns whose expert set changed                                    
+      94 +        share = ((errors[~same] ** 2).sum() / (errors**2).sum()
+         +).item() if (~same).any() else 0.0                             
+      95          out(f"{f'{index}.ffn':<7} {same.float().mean().item():>
+          16.4f} {overlap:>13.4f} "
+      94 -            f"{int((~same).sum()):>4}/{count:<3} {flip_mean:>13
+         -.4f} {keep_mean:>13.4f}")                                      
+      96 +            f"{int((~same).sum()):>4}/{count:<3} {flip_mean:>13
+         +.4f} {keep_mean:>13.4f} {share:>18.3f}")                       
+      97  
+      98  
+      99  def main():
+
+  Thought for 13s, ran 4 shell commands (ctrl+o to expand)
+
+● 384 专家也跑完了。看路由分解：
+
+  Thought for 14s, ran 1 shell command (ctrl+o to expand)
+
+● 数据全齐，且机制非常干净。写新工作记录：
+
+● Write(wiki/work_log/worklog_dsv41_module_input_probe.md)
+  ⎿  Wrote 249 lines to wiki/work_log/worklog_dsv41_module_input_probe.md
+       1 # DeepSeek-V4.1 训推一致性：**模块输入打桩**（input-graft）专项
+       2 
+         train_infer_consistency.md)（§9 输出嫁接 / §10 dtype A/B 负结果 
+       4 > 本轮回答一个此前**无法回答**的问题：**把模块的输入换成引擎侧完
+       5 > （§9 只能回答"把这个模块的输出换成引擎的，下游还剩多少差异"；
+         它的引擎输出是在**引擎自己的输入**上算出来的，层 ≥1 属混合态，见
+       6 > 日期：2026-09-22。脚本：`scripts/dsv41_consistency/probe_modul
+         30/dsv41/dump/probe_input{,_scaled}/`。
+       8 ---
+      10 ## 0. 结论摘要（先看这里）
+     … +361 lines (ctrl+o to expand)
+
+  Thought for 10s, ran 2 shell commands (ctrl+o to expand)
+
+● Update(scripts/dsv41_consistency/summarize_probe.py)
+  ⎿  Removed 1 line
+      123                      value = baseline["inputs"].get(key)
+      124                      if value is not None:
+      125                          natural_in[key] = rel_err(value, engin
+           e_tensor(engine, ENGINE_INPUT_KEYS[module].format(i=index)))
+      126 -                    # the baseline's own output error, for the
+          - reference column                                             
+      126          variants = [p["variant"] for p in payloads]
+      127          print(f"\n===== len={length}  (rel_err = ‖engine − tra
+           iner‖/‖trainer‖; * = input forced to the engine's)")
+      128          print(f"{'module':<20} {'in_nat':>8} " + " ".join(f"{n
+           ame:>13}" for name in variants))
+
+● Now 把新记录接回旧工作记录：
+
+● Update(wiki/work_log/worklog_dsv41_train_infer_consistency.md)
+  ⎿  Added 5 lines
+      31  > 16. **dtype 配方不是原因（§10，负结果）**：把训练侧 MoE 改成
+          引擎的 bf16 配方（env 门控 `VERL_DSV41_MOE_BF16=1`），固有差纹
+          丝不动（0.0058→0.0057 / 0.0178→0.0178）→ 差异在**分组 GEMM 内核
+          内部**，不在 GEMM 之间的 fp32 提升。与 §4.1（注意力改 fp32 无收
+          益）同构：**内核级差异，没有"配方级"捷径**。
+      32  > 17. **环境坑（会影响下次运行，见 §10.4）**：主机 IP 已变（`14
+          1.61.29.117`→`80.5.25.117`）但 `/etc/hosts` 未更新 → 需要 `MAST
+          ER_ADDR=127.0.0.1` + `GLOO_SOCKET_IFNAME=enp48s3u1u1`；`dump_en
+          gine_stages.py` 需 `--mem-util 0.85`（每卡有他人 ~3GB 常驻，0.9
+           必然失败）。
+      33  
+      34 +> **2026-09-22 补充（输入打桩，独立文档见 [worklog_dsv41_module
+         +_input_probe.md](worklog_dsv41_module_input_probe.md)）**——§9  
+         +的"混合态 caveat"（§9.6）已被消除，并给出放大机制：            
+      35 +> 18. **把模块输入换成引擎侧逐位相同的张量后，两个栈的模块自身 
+         +仍差 ~0.5%，且与专家数无关**（attn 0.0050–0.0057，MoE 0.0054–0.
+         +0055；第 0 层注意力的输入本来就是逐位一致 → 那 0.57% 是纯核差）
+         +。                                                             
+      36 +> 19. **端到端噪声的主体是这个 0.5% 被 MoE 的离散路由翻转放大出
+         +来的**：第 0 层 MoE 输入差 0.60% → 输出差 6.4%（10.7×），其中 *
+         +*97% 的平方误差落在 4.7% 的"top-6 集合变了"的 token 上**；全层/
+         +两模型都是 **92–98%**。                                        
+      37 +> 20. **全部模块输入钉死后**：σ 从 0.32/0.56（32 专家）与 1.08/
+         +0.71（384 专家）掉到 **0.030–0.034**，`model.norm` 一律 **0.007
+         +0** → 存在与专家数无关的"输入一致地板"。**专家数只加强放大器（ 
+         +同输入差下翻转率 16%→31%），不改变核差**——这就是"kl 0.11→0.38" 
+         +的机制。                                                       
+      38 +                                                               
+      39  ---
+      40  
+      41  ## 1. 方法与工具（本次新建）
+
+● Update(wiki/work_log/worklog_dsv41_train_infer_consistency.md)
+  ⎿  Added 1 line
+      543  
+      544  ### 11.4 未做的事（留给下次/新机器）
+      545  
+      546 +- ~~输入打桩（把模块输入钉成引擎值）~~ → **已于 2026-09-22 完 
+          +成**，见 [worklog_dsv41_module_input_probe.md](worklog_dsv41_m
+          +odule_input_probe.md)。                                       
+      547  - 384 专家下的 `VERL_DSV41_MOE_BF16=1` A/B（§10 的负结论只在 3
+           2 专家上验证过；理论上结论不会变，但没实测）。
+      548  - 引擎侧反方向嫁接（训练侧输出灌进引擎）——需要改 vllm-ascend w
+           orker 的 monkey-patch，收益与正向嫁接信息等价，未做。
+      549  - 真实（fp8 专家）权重：`MODEL_PATH=` 一行切换即可复用本 harne
+           ss，引擎侧需重跑 `run_dump_engine.sh`（注意 fp8 权重的 `quanti
+           zation_config` 会影响 `load_weights` 路径）。
+
+  Thought for 4s (ctrl+o to expand)
+
+● 更新记忆（新增工作记录指针与结论要点）：
+
+  Thought for 4s, recalled 1 memory, wrote 2 memories (ctrl+o to expand)
+
+● 让我核验两个写到工作记录里的关键断言（输入是否逐位一致、引擎侧输入原始
+  dtype）：
+
+  Thought for 3s, ran 1 shell command (ctrl+o to expand)
+
+● 核验通过，两个断言都成立（引擎侧输入全部 bf16 可精确表示 → 注入是逐位的；第 0
+  层注意力输入 torch.equal=True）。把验证写进工作记录：
+
+● Update(wiki/work_log/worklog_dsv41_module_input_probe.md)
+  ⎿  Added 5 lines, removed 1 line
+      72  x = self.mlp(x, input_ids=..., hidden_states_fp32=x_fp32, ...)
+      73  ```
+      74  
+      75 -已核对：`rms_norm_cast` 的两个返回值在 dump 里**逐位相等**（`[0
+         -].bfloat16() == [1].bfloat16()` 且 `[0] == [1]` 精确相等，`rel 
+         -diff = 0`）→ 引擎的 `hidden_states_fp32`（MoE 路由输入）就是 `[
+         -0]` 的 fp32 上转，**注入 `[0]` 一个张量即同时覆盖 GEMM 输入与路
+         -由输入**，不存在"只对齐了一半输入"的漏洞。                     
+      75 +已核对两件事，它们决定"逐位一致"这句话是否成立：               
+      76  
+      77 +1. `rms_norm_cast` 的两个返回值在 dump 里**逐位相等**（`[0].bfl
+         +oat16() == [1].bfloat16()` 且 `[0] == [1]` 精确相等，`rel diff 
+         += 0`）→ 引擎的 `hidden_states_fp32`（MoE 路由输入）就是 `[0]`  
+         +的 fp32 上转，**注入 `[0]` 一个张量即同时覆盖 GEMM 输入与路由输
+         +入**，不存在"只对齐了一半输入"的漏洞。                         
+      78 +2. 所有引擎侧输入张量都是 **bf16 可精确表示**的（`x.bfloat16().
+         +float() == x` 对全部元素成立）→ 把 dump 的 fp32 值回铸成 bf16  
+         +注入训练侧，是**逐位**注入，不是"近似一致"。                   
+      79 +3. 交叉验证：`baseline` 变体记录的"自然输入"里，**第 0 层注意力
+         +的输入与引擎 `input_layernorm` 输出 `torch.equal == True`（rel 
+         += 0.00e+00）**——即 embed → 第 0 层 attn 前的整段路径两侧**逐位 
+         +相同**。                                                       
+      80 +                                                               
+      81  ### 1.3 实现要点（`probe_module_inputs.py`）
+      82  
+      83  1. 每个目标模块注册**两个 pre-hook（注册顺序即执行顺序）**：① 
+          记录"自然输入"（替换前的值，即"输入差本来有多大"）→ ② 替换为引
+          擎张量（`.to(device, dtype).reshape(args[0].shape)`，保留 `inpu
+          ts[1:]`）。
+
+● Update(wiki/work_log/worklog_dsv41_module_input_probe.md)
+  ⎿  Added 1 line, removed 1 line
+      16     | attention（4 层） | **0.0050 – 0.0057** |
+      17     | MoE / ffn（4 层） | **0.0054 – 0.0055** |
+      18  
+      19 -   其中**第 0 层注意力的输入本来就是逐位相同的**（论文意义上的"
+         -种子"：embed/attn_norm 两侧 rel_err = 0），它那 0.57% 是**纯核 
+         -差**。                                                         
+      19 +   其中**第 0 层注意力的输入本来就是逐位相同的**（"种子"：embed
+         + → attn_norm 这一段两侧 `torch.equal == True`，rel_err 精确为 0
+         +），它那 0.57% 是**纯核差**（输入保证是逐位注入的，见 §1.2）。 
+      20  
+      21  2. **端到端噪声的主体不是这 0.5%，而是它被 MoE 的"离散路由翻转"
+          放大出来的**：
+      22     - 第 0 层 MoE：输入只差 **0.60%**，输出差 **6.4–6.45%**（≈ *
+          *10.7×**）——但把输入钉死后只剩 0.54%。
+
+  Thought for 4s (ctrl+o to expand)
+
+● Update(wiki/work_log/worklog_dsv41_module_input_probe.md)
+  ⎿  Added 1 line, removed 1 line
+      161  
+      162  ### 2.3 三个可以直接读出来的事实
+      163  
+      164 -1. **核差与专家数无关**：`in.all.ffn`/`in.all.attn`/`in.all`  
+          -三种变体的模块输出在 32 与 384 专家下**逐位级一致**（attn 0.00
+          -49–0.0057，MoE 0.0054–0.0055），`model.norm` 也都落在 0.0070–0
+          -.0080。**所以"专家数把差距放大"完全发生在输入传播路径上，不发 
+          -生在两个核的内部。**                                          
+      164 +1. **核差与专家数无关**：`in.all.ffn`/`in.all.attn`/`in.all`  
+          +三种变体的模块输出在 32 与 384 专家下**落在同一小区间**（attn 
+          +0.0049–0.0057，MoE 0.0054–0.0055），`model.norm` 也都落在 0.00
+          +70–0.0080（两者权重不同、专家数不同，却给出同一个数）。**所以"
+          +专家数把差距放大"完全发生在输入传播路径上，不发生在两个核的内 
+          +部。**                                                        
+      165  2. **baseline 的误差随专家数变大，且全部来自 MoE 行**：384 专
+           家 len64 的 `3.ffn` 从 0.2168（32）涨到 0.3768（384），而 `3.a
+           ttn` 只从 0.0865 到 0.1821（注意力行也涨是因为它的输入差被上游
+           放大了：0.1218→0.1834）。
+      166  3. **注意力是"种子"，但自身不是放大器**：把**注意力**输入钉死
+           （`in.all.attn`）只把 σ 压 1.2–1.7×；把 **MoE 输入**钉死立刻压
+            8.9–32×，且 `in.all` ≈ `in.all.ffn`（注意力输入是否钉死几乎不
+           影响最终结果）。
+      167  
+
+  Thought for 7s, read 1 file (ctrl+o to expand)
+
+● Update(wiki/work_log/worklog_dsv41_module_input_probe.md)
+  ⎿  Added 1 line, removed 1 line
+      19     其中**第 0 层注意力的输入本来就是逐位相同的**（"种子"：embed
+           → attn_norm 这一段两侧 `torch.equal == True`，rel_err 精确为 0
+          ），它那 0.57% 是**纯核差**（输入保证是逐位注入的，见 §1.2）。
+      20  
+      21  2. **端到端噪声的主体不是这 0.5%，而是它被 MoE 的"离散路由翻转"
+          放大出来的**：
+      22 -   - 第 0 层 MoE：输入只差 **0.60%**，输出差 **6.4–6.45%**（≈ *
+         -*10.7×**）——但把输入钉死后只剩 0.54%。                         
+      22 +   - 第 0 层 MoE：输入只差 **0.60%**，输出差 **5.2–6.5%**（len6
+         +4：6.44/6.45%，即 **10.7×**；len200：5.19/5.87%，即 8.7–9.8×）—
+         +—但把输入钉死后只剩 **0.54%**。                                
+      23     - 逐 token 分解：**误差能量的 92–98% 落在"top-6 专家集合发生
+          变化"的那部分 token 上**。第 0 层 len=64 时只有 3/64 个 token（
+          4.7%）翻转，它们贡献了 **97.3%** 的平方误差；这些 token 的逐 to
+          ken 相对误差 0.30，未翻转的只有 0.011。
+      24     - 翻转率随深度与专家数增长：len=200 第 3 层 384 专家有 **85/
+          200（42.5%）** token 翻转（32 专家时 46/200），误差能量占比仍 9
+          5%。
+      25  
+  Thought for 4s (ctrl+o to expand)
+
+● 工作记录里有一处推断需要更严谨（跨模型比较的混淆因素）。补上 caveat：
+
+● Update(wiki/work_log/worklog_dsv41_module_input_probe.md)
+  ⎿  Added 2 lines, removed 1 line
+      196  **读法**：
+      197  
+      198  - **误差是"少数 token 的离散事件"**：第 0 层只有 4.7% 的 token
+            换了专家，却贡献 **97%** 的平方误差；未翻转 token 的误差（0.0
+           11）只比核差（0.0054）大 2×。→ 6.4% 不是"每个 token 都错 6.4%"
+           ，而是"少数 token 错 30%"。
+      199 -- **专家数放大的是翻转率**：同一层、**输入差几乎相同**时，384 
+          -专家翻得更多——len64 层 1：输入差 0.0555 vs 0.0584（基本相同） 
+          -，翻转 10/64 → **20/64**，输出误差 0.1311 → **0.1912**。这直接
+          -定量解释了"32 专家 kl 0.11 → 384 专家 kl 0.38"：**专家越多，to
+          -p-k 越接近平局，0.5% 的输入扰动越容易翻掉选择。**             
+      199 +- **专家数放大的是翻转率**：同一层、**输入差几乎相同**时，384 
+          +专家翻得更多——len64 层 1：输入差 0.0555 vs 0.0584（基本相同） 
+          +，翻转 10/64 → **20/64**，输出误差 0.1311 → **0.1912**。这与" 
+          +专家越多、top-k 越接近平局"的直觉一致，定量解释了"32 专家 kl 0
+          +.11 → 384 专家 kl 0.38"：**放大器的增益变强了，而不是核差变大 
+          +了。**                                                        
+      200 +  > ⚠️ 这一条是**跨 checkpoint** 比较（`scaled32` 与 `scaled` 
+          +的 router 权重是两套不同的随机矩阵），所以"翻转率翻倍"里既有" 
+          +专家数"因素也有"换了一套随机权重"因素，**不能严格归因于专家数 
+          +本身**；严格的对照需要同一个 checkpoint 增减专家数（未做）。§1
+          +1.3-2 的"差距随专家数增长"结论有同样的混淆，本轮的贡献是为它补
+          +上了**机制**（翻转占误差能量 92–98%），而不是严格的因果对照。 
+      201  - 与 §6.2 的线上尾部（`|Δ|>2 nats` 的 token 占 1.5%）同源：翻
+           转 token 的逐 token 误差 0.3–0.45（≈ 1–3 nats 量级），就是那条
+           尾巴。
+      202  
+      203  ---
+
+● Update(wiki/work_log/worklog_dsv41_module_input_probe.md)
+  ⎿  Added 2 lines
+      252  - **只测 prefill↔prefill**：注入的是引擎 prefill 的输入；RL 用
+            rollout（**decode**）产出的 logprob，decode↔prefill 是另一条
+           通道（§3.4 / §11.3，384 专家下必须依赖 `enable_batch_invariant
+           `）。
+      253  - **只覆盖 4 层 / 两种长度 64,200**：更长序列（压缩 KV、index_
+           topk 全开）与更深的层数未测。
+      254  - **未测 `in.<层>.<模块>` 单层变体**：语法支持，本轮没跑（§9 
+           已证单层输出嫁接几乎无效）。
+      255 +- **"专家数 → 翻转率"是跨 checkpoint 观察，不是严格对照**（见 
+          +§3 的 ⚠️）；同理，本轮所有"32 专家 vs 384 专家"的差异都混着"两
+          +套不同的随机权重"。                                           
+      256 +- **`in.all` 的残余 σ=0.030 里，哪些属于 attn 核差、哪些属于 M
+          +oE 核差没拆**：`in.all.ffn`（0.031–0.036）与 `in.all`（0.030–0
+          +.034）几乎相同，说明把**注意力**的输入也钉死几乎没有额外收益——
+          +注意力自身的核差已经通过它写进残差流的位置被稀释，这一点与 §9.
+          +5-2 的量级解释一致，但没有单独量化。                          
+
+  Thought for 5s, ran 1 shell command (ctrl+o to expand)
+
+● 做完了。按你的要求开了新工作记录，并在模块输入处打桩测量。
+
+  结论：输入钉成逐位一致后，还有误差，≈0.5% —— 
+  而端到端噪声的主体是它被放大的结果
+
+  1. 模块自身核差（输入逐位一致时）——与专家数无关
+
+  ┌───────────────────┬────────────────────────┐
+  │       模块        │ 输入一致时剩余 rel_err │
+  ├───────────────────┼────────────────────────┤
+  │ attention（4 层） │ 0.0050–0.0057          │
+  ├───────────────────┼────────────────────────┤
+  │ MoE / ffn（4 层） │ 0.0054–0.0055          │
+  └───────────────────┴────────────────────────┘
+
+  32 专家与 384 专家给出同一个数。第 0
+  层注意力的输入本来就是逐位相同的（torch.equal=True，已核验）→ 那 0.57%
+  是纯核差，不是上游传播。
+
+  2. 放大机制：MoE 的离散路由翻转（这次测出来了）
+
+  第 0 层 MoE：输入只差 0.60%，输出差 5.2–6.5%；误差能量的 92–98% 落在"top-6 
+  专家集合变了"的少数 token 上。len64 层 0 只有 3/64 个 token 翻转，却贡献 97.3%
+  的平方误差（翻转 token 逐 token 误差 0.30，未翻转 0.011）。所以 6.4%
+  不是"每个 token 都错 6.4%"，而是"少数 token 错 30%"——正是线上 |Δ|>2 nats
+  那条尾巴的来源。
+
+  3. 全部输入钉死后（in.all）
+
+  ┌───────────────────┬────────────┬─────────────────┬─────────────────┐
+  │       配置        │ baseline σ │    in.all σ     │   model.norm    │
+  ├───────────────────┼────────────┼─────────────────┼─────────────────┤
+  │ scaled32 / len64  │ 0.3181     │ 0.0335（9.5×）  │ 0.1434 → 0.0070 │
+  ├───────────────────┼────────────┼─────────────────┼─────────────────┤
+  │ scaled32 / len200 │ 0.5596     │ 0.0298（18.8×） │ 0.1294 → 0.0070 │
+  ├───────────────────┼────────────┼─────────────────┼─────────────────┤
+  │ 384 专家 / len64  │ 1.0786     │ 0.0310（34.8×） │ 0.2283 → 0.0070 │
+  ├───────────────────┼────────────┼─────────────────┼─────────────────┤
+  │ 384 专家 / len200 │ 0.7062     │ 0.0311（22.7×） │ 0.1826 → 0.0070 │
+  └───────────────────┴────────────┴─────────────────┴─────────────────┘
+
+  四个配置残余几乎相同 → 存在与专家数无关的"输入一致地板"（0.031 nats /
+  0.7%）。所以一句话：训推差距 = 核差（每模块 0.5%，种子）× MoE 路由敏感（每层 
+  ~10×，放大器）的逐层累积；专家数只加强放大器，不改变核差。这解释了 kl
+  0.11→0.38 是"放大器变强"而非"误差源变大"。
+
+  顺带
+
+  - 不需要重跑引擎 dump：引擎侧模块输入已在现有 dump 里（attn ←
+    input_layernorm；ffn ← rms_norm_cast@layerN[0]，其 [1] fp32
+    孪生已验证逐位相等 → 注入一个张量即覆盖 MoE 的 GEMM 与路由输入）。
+  - 与历史结论交叉验证一致：MoE 输入对齐后固有差本节 0.0054 vs §9 的
+    0.0058；baseline 全部数字逐位复现（钩子不扰动前向）。
+  - 诚实标注了一处混淆："32 vs 384 专家"是跨 checkpoint 比较（router
+    是两套不同随机权重），所以"翻转率翻倍"不能严格归因于专家数本身，已写进
+    caveat。两处代码 bug 也记了（in.all 简写解析、baseline 未记录自然输入）。
+
+  产物：工作记录 verl/wiki/work_log/worklog_dsv41_module_input_probe.md（含全部
+  原始表格、机制分解、复现命令、caveat），脚本 probe_module_inputs.py +
+  summarize_probe.py + sh/run_probe_inputs.sh，dump 在
+  .../dump/probe_input{,_scaled}/；旧记录 §11.4 与 §0
+  已回链。进程已退出、显存已释放。
+
+  下一步候选（等你定）：① 用真实 fp8 权重复跑同一
+  harness（看清"未训练模型路由近平局"把放大系数夸大了多少）；② 既然种子明确在第
+  0 层注意力核，评估要不要为它单独做数值对齐；③ 把翻转 token 的尾部特征喂给 RL
+  侧 IS/TIS 的阈值选择。
+
+✻ Cogitated for 29m 45s · done 3:36 AM
+
+❯ 如果moe输入一致的情况，moe是否会存在误差？                                    
+
+  Thought for 15s (ctrl+o to expand)
+
+● 好问题 —— 这正是这次实验测到的核心量。先直接回答，再用我已有的 dump 把"这
+  0.54% 长什么样"拆开（均匀的核噪声 vs 少数 token 的离散翻转）：
+
+  Thought for 27s, ran 4 shell commands (ctrl+o to expand)
+
+● 确认了一个重要的 dump 语义问题（引擎侧 routed/shared
+  是融合的）。把这一轮追查写进工作记录：
+
+● Update(wiki/work_log/worklog_dsv41_module_input_probe.md)
+  ⎿  Added 22 lines, removed 1 line
+      159  | Δlogp σ | — | 0.7062 | 0.0339 (20.8×) | 0.5745 (1.2×) | **0.
+           0311 (22.7×)** |
+      160  | argmax 一致率 | — | 0.759 | 0.970 | 0.829 | **0.975** |
+      161  
+      162 -### 2.3 三个可以直接读出来的事实                              
+      162 +### 2.3 输入一致时那 0.54% **长什么样**：均匀核噪声，不是离散 
+          +翻转                                                          
+      163  
+      164 +把"输入=引擎值"那一版的 MoE 输出与引擎输出做**逐 token** 比较 
+          +（`rel_err_t = ‖e_t − x_t‖/‖x_t‖`，每行 5120 维）：           
+      165 +                                                              
+      166 +| 层 | **输入一致**（`in.all.ffn`）mean / median / p99 / **max
+          +** | 自然输入（baseline）mean / median / p99 / **max** |      
+      167 +|---|---|---|                                                 
+      168 +| 0.ffn | 0.0054 / 0.0055 / 0.0057 / **0.0058** | 0.0245 / 0.0
+          +110 / 0.3123 / **0.3171** |                                   
+      169 +| 1.ffn | 0.0054 / 0.0054 / 0.0058 / **0.0058** | 0.0738 / 0.0
+          +310 / 0.4358 / **0.4391** |                                   
+      170 +| 2.ffn | 0.0055 / 0.0055 / 0.0057 / **0.0058** | 0.1245 / 0.0
+          +466 / 0.5596 / **0.5810** |                                   
+      171 +| 3.ffn | 0.0054 / 0.0054 / 0.0057 / **0.0057** | 0.1461 / 0.0
+          +591 / 0.6668 / **0.6719** |                                   
+      172 +                                                              
+      173 +（64 token × 4 层 = 256 个样本）                              
+      174 +                                                              
+      175 +- **输入一致时分布完全紧致**：median ≈ mean ≈ 0.0054，**max 0.
+          +0058**，没有一个 token 超过 0.05。                            
+      176 +- **自然输入时是长尾**：median 只有 0.011–0.059，**max 0.32–0.
+          +67**——正是 §3 那些翻转 token。                                
+      177 +- **推论（重要）：输入一致时路由不翻转**。若有一例翻转，逐 tok
+          +en 误差会出现 ~0.3 的离群值（翻转 token 的实测值），而 256 个 
+          +样本里最大值只有 0.0058 → 翻转率 < 0.4%。也就是说训练侧 gate  
+          +与引擎 router 在相同输入上给出**相同的 top-6**（两侧都用 fp32 
+          +算 logits），这 0.54% 是**纯算术核差**（分组 GEMM 分块/累加、 
+          +专家输出归约与 combine、route 权重相乘位置、shared 相加精度） 
+          +。                                                            
+      178 +- 因此 MoE 的误差有**两条互不相同的通道**：                   
+      179 +  1. **算术核差 0.54%**（输入一致时依然存在，均匀、无尾）——这 
+          +是 MoE 的数值地板；                                           
+      180 +  2. **离散路由翻转**（由输入差触发，把 0.6% 输入差变成 6.4%  
+          +输出差）——这是端到端差距的主体。                              
+      181 +  只有掐掉种子（上游那 0.5% 核差）才能关掉通道 2；通道 1 只能 
+          +靠换成引擎同款算子消掉（§4.2/§10 已证无"配方级"捷径）。       
+      182 +                                                              
+      183 +### 2.4 三个可以直接读出来的事实                              
+      184 +                                                              
+      185  1. **核差与专家数无关**：`in.all.ffn`/`in.all.attn`/`in.all` 
+           三种变体的模块输出在 32 与 384 专家下**落在同一小区间**（attn 
+           0.0049–0.0057，MoE 0.0054–0.0055），`model.norm` 也都落在 0.00
+           70–0.0080（两者权重不同、专家数不同，却给出同一个数）。**所以"
+           专家数把差距放大"完全发生在输入传播路径上，不发生在两个核的内
+           部。**
+      186  2. **baseline 的误差随专家数变大，且全部来自 MoE 行**：384 专
+           家 len64 的 `3.ffn` 从 0.2168（32）涨到 0.3768（384），而 `3.a
+           ttn` 只从 0.0865 到 0.1821（注意力行也涨是因为它的输入差被上游
+           放大了：0.1218→0.1834）。
+      187  3. **注意力是"种子"，但自身不是放大器**：把**注意力**输入钉死
+           （`in.all.attn`）只把 σ 压 1.2–1.7×；把 **MoE 输入**钉死立刻压
+            8.9–32×，且 `in.all` ≈ `in.all.ffn`（注意力输入是否钉死几乎不
+           影响最终结果）。
+
+● Update(wiki/work_log/worklog_dsv41_module_input_probe.md)
+  ⎿  Added 1 line
+      270  ## 7. 方法上的 caveat
+      271  
+      272  - **"引擎路由"是代理值**：路由对比用的是"训练侧 gate 在引擎输
+           入上的选择"，不是引擎自己那次前向的真实选择。原因是引擎 dump 
+           里的 router 捕获（`AscendFusedTopKRouter._compute_routing`）只
+           有 8/25 token 的 dummy 批次，与 prefill 的 token 流不可比（这
+           也解释了 §9.5-4 为何要"从 checkpoint 重算"）。
+      273 +- **引擎侧 routed / shared 无法分离（用 dump 时别踩）**：`lang
+          +uage_model.model.layers.{i}.mlp.experts` 看起来像"只含 routed"
+          +，实测它就是**整块 MoE 输出**（与训练侧 `ffn` 的 cos = 0.99996
+          +、norm 397.19 vs 397.17、rel_err = 0.00545 —— 与 `.mlp` 同值）
+          +，因为 Ascend 融合 MoE 把 shared 也吃进去了。所以引擎 dump 里*
+          +*不能**用 `.mlp.experts` 做"routed 路径"的对比；本轮也因此**没
+          +能把 0.54% 拆成 routed / shared 两部分**（要拆需在引擎侧加 hoo
+          +k 或改融合核）。                                              
+      274  - **只测 prefill↔prefill**：注入的是引擎 prefill 的输入；RL 用
+            rollout（**decode**）产出的 logprob，decode↔prefill 是另一条
+           通道（§3.4 / §11.3，384 专家下必须依赖 `enable_batch_invariant
+           `）。
+      275  - **只覆盖 4 层 / 两种长度 64,200**：更长序列（压缩 KV、index_
+           topk 全开）与更深的层数未测。
+      276  - **未测 `in.<层>.<模块>` 单层变体**：语法支持，本轮没跑（§9 
+           已证单层输出嫁接几乎无效）。
+
+  Thought for 2s, wrote 1 memory (ctrl+o to expand)
+
+● 会，仍有误差 —— 但性质和"输入不一致时"完全不同。
+
+  我用已有 dump 把输入=引擎值那一版的 MoE 输出做了逐 token 比较（每 token
+  一行，5120 维）：
+
+  ┌───────┬────────────────────────────────┬────────────────────────────────┐
+  │  层   │         输入逐位一致           │  自然输入 mean/median/p99/max  │
+  │       │      mean/median/p99/max       │                                │
+  ├───────┼────────────────────────────────┼────────────────────────────────┤
+  │ 0.ffn │ 0.0054 / 0.0055 / 0.0057 /     │ 0.0245 / 0.0110 / 0.3123 /     │
+  │       │ 0.0058                         │ 0.3171                         │
+  ├───────┼────────────────────────────────┼────────────────────────────────┤
+  │ 1.ffn │ 0.0054 / 0.0054 / 0.0058 /     │ 0.0738 / 0.0310 / 0.4358 /     │
+  │       │ 0.0058                         │ 0.4391                         │
+  ├───────┼────────────────────────────────┼────────────────────────────────┤
+  │ 2.ffn │ 0.0055 / 0.0055 / 0.0057 /     │ 0.1245 / 0.0466 / 0.5596 /     │
+  │       │ 0.0058                         │ 0.5810                         │
+  ├───────┼────────────────────────────────┼────────────────────────────────┤
+  │ 3.ffn │ 0.0054 / 0.0054 / 0.0057 /     │ 0.1461 / 0.0591 / 0.6668 /     │
+  │       │ 0.0057                         │ 0.6719                         │
+  └───────┴────────────────────────────────┴────────────────────────────────┘
+
+  （64 token × 4 层 = 256 个样本；两种专家数、两种长度都是这个结果）
+
+  三个要点：
+
+  1. 输入一致时误差是 0.54%，且完全紧致：median≈mean≈0.0054，max 0.0058，256
+     个样本里没有一个 token 超过 0.05。
+  2. 由此可推断：输入一致时路由不翻转。翻转 token 的特征是 ~0.3 的逐 token
+     误差（右列 max 0.32–0.67 就是它们），若 256 个样本里有任何一例翻转，max
+     不可能是 0.0058。也就是说训练侧 gate 与引擎 router 在相同输入上给出相同的 
+     top-6（两侧都按 fp32 算 logits）。所以这 0.54% 是纯算术核差：分组 GEMM
+     的分块/累加顺序、专家输出的归约与 all-to-all combine、route
+     权重相乘位置、shared 相加精度。
+  3. 对比输入差 0.60% 时：误差 6.4%，其中 97% 的能量压在 4.7% 的翻转 token 上。
+
+  所以 MoE 的误差有两条互不相同的通道：
+
+  ┌───────────┬────────────────────┬─────┬─────────┬──────────────────────┐
+  │   通道    │      触发条件      │ 大  │  形态   │       能否消除       │
+  │           │                    │ 小  │         │                      │
+  ├───────────┼────────────────────┼─────┼─────────┼──────────────────────┤
+  │ ①         │ 任何情况（输入一致 │ 0.5 │ 均匀、  │ 只能换成引擎同款算子 │
+  │ 算术核差  │ 也在）             │ 4%  │ 无尾    │ （§4.2 布局受限 /    │
+  │           │                    │     │         │ §10 dtype 无捷径）   │
+  ├───────────┼────────────────────┼─────┼─────────┼──────────────────────┤
+  │           │                    │ 0.6 │ 少数    │                      │
+  │ ② 离散路  │ 输入有差（≥0.1%    │ % → │ token   │ 只能掐种子（上游     │
+  │ 由翻转    │ 量级即可）         │  6. │ 30–67%  │ 0.5% 核差）          │
+  │           │                    │ 4%  │ 的长尾  │                      │
+  └───────────┴────────────────────┴─────┴─────────┴──────────────────────┘
+
+  顺带一个dump 陷阱（本轮追查发现的，已记进工作记录与记忆）：引擎的 mlp.experts
+  不是"只含 routed"——实测它就是整块 MoE 输出（与训练侧 ffn 的
+  cos=0.99996、rel_err 与 .mlp 同值），因为 Ascend 融合 MoE 把 shared
+  也吃进去了。因此这 0.54% 目前拆不开 routed/shared
+  各占多少，是遗留项（要拆得在引擎侧加 hook 或改融合核）。
+
+  工作记录已更新：新增 §2.3「输入一致时那 0.54% 长什么样」和 §7 的 dump
+  陷阱条目。
+
+✻ Brewed for 2m 35s · done 3:48 AM
+
+❯ attn在输入一致是，是否也没有误差？                                            
+
+  Thought for 9s (ctrl+o to expand)
+
+● 好问题 —— attn 也有"离散选择"（滑窗/压缩 KV 的 top-k
+  索引），所以同样要问：输入一致时残留的 0.5% 是均匀核噪声还是少数 token 
+  的选择翻转。用已有 dump 直接测：
+
+  Thought for 12s, ran 2 shell commands (ctrl+o to expand)
+
+● attn 的答案同样干净，而且连离散选择都没翻转。写进工作记录：
+
+● Update(wiki/work_log/worklog_dsv41_module_input_probe.md)
+  ⎿  Added 29 lines, removed 1 line
+      180    2. **离散路由翻转**（由输入差触发，把 0.6% 输入差变成 6.4% 
+           输出差）——这是端到端差距的主体。
+      181    只有掐掉种子（上游那 0.5% 核差）才能关掉通道 2；通道 1 只能
+           靠换成引擎同款算子消掉（§4.2/§10 已证无"配方级"捷径）。
+      182  
+      183 -### 2.4 三个可以直接读出来的事实                              
+      183 +### 2.4 attn 在输入一致时：同样是 0.5% 的**均匀核噪声**，连稀 
+          +疏选择都不翻转                                                
+      184  
+      185 +同样做逐 token 比较（`in.all.attn`，输入=引擎值，逐位）：     
+      186 +                                                              
+      187 +| 配置 | 0.attn | 1.attn | 2.attn | 3.attn |                  
+      188 +|---|---|---|---|---|                                         
+      189 +| scaled32 / len64 | 0.0058 / max 0.0062 | 0.0052 / max 0.0054
+          + | 0.0051 / max 0.0055 | 0.0051 / max 0.0055 |                
+      190 +| scaled32 / len200 | 0.0057 / max 0.0063 | 0.0050 / max 0.005
+          +4 | 0.0049 / max 0.0054 | 0.0049 / max 0.0056 |               
+      191 +| scaled384 / len64 | 0.0058 / max 0.0062 | 0.0052 / max 0.005
+          +4 | 0.0051 / max 0.0054 | 0.0051 / max 0.0055 |               
+      192 +| scaled384 / len200 | 0.0057 / max 0.0062 | 0.0050 / max 0.00
+          +54 | 0.0049 / max 0.0054 | 0.0049 / max 0.0055 |              
+      193 +                                                              
+      194 +（每格：mean / max；median ≈ mean，p99 ≈ max；**8 个配置 × 4  
+          +层 × 64/200 token ≈ 5000 个样本里，逐 token 误差超过 0.05 的有
+          + 0 个**。）                                                   
+      195 +                                                              
+      196 +- **没有离散事件**：注意力这条路上本来也有离散选择（滑窗、压缩
+          + KV 的 `index_topk`、indexer 的 top-k），但输入一致时没有出现 
+          +翻转——否则会出现 0.1–0.3 量级的离群 token。所以两侧的索引选择 
+          +在相同输入下是**一致的**，残留 0.50–0.58% 全部来自核内数值（bf
+          +16 分数/概率 vs 分页融合核的高精度路径）。                    
+      197 +- **位置剖面**：误差随位置**轻微下降**（与位置相关系数 −0.38…−
+          +0.78：位置 0 处 0.0052–0.0057，位置 ~130 处 0.0048–0.0049），*
+          +*在滑窗边界（128）处没有跳变**，任何位置都不出离群 → 是平滑的 
+          +核噪声，不是"某些位置选择了不同的 KV"。                       
+      198 +- 一个自检：`0.attn` 在 baseline 里输入本来就是逐位一致的，所 
+          +以它的 baseline 值与"输入一致"值**完全相等**（0.0057/0.0058）—
+          +—两条独立路径给出同一个数。                                   
+      199 +                                                              
+      200 +### 2.5 两个模块的对照：**地板一样（~0.5%），增益完全不同**   
+      201 +                                                              
+      202 +| | attn | MoE |                                              
+      203 +|---|---|---|                                                 
+      204 +| 输入一致时的自身误差 | 0.0050–0.0058，**均匀无尾**（max/medi
+          +an ≈ 1.05） | 0.0054–0.0055，**均匀无尾**（max/median ≈ 1.05）
+          + |                                                            
+      205 +| 输入有差时的行为 | **近似"直通"（不放大）**：层 1 输入差 0.0
+          +572 → 输出 0.0507；层 3 输入差 0.1834 → 输出 0.1594（384/len64
+          +）。max/median ≈ 1.1–2.3，**无长尾** | **放大**：层 0 输入差 0
+          +.0060 → 输出 0.0645（**10.8×**）；max/median ≈ 5–11，**长尾集 
+          +中在翻转 token** |                                            
+      206 +| 长尾的来源 | 无（连续算子，没有阈值/选择） | 离散路由选择翻 
+          +转（占误差能量 92–98%） |                                     
+      207 +| 端到端影响力 | 钉死其输入只把 σ 压 1.2–1.7× | 钉死其输入把 σ
+          + 压 8.9–34.8× |                                               
+      208 +                                                              
+      209 +→ **两个核的"数值地板"是同一个量级（~0.5%）**，训推差距之所以 
+          +由 MoE 主导，不是因为 MoE 自己更不准，而是因为它是**唯一带阈值
+          +/选择的算子**，会把任何微小的输入差**离散放大**。             
+      210 +                                                              
+      211 +### 2.6 三个可以直接读出来的事实                              
+      212 +                                                              
+      213  1. **核差与专家数无关**：`in.all.ffn`/`in.all.attn`/`in.all` 
+           三种变体的模块输出在 32 与 384 专家下**落在同一小区间**（attn 
+           0.0049–0.0057，MoE 0.0054–0.0055），`model.norm` 也都落在 0.00
+           70–0.0080（两者权重不同、专家数不同，却给出同一个数）。**所以"
+           专家数把差距放大"完全发生在输入传播路径上，不发生在两个核的内
+           部。**
+      214  2. **baseline 的误差随专家数变大，且全部来自 MoE 行**：384 专
+           家 len64 的 `3.ffn` 从 0.2168（32）涨到 0.3768（384），而 `3.a
+           ttn` 只从 0.0865 到 0.1821（注意力行也涨是因为它的输入差被上游
+           放大了：0.1218→0.1834）。
+      215  3. **注意力是"种子"，但自身不是放大器**：把**注意力**输入钉死
+           （`in.all.attn`）只把 σ 压 1.2–1.7×；把 **MoE 输入**钉死立刻压
+            8.9–32×，且 `in.all` ≈ `in.all.ffn`（注意力输入是否钉死几乎不
+           影响最终结果）。
+
+  Thought for 3s (ctrl+o to expand)
+
+● Update(wiki/work_log/worklog_dsv41_module_input_probe.md)
+  ⎿  Added 1 line, removed 1 line
+      202  | | attn | MoE |
+      203  |---|---|---|
+      204  | 输入一致时的自身误差 | 0.0050–0.0058，**均匀无尾**（max/medi
+           an ≈ 1.05） | 0.0054–0.0055，**均匀无尾**（max/median ≈ 1.05）
+            |
+      205 -| 输入有差时的行为 | **近似"直通"（不放大）**：层 1 输入差 0.0
+          -572 → 输出 0.0507；层 3 输入差 0.1834 → 输出 0.1594（384/len64
+          -）。max/median ≈ 1.1–2.3，**无长尾** | **放大**：层 0 输入差 0
+          -.0060 → 输出 0.0645（**10.8×**）；max/median ≈ 5–11，**长尾集 
+          -中在翻转 token** |                                            
+      205 +| 输入有差时的行为（全张量 rel_err） | **近似"直通"（不放大）*
+          +*：384/len64 层 1 输入 0.0572 → 输出 0.0661（1.2×）、层 3 输入
+          + 0.1834 → 输出 0.1821（1.0×）。逐 token 的 max/median ≈ 1.1–2.
+          +3，**无长尾** | **放大**：384/len64 层 0 输入 0.0060 → 输出 **
+          +0.0645（10.8×）**；逐 token 的 max/median ≈ 5–11，**长尾集中在
+          +翻转 token** |                                                
+      206  | 长尾的来源 | 无（连续算子，没有阈值/选择） | 离散路由选择翻
+           转（占误差能量 92–98%） |
+      207  | 端到端影响力 | 钉死其输入只把 σ 压 1.2–1.7× | 钉死其输入把 σ
+            压 8.9–34.8× |
+      208  
+
+  Thought for 4s (ctrl+o to expand)
+
+● Update(wiki/work_log/worklog_dsv41_module_input_probe.md)
+  ⎿  Added 1 line, removed 1 line
+      201  
+      202  | | attn | MoE |
+      203  |---|---|---|
+      204 -| 输入一致时的自身误差 | 0.0050–0.0058，**均匀无尾**（max/medi
+          -an ≈ 1.05） | 0.0054–0.0055，**均匀无尾**（max/median ≈ 1.05）
+          - |                                                            
+      204 +| 输入一致时的自身误差 | 0.0050–0.0058，**均匀无尾**（逐 token
+          + 的 max/median ≈ 1.05–1.2） | 0.0054–0.0055，**均匀无尾**（max
+          +/median ≈ 1.05–1.1） |                                        
+      205  | 输入有差时的行为（全张量 rel_err） | **近似"直通"（不放大）*
+           *：384/len64 层 1 输入 0.0572 → 输出 0.0661（1.2×）、层 3 输入
+            0.1834 → 输出 0.1821（1.0×）。逐 token 的 max/median ≈ 1.1–2.
+           3，**无长尾** | **放大**：384/len64 层 0 输入 0.0060 → 输出 **
+           0.0645（10.8×）**；逐 token 的 max/median ≈ 5–11，**长尾集中在
+           翻转 token** |
+      206  | 长尾的来源 | 无（连续算子，没有阈值/选择） | 离散路由选择翻
+           转（占误差能量 92–98%） |
+      207  | 端到端影响力 | 钉死其输入只把 σ 压 1.2–1.7× | 钉死其输入把 σ
+            压 8.9–34.8× |
+
+● Update(wiki/work_log/worklog_dsv41_module_input_probe.md)
+  ⎿  Added 1 line, removed 1 line
+      202  | | attn | MoE |
+      203  |---|---|---|
+      204  | 输入一致时的自身误差 | 0.0050–0.0058，**均匀无尾**（逐 token
+            的 max/median ≈ 1.05–1.2） | 0.0054–0.0055，**均匀无尾**（max
+           /median ≈ 1.05–1.1） |
+      205 -| 输入有差时的行为（全张量 rel_err） | **近似"直通"（不放大）*
+          -*：384/len64 层 1 输入 0.0572 → 输出 0.0661（1.2×）、层 3 输入
+          - 0.1834 → 输出 0.1821（1.0×）。逐 token 的 max/median ≈ 1.1–2.
+          -3，**无长尾** | **放大**：384/len64 层 0 输入 0.0060 → 输出 **
+          -0.0645（10.8×）**；逐 token 的 max/median ≈ 5–11，**长尾集中在
+          -翻转 token** |                                                
+      205 +| 输入有差时的行为（全张量 rel_err） | **近似"直通"（不放大）*
+          +*：384/len64 层 1 输入 0.0572 → 输出 0.0661（1.2×）、层 3 输入
+          + 0.1834 → 输出 0.1821（1.0×）。逐 token 的 max/median ≈ **2.3–
+          +4.3** | **放大**：384/len64 层 0 输入 0.0060 → 输出 **0.0645（
+          +10.8×）**；逐 token 的 max/median ≈ **11–29**，**长尾集中在翻 
+          +转 token** |                                                  
+      206  | 长尾的来源 | 无（连续算子，没有阈值/选择） | 离散路由选择翻
+           转（占误差能量 92–98%） |
+      207  | 端到端影响力 | 钉死其输入只把 σ 压 1.2–1.7× | 钉死其输入把 σ
+            压 8.9–34.8× |
+      208  
+
+  Thought for 2s, wrote 1 memory (ctrl+o to expand)
+
+● 不是零 —— attn 在输入逐位一致时也有 ~0.5% 
+  的误差，而且同样是"均匀核噪声、没有任何离散翻转"。
+
+  逐 token 比较（in.all.attn，输入=引擎值逐位注入）：
+
+  ┌──────────────┬─────────────┬─────────────┬─────────────┬─────────────┐
+  │     配置     │   0.attn    │   1.attn    │   2.attn    │   3.attn    │
+  ├──────────────┼─────────────┼─────────────┼─────────────┼─────────────┤
+  │ scaled32 /   │ 0.0058 /    │ 0.0052 /    │ 0.0051 /    │ 0.0051 /    │
+  │ len64        │ max 0.0062  │ max 0.0054  │ max 0.0055  │ max 0.0055  │
+  ├──────────────┼─────────────┼─────────────┼─────────────┼─────────────┤
+  │ scaled32 /   │ 0.0057 /    │ 0.0050 /    │ 0.0049 /    │ 0.0049 /    │
+  │ len200       │ max 0.0063  │ max 0.0054  │ max 0.0054  │ max 0.0056  │
+  ├──────────────┼─────────────┼─────────────┼─────────────┼─────────────┤
+  │ scaled384 /  │ 0.0058 /    │ 0.0052 /    │ 0.0051 /    │ 0.0051 /    │
+  │ len64        │ max 0.0062  │ max 0.0054  │ max 0.0054  │ max 0.0055  │
+  ├──────────────┼─────────────┼─────────────┼─────────────┼─────────────┤
+  │ scaled384 /  │ 0.0057 /    │ 0.0050 /    │ 0.0049 /    │ 0.0049 /    │
+  │ len200       │ max 0.0062  │ max 0.0054  │ max 0.0054  │ max 0.0055  │
+  └──────────────┴─────────────┴─────────────┴─────────────┴─────────────┘
+
+  （每格 mean / max；median ≈ mean，p99 ≈ max；8 个配置 × 4 层 × 64/200 token ≈ 
+  5000 个样本里，逐 token 误差超过 0.05 的有 0 个。）
+
+  三点：
+
+  1. 离散选择也没有翻转。注意力这条路本来也有离散选择（滑窗、压缩 KV 的
+     index_topk、indexer 的 top-k），但输入一致时没出现离群 token（否则会有
+     0.1–0.3 的样本）→ 两侧的索引选择在相同输入下完全一致，残留的 0.50–0.58%
+     全是核内数值（训练侧 bf16 分数/bf16 概率的 eager 实现 vs
+     引擎分页融合核的高精度路径）。
+  2. 位置剖面平滑：误差随位置轻微下降（相关系数 −0.38…−0.78，位置 0 处
+     0.0052–0.0057 → 位置 ~130 处 0.0048–0.0049），在滑窗边界 128 处没有跳变 →
+     不是"某些位置选了不同 KV"。
+  3. 自检：0.attn 在 baseline 里输入本来就是逐位一致的，它的 baseline
+     值与"输入一致"值完全相同（0.0057/0.0058）——两条独立路径给同一个数。
+
+  两者对照：地板一样（~0.5%），增益完全不同
+
+  ┌───────────────┬───────────────────────────┬────────────────────────────┐
+  │               │           attn            │            MoE             │
+  ├───────────────┼───────────────────────────┼────────────────────────────┤
+  │ 输入一致时自  │ 0.0050–0.0058，均匀无尾（ │ 0.0054–0.0055，均匀无尾（≈ │
+  │ 身误差        │ max/median ≈1.05–1.2）    │ 1.05–1.1）                 │
+  ├───────────────┼───────────────────────────┼────────────────────────────┤
+  │ 输入有差时（  │ 近似直通、不放大：层1     │                            │
+  │ 全张量        │ 输入 0.0572→输出          │ 放大 10.8×：层0 输入       │
+  │ rel_err）     │ 0.0661（1.2×）；层3       │ 0.0060→输出 0.0645         │
+  │               │ 0.1834→0.1821（1.0×）     │                            │
+  ├───────────────┼───────────────────────────┼────────────────────────────┤
+  │ 逐 token      │ 2.3–4.3（连续算子，无阈值 │ 11–29（长尾全在翻转 token  │
+  │ max/median    │ ）                        │ 上）                       │
+  ├───────────────┼───────────────────────────┼────────────────────────────┤
+  │ 钉死其输入的  │ σ 只降 1.2–1.7×           │ σ 降 8.9–34.8×             │
+  │ 收益          │                           │                            │
+  └───────────────┴───────────────────────────┴────────────────────────────┘
+
+  所以"差距由 MoE 主导"不是因为 MoE 自己更不准（两者的数值地板同为
+  ~0.5%），而是因为它是唯一带阈值/选择的算子，会把任何微小输入差离散放大；注意力
+  是连续算子，只会把输入差原样传下去。
+
+  工作记录已加 §2.4（attn 逐 token 分布 + 位置剖面）和
+  §2.5（两模块"同地板、不同增益"对照表）。
+
+✻ Brewed for 1m 38s · done 3:56 AM
+
+❯ attn 和 moe 这么看都没啥大问题？下一步方向是什么                              
+  Thought for 20s (ctrl+o to expand)
+
+● 先给一个判断，再给方向。为了不空谈，我快速核一件关键事实（RL 的 ratio
+  分母到底是不是引擎给的）：
+
+  Thought for 22s, searched for 4 patterns, ran 2 shell commands (ctrl+o to expand)
+
+● 核完了。先给判断，再给方向（其中一条我已顺手查了代码，能直接落地）。
+
+  Thought for 9s, searched for 1 pattern (ctrl+o to expand)
+
+● 判断：模块级"没大问题"成立，但要分清三件事
+
+  (a) 确实没有 bug —— 三条独立证据：① 权重逐张量一致（§2）；②
+  输入相同时连离散选择都逐 token 一致（路由 top-6、滑窗/压缩 KV 的 index
+  selection 全都不翻转）；③ 残差 ~0.5% 恰好是 bf16 的 ~1 ULP（bf16 eps = 2⁻⁸ ≈
+  0.39%）。结论：两个栈各自都是"bf16 下正确"的实现，差异只是舍入路径不同。→
+  这同时意味着**"对齐内核"的天花板很低**：不共用同一套 kernel，就不可能把 0.5%
+  压到 0。
+
+  (b) 但端到端差距真实、机制已闭环：0.5% 种子 × MoE 离散放大 10×/层。
+
+  (c) 关键新认识：放大是"离散/混沌"的 —— 这解释了一个此前看着矛盾的结果：§4.1
+  把注意力从 bf16 概率改成 fp32（种子 0.34%→0.19%，降了一半），端到端 σ
+  反而升了。不是"对齐无用"，而是落点变了：只要还落在决策边界的另一侧，精度提高
+  2× 就没有意义。所以目标必须是"数量级削减种子"或"让决策一致"，而不是"把 rel_err
+  降低一点"。
+
+  下一步（按性价比排序）
+
+  A. 先钉死"这个差距影响什么"——我已顺手查了代码，结论比预期好
+
+  - verl/trainer/ppo/v1/trainer_base.py::_compute_old_log_prob：默认模式下 
+    old_log_probs 由训练侧重算；只有
+    algorithm.rollout_correction.bypass_mode=True 时才拿引擎的 rollout_log_probs
+    当 old。
+  - 我们的 GRPO 脚本（run_deepseek_v41_grpo_fsdp_turbo_npu.sh）没有设 
+    algorithm.rollout_correction → 走默认 → PG ratio 
+    的分子与分母都来自训练侧，这 0.5 nats 不进入 ratio。
+
+  → 它当前的真实影响只有两条：① 采样分布 π_rollout ≠ 训练锚点 π_old 的
+  off-policy 程度；② 监控指标被内核差饱和（rollout_corr/kl 随专家数、head-gain
+  变，不能再当"同步是否健康"的指标）。
+  → 于是分岔：(a) 认为 off-policy 可接受 →
+  什么都不用改，只把健康指标换成我们这套 harness 的直接量（模块 rel_err /
+  σ）；(b) 认为需要纠正 → 开 rollout_correction 的 token 级 TIS，阈值按"翻转
+  token 承担 90%+ 误差能量"来定。
+
+  B. 真实 fp8 权重复跑（最高性价比实验，一行 MODEL_PATH= + 引擎侧 dump 一次）
+  现在的所有绝对值都偏悲观：随机权重让路由处在近平局、head-gain 4 又把 logprob
+  噪声放大 4×（KL 16×）。这个数字决定 A 的分岔走哪条、以及要不要继续投入对齐。
+
+  C. 把"对齐内核"变成可量化的工程（新工具的直接用途）
+  用输入打桩把目标从"端到端 σ"换成"模块级种子"：在 in.all.attn / in.all.ffn
+  下直接读"改一处数学 → 种子降多少"，没有放大噪声。候选改动（都是训练侧、可
+  A/B）：注意力 PV 的 bf16 概率→fp32、路由 logits 全程 fp32、专家累加/combine 全
+  fp32 且归约顺序对齐、shared 相加精度。判据是数量级（→
+  ≤0.05%），不是"降一点"。
+
+  D. 工程级（暂不划算）：让两侧共用同一数值路径（rollout
+  用训练栈太慢；训练用引擎栈受 §4.2 A2/A3 布局限制）。
+
+  我的建议顺序：B → 用结果决定 A 走 (a) 还是 (b) → 若要继续，用 C 
+  的方式（而不是端到端猜）做内核实验。
+
+  要我现在就把 B 跑起来吗？（需要你先给真实 fp8 权重的路径；引擎侧 dump 我可以按
+  §10.4 的坑位直接重跑。）
+
+✻ Brewed for 2m 27s · done 4:03 AM
+
+❯ 输出到工作日志                                                                
+
+  Thought for 17s, searched for 3 patterns, ran 1 shell command (ctrl+o to expand)
+
+● Update(wiki/work_log/worklog_dsv41_module_input_probe.md)
+  ⎿  Added 42 lines, removed 7 lines
+      262  
+      263  ---
+      264  
+      265 -## 5. 含义与下一步                                            
+      265 +## 5. 判断与下一步                                            
+      266  
+      267 -1. **对"对齐内核"路线**：种子只有两个——第 0 层注意力核（输入逐
+          -位一致仍差 0.57%）与各模块核差（0.54%）。既然 §4.2（A2/A3 布局
+          -限制）与 §10（dtype 配方无收益）都把"训练侧换引擎核"堵死了，那
+          -么**真正的期望值在于**：                                      
+      268 -   - 让 eager 注意力在**数学上**更接近引擎核（引擎核在核内高精
+          -度、分页 KV；训练侧是 bf16 分数 + bf16 概率）——但 §4.1 已证"只
+          -改注意力精度"端到端收益有限，因为它只掐掉种子的一部分；       
+      269 -   - **降低路由灵敏度**（放大器）：例如路由 logits 的高精度计 
+          -算、或对近平局 token 的稳定化。注意引擎的路由输入本就是 fp32  
+          -上转（已核对逐位等于 bf16 上转），所以**"训练侧路由改 fp32"不 
+          -会有收益**——需要动的是平局本身。                              
+      270 -2. **对 RL 侧吸收（§7-5）**：现在有了机制的阈值依据——误差集中 
+          -在**少数路由翻转 token**（1.5–5% 的 token 承担 >90% 的误差能量
+          -），这正是 IS/TIS 与裁剪该覆盖的尾部；对多数 token（未翻转，误
+          -差 ~0.01 nats）无需过强纠正。                                 
+      271 -3. **随机权重的警告（重要）**：本 checkpoint 未训练，路由接近"
+          -平局"，翻转率被系统性放大。**真实训练权重的路由器会更果断 → 同
+          -样的 0.5% 核差带来的翻转应显著更少**。所以本轮结论的**机制**（
+          -核差→路由翻转→逐层放大）可信，但**放大系数的绝对值**对真实权重
+          -会偏悲观。拿到真实（fp8）权重后一行 `MODEL_PATH=` 即可复跑本套
+          - harness（引擎侧需先重跑一次 `run_dump_engine.sh`）。         
+      272 -4. 仍未做：384 专家下的 `VERL_DSV41_MOE_BF16=1` A/B（§11.4 遗 
+          -留）；引擎侧反方向打桩（把训练侧输入灌进引擎，需改 vllm-ascend
+          - worker）。                                                   
+      267 +### 5.1 判断：模块级"**没有 bug**"，但要分三层看              
+      268  
+      269 +1. **没有 bug（三条独立证据）**：① 权重逐张量一致（§2）；② 输 
+          +入相同时**连离散选择都逐 token 一致**——路由 top-6（§3）与注意 
+          +力的滑窗/压缩 KV 索引（§2.4 无离群值）都不翻转；③ 残差 ~0.5%  
+          +恰好是 **bf16 的 ~1 ULP**（bf16 eps = 2⁻⁸ ≈ 0.39%，实测 0.49–0
+          +.58%）。→ 两个栈**各自都是"bf16 下正确"的实现**，差异只是舍入 
+          +路径不同。                                                    
+      270 +2. **"对齐内核"的天花板因此很低**：不共用同一套 kernel，就不可
+          +能把 0.5% 压到 0；训练侧换引擎核又被 §4.2（A2/A3 布局）、§10（
+          +dtype 配方无收益）堵死。                                      
+      271 +3. **但端到端差距是真实的**（σ 0.30–1.08 nats、kl 0.11/0.38） 
+          +，机制已在 §3 闭环。                                          
+      272 +                                                              
+      273 +**关键新认识：放大是"离散/混沌"的** —— 这解释了此前看着矛盾的 
+          +结果：§4.1 把注意力从 bf16 概率改成 fp32（种子 0.34%→0.19%，降
+          +一半），端到端 σ 反而**升**（0.3207→0.4352）。不是"对齐无用"，
+          +而是**落点变了**：只要还落在路由决策边界的另一侧，精度提高 2× 
+          +就没有意义。                                                  
+      274 +→ **目标必须是"数量级削减种子"（→ ≤0.05%）或"让离散决策一致"，
+          +而不是"把 rel_err 降低一点"。**                               
+      275 +                                                              
+      276 +### 5.2 这个差距在 RL 里走哪条路（代码核实，2026-09-22）      
+      277 +                                                              
+      278 +| 位置 | 事实 |                                               
+      279 +|---|---|                                                     
+      280 +| `verl/trainer/ppo/v1/trainer_base.py::_compute_old_log_prob`
+          +（约 1608–1640 行） | **默认（decoupled）分支 = `self.actor_ro
+          +llout_wg.compute_log_prob(batch)` → `old_log_probs` 由训练侧重
+          +算**；只有 `rollout_corr_config["bypass_mode"]=True` 时才 `old
+          +_log_probs = rollout_log_probs`（引擎的） |                   
+      281 +| `verl/trainer/ppo/ray_trainer.py`（1575–1579 行） | 同样的两
+          +条分支（`bypass_recomputing_logprobs` → `apply_bypass_mode`； 
+          +否则 1277/1304 行 `compute_log_prob`） |                      
+      282 +| `verl/trainer/config/algorithm.py:667` | `rollout_correction
+          +` 默认 `None` |                                               
+      283 +| 我们的启动脚本 `examples/grpo_trainer/run_deepseek_v41_grpo_
+          +fsdp_turbo_npu.sh` | **grep 不到 `rollout_correction`** → 走默
+          +认 |                                                          
+      284 +                                                              
+      285 +**结论：默认配置下 PG ratio 的分子与分母都来自训练侧，这 0.5 n
+          +ats 不进入 ratio。** 它的真实影响只有两条：                   
+      286 +1. 采样分布 π_rollout ≠ 训练锚点 π_old 的 **off-policy 程度** 
+          +（GRPO 的裁剪隐含假设两者接近）；                             
+      287 +2. **监控指标被内核差饱和**：`rollout_corr/kl`、`rollout_actor
+          +_probs_pearson_corr` 随**专家数**与 **head-gain** 变（32 专家 
+          +0.98/0.11 → 384 专家 0.79/0.38 → 真实权重预计回到 0.01 量级） 
+          +，所以**不能再用它们当"同步是否健康"的指标**（详见 [worklog_ds
+          +v41_rl.md](../worklog_dsv41_rl.md) 判读标准处的修正）。真正的 
+          +健康指标应是**直接量**：模块 rel_err / Δlogp σ（本 harness）或
+          + §2 的权重指纹。                                              
+      288 +                                                              
+      289 +→ 由此分岔：**(a)** 认为 off-policy 可接受 → **什么代码都不用 
+          +改**，只把健康指标换成直接量；**(b)** 认为需要纠正 → 开 `algor
+          +ithm.rollout_correction` 的 **token 级 TIS**，阈值按 §3 的"翻 
+          +转 token 承担 90%+ 误差能量"来定。                            
+      290 +                                                              
+      291 +### 5.3 下一步方向（按性价比）                                
+      292 +                                                              
+      293 +| # | 方向 | 为什么现在做 / 判据 | 成本 |                     
+      294 +|---|---|---|---|                                             
+      295 +| **B** | **真实 fp8 权重复跑本套 harness**（`MODEL_PATH=` 一 
+          +行 + 引擎侧 `run_dump_engine.sh` 一次） | 随机权重把路由放在近
+          +平局、`head-gain 4` 又放大 4×（KL 16×），**当前所有绝对值都偏 
+          +悲观**；这个数字决定 §5.2 走 (a) 还是 (b)、以及要不要继续投入 
+          +对齐 | ~1 小时 |                                              
+      296 +| **A** | 按 §5.2 决定：换健康指标（(a)）或 开 TIS / 用 bypass
+          +（(b)） | 只要不动，监控就一直在骗人 | 极小 |                 
+      297 +| **C** | 把"对齐内核"改成**模块级可量化**的工程：在 `in.all.a
+          +ttn` / `in.all.ffn` 下直接读"改一处数学 → 种子降多少"（**无放 
+          +大噪声**）。候选：注意力 PV 的 bf16 概率→fp32、路由 logits 全 
+          +程 fp32、专家累加/all-to-all combine 全 fp32 且**归约顺序对齐*
+          +*、shared 相加精度 | §5.1-3 的落点论断要求**数量级**削减才可能
+          +跨过决策边界；端到端猜法已被 §4.1 证否 | 每个改动 ~1 小时 |   
+      298 +| **D** | RL 侧尾部纠正：**token 级 TIS + 尾部截断**，只对翻转
+          + token 施加 | 误差能量 90%+ 压在这 1.5–5% 的 token 上，比全局 
+          +纠正更省更准 | 中 |                                           
+      299 +| **E** | 让两侧共用同一数值路径（rollout 用训练栈 / 训练用引 
+          +擎栈） | **暂不划算**：前者太慢，后者受 §4.2 A2/A3 布局限制 | 
+          +大 |                                                          
+      300 +                                                              
+      301 +**建议顺序：B → 用结果定 A 的 (a)/(b) → 若要继续投入，用 C 的 
+          +方式（而不是端到端猜）做内核实验。**                          
+      302 +                                                              
+      303 +### 5.4 仍未做                                                
+      304 +                                                              
+      305 +- 384 专家下的 `VERL_DSV41_MOE_BF16=1` A/B（§11.4 遗留）。    
+      306 +- 引擎侧反方向打桩（把训练侧输入灌进引擎，需改 vllm-ascend wor
+          +ker）。                                                       
+      307 +- 把 0.54% 拆成 routed / shared 两部分（引擎侧二者融合，dump  
+          +拆不开，见 §7）。                                             
+      308 +                                                              
+      309  ---
+      310  
+      311  ## 6. 复现命令
+
+  Thought for 3s (ctrl+o to expand)
+
+● Update(wiki/work_log/worklog_dsv41_module_input_probe.md)
+  ⎿  Added 2 lines, removed 4 lines
+      36  
+      37  4. **一句话**：训推差距 = **核差（每模块 ~0.5%，种子）× MoE 路
+          由敏感（每层 ~10×，放大器）的逐层累积**。专家数只改变**放大器的
+          增益**（同输入差下 384 专家的翻转率约为 32 专家的 2×），不改变
+          核差本身。这定量解释了线上"32 专家 kl 0.11 → 384 专家 kl 0.38"
+          ：**不是误差源变大了，而是放大器变强了**。
+      38  
+      39 -5. 由此得到的行动优先级（修正 §9.7 / §11.3）：想缩小差距必须掐 
+         -掉**种子**——最直接的两个目标是                                 
+      40 -   (a) 第 0 层注意力核（输入已逐位一致仍差 0.57%）；           
+      41 -   (b) 路由/专家聚合路径（翻转率本身）。                       
+      42 -   只要种子存在，MoE 就会把它放大 10×/层；而"对齐配方/dtype"这 
+         -类捷径已被 §4.1、§10 证否。                                    
+      39 +5. **模块级没有 bug**（三条独立证据 + "0.5% ≈ bf16 的 1 ULP"论 
+         +证，见 §5.1）；且**默认配置下这 0.5 nats 不进入 PG ratio**（`ol
+         +d_log_probs` 由训练侧重算，我们脚本没开 `rollout_correction`， 
+         +见 §5.2）——它影响的是 off-policy 程度与**监控指标**（后者已被内
+         +核差饱和，不能再当"同步是否健康"用）。                         
+      40 +6. **下一步**（详见 §5.3）：**先用真实 fp8 权重复跑本套 harness
+         +**（随机权重 + `head-gain 4` 把当前所有绝对值都放大了），再决定
+         +是"只换健康指标"还是"上 TIS/尾部纠正"；若要继续对齐内核，判据要
+         +改成**模块级的种子数量级削减**（用 `in.all.attn`/`in.all.ffn`  
+         +直接量，而不是端到端 σ）。                                     
+      41  
+      42  ---
+      43  
+
+● Now 修正旧工作记录里的"判读标准"（它现在会误导人）：
+
+● Update(wiki/worklog_dsv41_rl.md)
+  ⎿  Added 4 lines
+      278  | `training_log_ppl` vs `rollout_log_ppl` | 接近 | 差距大 |
+      279  | `actor/grad_norm` | 有限 | nan |
+      280  
+      281 +> ⚠️ **阈值要按"权重/专家数"重标定（2026-09-22 修正）**：上表 
+          +的"~0 / >0.99"是在 G12 那批权重上得出的，**不能当通用阈值**。 
+          +后续一致性专项（见 [work_log/worklog_dsv41_module_input_probe.
+          +md](work_log/worklog_dsv41_module_input_probe.md)）证明：这两 
+          +个指标主要是**两套栈的固有内核数值差（每模块 ~0.5% ≈ bf16 的 1
+          + ULP）**经 MoE 路由离散翻转逐层放大的结果，**随专家数与 head-g
+          +ain 显著变化**——32 专家 scaled32 是 `0.010/0.979`，384 专家 `s
+          +caled` 是 `kl 0.38 / pearson 0.79`，二者都是"同步正确"的正常表
+          +现；真实（fp8、head 正常尺度）权重预计回到 kl ≈ 0.01 量级。   
+      282 +> **判据改为看量级断层**：真错位（专家错绑/布局没回退）会是 **
+          +O(1) 的 logprob 落差 / pearson ~0.5**，与"专家数放大"有数量级 
+          +差异；同时用**直接量**做健康检查——权重指纹（`check_engine_para
+          +ms.py`）、模块 rel_err / Δlogp σ（`probe_module_inputs.py` + `
+          +summarize_probe.py`）。                                       
+      283 +> 另：默认配置下 `old_log_probs` 由训练侧重算（`trainer_base.p
+          +y::_compute_old_log_prob`；本脚本未设 `algorithm.rollout_corre
+          +ction`），**这个差进入的是 off-policy 程度与监控指标，不进入 P
+          +G ratio**。                                                   
+      284 +                                                              
+      285  **结果（2026-09-19，scaled32 权重，第一步）**：
+      286  
+      287  | 指标 | N(0,1) 权重（G12） | scaled 权重 |
+
+  Thought for 7s, searched for 1 pattern, read 1 file, wrote 1 memory (ctrl+o to expand)
+
+● Update(wiki/work_log/worklog_dsv41_module_input_probe.md)
+  ⎿  Added 1 line, removed 1 line
+      292  |---|---|---|---|
+      293  | **B** | **真实 fp8 权重复跑本套 harness**（`MODEL_PATH=` 一
+           行 + 引擎侧 `run_dump_engine.sh` 一次） | 随机权重把路由放在近
+           平局、`head-gain 4` 又放大 4×（KL 16×），**当前所有绝对值都偏
+           悲观**；这个数字决定 §5.2 走 (a) 还是 (b)、以及要不要继续投入
+           对齐 | ~1 小时 |
+      294  | **A** | 按 §5.2 决定：换健康指标（(a)）或 开 TIS / 用 bypass
+           （(b)） | 只要不动，监控就一直在骗人 | 极小 |
+      295 -| **C** | 把"对齐内核"改成**模块级可量化**的工程：在 `in.all.a
+          -ttn` / `in.all.ffn` 下直接读"改一处数学 → 种子降多少"（**无放 
+          -大噪声**）。候选：注意力 PV 的 bf16 概率→fp32、路由 logits 全 
+          -程 fp32、专家累加/all-to-all combine 全 fp32 且**归约顺序对齐*
+          -*、shared 相加精度 | §5.1-3 的落点论断要求**数量级**削减才可能
+          -跨过决策边界；端到端猜法已被 §4.1 证否 | 每个改动 ~1 小时 |   
+      295 +| **C** | 把"对齐内核"改成**模块级可量化**的工程：在 `in.all.a
+          +ttn` / `in.all.ffn` 下直接读"改一处数学 → 种子降多少"（**无放 
+          +大噪声**）。候选：注意力 PV 的 bf16 概率→fp32、路由 logits 全 
+          +程 fp32、专家累加/all-to-all combine 全 fp32 且**归约顺序对齐*
+          +*、shared 相加精度 | §5.1 的"落点"论断要求**数量级**削减才可能
+          +跨过决策边界；端到端猜法已被 §4.1 证否 | 每个改动 ~1 小时 |   
+      296  | **D** | RL 侧尾部纠正：**token 级 TIS + 尾部截断**，只对翻转
+            token 施加 | 误差能量 90%+ 压在这 1.5–5% 的 token 上，比全局
+           纠正更省更准 | 中 |
+      297  | **E** | 让两侧共用同一数值路径（rollout 用训练栈 / 训练用引
+           擎栈） | **暂不划算**：前者太慢，后者受 §4.2 A2/A3 布局限制 | 
+           大 |
+      298  
+
+● 已写入工作日志（三处）：
+
+  1. wiki/work_log/worklog_dsv41_module_input_probe.md — 新增/重写 
+  §5「判断与下一步」（4 个子节）
+
+  - §5.1 判断：模块级"没有 bug" —— 三条独立证据（权重逐张量一致 /
+    相同输入下连离散选择都逐 token 一致 / 残差 0.5% ≈ bf16 的 1
+    ULP），并明确"对齐内核的天花板很低"；把 §4.1
+    的负结果重新解读为放大是离散/混沌的——"精度提高 2× 不会带来 2×
+    收益，落在决策边界另一侧就没意义"，因此目标必须是数量级削减种子（≤0.05%）或
+    让离散决策一致。
+  - §5.2 这个差距在 RL 里走哪条路（代码核实） —— 表格列出
+    trainer_base.py::_compute_old_log_prob（默认 decoupled
+    分支由训练侧重算；bypass_mode
+    才用引擎的）、ray_trainer.py:1575-1579、algorithm.py:667 默认
+    None、以及我们的 GRPO 脚本 grep 不到 rollout_correction → 结论：默认下 PG 
+    ratio 两侧都来自训练侧，这 0.5 nats 不进入 ratio，它只影响 off-policy
+    程度与监控指标；并给出分岔 (a) 换健康指标 / (b) 开 token 级 TIS。
+  - §5.3 下一步方向 A–E 表（含成本与判据） + 建议顺序：B（真实 fp8 权重复跑）→ 
+    定 A 的 (a)/(b) → 若要继续投入，用 C 的模块级量法而不是端到端猜。
+  - §5.4 仍未做（含"0.54% 拆不开 routed/shared"的原因）。
+
+  §0 摘要同步加了第 5、6 条（"没有 bug + 不进 ratio" 与 "先跑真实权重"）。
+
+  2. wiki/worklog_dsv41_rl.md — 
+  修正「判读标准」表，加了醒目告警：原阈值（pearson >0.99、kl 
+  ~0）不能当通用判据——这些指标随专家数与 head-gain 变（32 专家
+  0.010/0.979/kl0.11；384 专家 pearson 0.79/kl
+  0.38，都是正常的）；判据改为看量级断层（真错位是
+  O(1)/pearson~0.5），并改用直接量做健康检查（权重指纹、模块 rel_err / Δlogp
+  σ），同时注明默认配置下该差不进入 PG ratio。
+
+  3. 记忆已同步修正：数值健康信号的阈值说明 + "MoE 两条误差通道 / attn 与 MoE
+  同地板不同增益" + 引擎 dump 的 .mlp.experts 陷阱。
+
+  需要我现在把方向 B（真实 fp8 权重复跑）跑起来吗？给我权重路径即可，引擎侧 dump
+  我按 §10.4 的坑位一次跑完。
+
+✻ Sautéed for 2m 9s · done 4:12 AM
+
+❯ /resume 
+  ⎿  Resume cancelled
+
+❯ /mnt/share/DeepSeek-V4.1-Flash-bf16/                                          
+  这是真实权重，但是不要加载所有的，只加载4层，该如何做。先设计方案。           
+
+  Thought for 10s (ctrl+o to expand)
+
+● 收到。这是一个需要先摸清 checkpoint 结构、loader 行为和"4
+  层切片"语义的设计任务 —— 我先进计划模式做调研，然后给你完整方案再动手。
+
+● Entered plan mode
+  Claude is now exploring and designing an implementation approach.
+
+  Thought for 5s (ctrl+o to expand)
+
+● 进入调研。并行派 3 个 Explore agent 摸清：真实 checkpoint 结构、训练侧 loader
+  行为、引擎侧加载与"4 层随机权重生成脚本"的做法。
+
+● 3 background agents launched (↓ to manage)
+   ├ Inventory real checkpoint + 4layer ckpt diffs
+   ├ Trace trainer-side checkpoint loader
+   └ Study 4layer ckpt generator + engine loading
+
+  Thought for 20s (ctrl+o to expand)
+
+● 趁调研进行，我先确认磁盘余量（切片要落盘一份新 checkpoint）：
+
+  Thought for 20s, read 1 file, ran 1 shell command (ctrl+o to expand)
+  ⎿  2 skills available
+  ⎿  Loaded verl/CLAUDE.md
+
+● 调研进行中。有一个必须你定的设计决策，先问清楚（它影响切片的可比性与后续所有数
+  字）：
+● User answered Claude's questions:
+  ⎿  · 真实权重切哪 4 层？（决定数字能否与之前所有实验对比） → 第 0–3 层（推荐）
+     · 这次用真实权重跑的范围？（决定工作量与产出） → 全套 harness（推荐）
+
+  Thought for 6s (ctrl+o to expand)
+
+● Updated plan
+  ⎿  /plan to preview
+
+  Thought for 17s, ran 4 shell commands (ctrl+o to expand)
+
+  Thought for 2m 46s, ran 1 shell command (ctrl+o to expand)
+
+● Agent "Inventory real checkpoint + 4layer ckpt diffs" finished · 10m 53s
+
+● Agent "Trace trainer-side checkpoint loader" finished · 11m 48s
+
+● 两个 agent 已给出关键结论。等第三个的同时，我确认机器资源（真实切片 rank0 需
+  ~110GB 匿名内存）：
+
+  Thought for 10s, ran 1 shell command (ctrl+o to expand)
+
+● RAM 2.4TB、320 核、NPU 空闲 —— 足够。先起草方案（等引擎侧调研回来后补全）：
+
+● Updated plan
+  ⎿  /plan to preview
+
+  Thought for 2m 58s, ran 2 shell commands (ctrl+o to expand)
+
+● Agent "Study 4layer ckpt generator + engine loading" finished · 21m 19s
+
+● 三份调研齐了（引擎侧还确认了 vLLM 的硬校验规则和 tokenizer
+  需求）。写最终方案：
+
+● Updated plan
+  ⎿  /plan to preview
+
+  Thought for 6s (ctrl+o to expand)
+
+● 方案已成型。按流程派一个 Plan agent
+  做对抗性复核（重点：这个切片目录在两套加载路径上会不会有我没看到的坑）：
+
+● Plan(Adversarially review slice plan)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+  Thought for 4s (ctrl+o to expand)
+
+● 趁复核进行，我核一个会影响所有后续运行的前提：fixture 的 token id
+  是否对真实模型的词表合法：
+
+  Thought for 4s, ran 1 shell command (ctrl+o to expand)
+
+● Updated plan
+  ⎿  /plan to preview
+
+  Thought for 6s, ran 3 shell commands (ctrl+o to expand)
+
+  Thought for 7s, ran 1 shell command (ctrl+o to expand)
+
+● 实测确认了方案核心（选名 4972/4972 全部命中、只需 31 个 shard、不需要碰那两个 
+  183GB 的 engram shard）。写进方案：
+
+● Updated plan
+  ⎿  /plan to preview
+
+  Thought for 1m 25s, ran 3 shell commands (ctrl+o to expand)
+
+● Agent "Adversarially review slice plan" finished · 29m 5s
+
+● 复核 agent 找到一个致命问题（vLLM 是按文件、不是按 index 加载张量 → 我们链接的
+  shard 里含 1086 个多余张量会让引擎
+  KeyError），还发现一个真实且可能可修的新差异（39 个张量的 dtype
+  两侧不同）。我先亲验这两条：
+
+  Thought for 13s, ran 2 shell commands (ctrl+o to expand)
+● 两条都实锤了。H2 是个重要发现：真实权重把 hc_*/attn_sink/gate.bias 存成
+  fp32，而训练侧 prepare_deepseek_v41_model_for_fsdp 把所有浮点参数统一转
+  bf16（引擎保持 fp32）→ 真实权重下新增一个参数级差异，随机 fixture
+  里看不出来（那边本来就存 bf16）。更新方案：
+
+● Updated plan
+  ⎿  /plan to preview
+
+  Thought for 4s (ctrl+o to expand)
+
+● 方案已定稿（含复核发现的两个必须处理的坑）。请审阅：
+  ⎿  User rejected Claude's plan:
+     ╭─────────────────────────────────────────────────────────────────────────╮
+     │ 从真实 DeepSeek-V4.1-Flash 权重切出 4 层，并在其上重跑训推一致性全套    │
+     │ harness                                                                 │
+     │                                                                         │
+     │ Context（为什么做）                                                     │
+     │                                                                         │
+     │ - 上一轮已闭环机制（verl/wiki/work_log/worklog_dsv41_module_input_probe │
+     │   .md）：训推差距 = 每模块 ~0.5% 核差（≈ bf16 的 1 ULP）× MoE           │
+     │   离散路由翻转放大；专家数只加强放大器，不改变核差。                    │
+     │ - 但那是随机权重：路由处在近平局、--head-gain 4 把 logprob 噪声放大     │
+     │   4×（KL ~16×）→ 绝对值全偏悲观。方向 B                                 │
+     │   就是用真实权重复跑，拿生产数字决定 (a) 只换健康指标 还是 (b) 上       │
+     │   TIS/尾部纠正。                                                        │
+     │ - 真实权重 /mnt/share/DeepSeek-V4.1-Flash-bf16/（40 层 + 3 MTP、384     │
+     │   专家、1.53 TB、无量化配置）；harness 与 fixture 都是围绕 4 层模型建的 │
+     │   → 需要 4 层切片目录，两套加载路径都指向它。                           │
+     │ - 用户已定：切第 0–3 层；跑全套 harness。                               │
+     │                                                                         │
+     │ 调研结论（已核实；★ = 本轮复核新发现，直接改变方案）                    │
+     │                                                                         │
+     │ #: F1                                                                   │
+     │ 事实: 真实 ckpt：268 shard / 48,496 张量 / 1.53 TB；无                  │
+     │ quantization_config；num_hidden_layers 40、384 专家、compress_ratios    │
+     │ [0,0,2×18,1×20,0,0,0]、kv_source_layer_ids                              │
+     │ [2,8,14,20]、index_source_layer_ids                                     │
+     │ [2,8,14,20,24,28,32,36]、candidate_source_layer_id 20、engram_layer_ids │
+     │                                                                         │
+     │ [1,14]、num_nextn_predict_layers 3                                      │
+     │ 出处: 盘点 agent                                                        │
+     │ ────────────────────────────────────────                                │
+     │ #: F2                                                                   │
+     │ 事实: 切片名字集合 = 现有 -4layer-scaled 的 index                       │
+     │ 名字集合（本机实算：4972                                                │
+     │ 个名字在真实 ckpt 0 缺失；名字构成 layers 4703 + vision 259 + aligner 4 │
+     │ +                                                                       │
+     │ base 6）；只需 31 个 shard，不需要碰两个 183 GB 的 engram               │
+     │ shard；total_size                                                       │
+     │ = 113,675,759,792                                                       │
+     │ 出处: 本机核算                                                          │
+     │ ────────────────────────────────────────                                │
+     │ #: F3                                                                   │
+     │ 事实: 现有 -4layer-scaled/config.json（384 专家）就是切片要用的         │
+     │ config：与真实                                                          │
+     │ config 的差异恰好是"4 层化"的全部改写，且同时带新旧 key 拼写 →          │
+     │ 两套消费方都认。注意：不能改用真实 config —— engram_meta_init=True      │
+     │ 会给层                                                                  │
+     │ 1/14 建 meta Engram 模块，切片里没有对应张量 → DCP 直接失败             │
+     │ 出处: 盘点 agent + 复核                                                 │
+     │ ────────────────────────────────────────                                │
+     │ #: F4                                                                   │
+     │ 事实: 引擎侧硬校验（vllm-ascend-v41-private/vllm_ascend/models/deepseek │
+     │ _v41/model.py::build_layer_plan                                         │
+     │  117-195）：len(ratios) ≥ n_layers、每个 source > num_layers 或         │
+     │ ratios[source]==0 都报错、kv ⊆ index、candidate ∈ kv → 三个 id          │
+     │ 列表必须截断为                                                          │
+     │  [2]（= -scaled 的值）                                                  │
+     │ 出处: 引擎 agent                                                        │
+     │ ────────────────────────────────────────                                │
+     │ #: F5                                                                   │
+     │ 事实: 引擎必需 tokenizer.json + tokenizer_config.json（engine init      │
+     │ 时构造                                                                  │
+     │ tokenizer，即使 harness 只喂 token ids）；不需要                        │
+     │ generation_config.json/quarot.safetensors（后者只在 engram              │
+     │ 开时读）。真实目录与模板的 tokenizer 文件 md5 相同                      │
+     │ 出处: 引擎 agent + 复核                                                 │
+     │ ────────────────────────────────────────                                │
+     │ #: F6                                                                   │
+     │ 事实: 架构选择依赖 vision：vision_n_layers > 0 → 改写 architectures 为  │
+     │ DeepseekV41ForConditionalGeneration（VL wrapper 建塔，缺张量会          │
+     │ KeyError）→                                                             │
+     │ 切片必须保留 vision/aligner 张量。而训练侧不建  vision（include_vision  │
+     │ 默认                                                                    │
+     │ False）→ 那些名字会进 skipped，无害                                     │
+     │ 出处: 复核                                                              │
+     │ ────────────────────────────────────────                                │
+     │ #: ★H1                                                                  │
+     │ 事实: 致命：vLLM 的加载是"按文件"而不是"按                              │
+     │ index"：weight_utils.py:968-972                                         │
+     │ 迭代文件里每个 key，deepseek_v4/model.py:1331 是裸的 params_dict[name]  │
+     │ →                                                                       │
+     │ 链接进来的真实 shard 里含 1086 个不属于切片的张量（898 个 layers.4–39 + │
+     │ 149                                                                     │
+     │ 个 mtp，其中 1047 个不是 .bias）→ 引擎加载 KeyError。两个已跑通的 4 层  │
+     │ ckpt                                                                    │
+     │ 的 shard                                                                │
+     │ 零多余张量（复核逐文件核对过），所以这个坑以前从未暴露。换成整份拷贝也  │
+     │ 不能解决（同样含多余张量）                                              │
+     │ 出处: 复核                                                              │
+     │ ────────────────────────────────────────                                │
+     │ #: ★H2                                                                  │
+     │ 事实: 真实权重下新增一个参数级差异：attn_sink、gate.bias、gate.bias_vl  │
+     │ 、hc_*{fn,base,scale}（每层                                             │
+     │ 9 个 ×4 层 = 36 个）在真实 ckpt 里是 fp32，而训练侧                     │
+     │ prepare_deepseek_v41_model_for_fsdp 把所有浮点参数统一转                │
+     │ bf16（adapter.py:395-398，其 docstring 明说"FP32-sensitive forward      │
+     │ paths cast                                                              │
+     │  their operands locally"→ 用 hc_fn.float() 上转的是已被舍入的 bf16      │
+     │ 权重）；引擎保持 fp32 并 fp32→fp32 拷贝。随机 fixture                   │
+     │ 里看不出来（那边这两类张量本来就存                                      │
+     │ bf16，两侧取值相同）。image_start/end/newline 是反向（真实 bf16 / 模板  │
+     │ fp32）。check_engine_params.py 不会报这个（两侧读到的都是 fp32 原值）   │
+     │ 出处: 复核 + 本机实读 (dtype 已验)                                      │
+     │ ────────────────────────────────────────                                │
+     │ #: H3                                                                   │
+     │ 事实: check_engine_params.py:167 硬编码 n_experts = 32 → 384 专家会假   │
+     │ FAIL（这正是"证明引擎持有 checkpoint 值"的脚本，假 FAIL 代价高）        │
+     │ 出处: 复核                                                              │
+     │ ────────────────────────────────────────                                │
+     │ #: H4                                                                   │
+     │ 事实: 所有 harness 入口默认指向 32 专家；不过 384 专家引擎侧 dump 在    │
+     │ 2026-09-21                                                              │
+     │  已成功跑过（worklog_dsv41_train_infer_consistency.md §11.1             │
+     │ 有命令与结果）→                                                         │
+     │ 不是首次。仍建议先做一次 params-only 冒烟                               │
+     │ 出处: 复核 + 本历次记录                                                 │
+     │ ────────────────────────────────────────                                │
+     │ #: H5                                                                   │
+     │ 事实: 切片的语义偏差（要写进 SLICE.md）：candidate_source_layer_id      │
+     │ 2（真实是                                                               │
+     │ 20）→ 开了层 3 的候选预筛，真实模型层 0–3 是关的；engram 关闭；且引擎侧 │
+     │ v4.1                                                                    │
+     │ 专有代码路径挂在带点拼写 deepseek_v4.1（只有模板有）→ 本 harness        │
+     │ 验证的是"模板 config 的引擎路径"，不是真实 ckpt 自带的 config           │
+     │ 出处: 复核                                                              │
+     │ ────────────────────────────────────────                                │
+     │ #: H6                                                                   │
+     │ 事实: 训练侧缺 key 的失败点是 load_state_dict(strict=True) 的           │
+     │ RuntimeError（DCP                                                       │
+     │ 的 _broadcast_state_dict 只是静默 pop），在 harness 自己的 assert not   │
+     │ still_meta 之前；三个 trainer 脚本都丢弃了 report["missing"]            │
+     │ 出处: 复核                                                              │
+     │ ────────────────────────────────────────                                │
+     │ #: H7                                                                   │
+     │ 事实: /mnt/share 是 NFS，vLLM 判定 is_net_fs 且 113.7 GiB ≤             │
+     │ 0.9×MemAvailable →                                                      │
+     │ 会后台整文件预取 ~120 GiB（时间成本，非正确性问题）                     │
+     │ 出处: 复核                                                              │
+     │ ────────────────────────────────────────                                │
+     │ #: —                                                                    │
+     │ 事实: 已核实前提：fixture token id 0–128821 < vocab_size 129280 ✓；真实 │
+     │                                                                         │
+     │ tie_word_embeddings=false（必须保留 head.weight）✓；本机 RAM 2.4 TB /   │
+     │ NPU                                                                     │
+     │ chips 2–9 空闲 ✓                                                        │
+     │ 出处: 本机                                                              │
+     │                                                                         │
+     │ 方案                                                                    │
+     │                                                                         │
+     │ 总思路：不改任何加载代码 —— 生成一个 4 层切片目录（config + 定向 index  │
+     │ + 键集干净的 shard + tokenizer），两套消费方都用 --model-path 指过去。  │
+     │                                                                         │
+     │ 1. 新脚本 verl/scripts/dsv41_consistency/make_slice_from_real.py        │
+     │                                                                         │
+     │ --src      /mnt/share/DeepSeek-V4.1-Flash-bf16                          │
+     │ --out      /mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-4layer-real │
+     │ --layers   0,1,2,3                                                      │
+     │ --config-template /mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-4lay │
+     │ er-scaled/config.json                                                   │
+     │ --mode     hybrid|copy      # 默认 hybrid：干净的 shard 直接            │
+     │ hardlink，含多余张量的 shard 重写                                       │
+     │                                                                         │
+     │ 步骤：                                                                  │
+     │ 1. 读真实 index.json 与模板同目录 index；选名白名单 = 模板 index        │
+     │    的名字集合，断言真实侧零缺失，并输出名字构成统计（F2                 │
+     │    的实算已给出预期值）。                                               │
+     │ 2. 按 shard 分类（H1 的修复）：对每个需要的 shard，比较"文件内实际 key  │
+     │    集合"与"index 指向该文件的选中名字集合"：                            │
+     │    - 相等 → hardlink（预计 24 个）；                                    │
+     │    - 不等 → 重写：safe_open 流式取出选中张量（保持原                    │
+     │      dtype，不改值）写到新 shard（预计 7                                │
+     │      个：model-00079/00085/00158/00164/00228/00235/00267；读 ≈27.5      │
+     │      GiB、写 ≈13.7 GiB）。                                              │
+     │      重写后断言不变量：切片里每个 *.safetensors 的 set(keys) == {index  │
+     │      里指向它的名字}（这正是两个已跑通 ckpt                             │
+     │      都满足、而当前方案会破坏的条件）。                                 │
+     │      --mode copy = 对所有 shard 走重写路径（自包含；代价是 113.7 GiB    │
+     │      读写）。                                                           │
+     │ 3. 写 model.safetensors.index.json：weight_map 指向切片内的 shard       │
+     │    名（干净 shard 保持真实文件名；重写的用同名覆盖写入切片目录即可保持  │
+     │    一致）、total_size 重算、加                                          │
+     │    metadata.dsv41_slice（源目录、层列表、排除项、时间）。               │
+     │ 4. 链接/复制 tokenizer.json、tokenizer_config.json（F5）。              │
+     │ 5. 写 config.json：逐字节复制模板（F3）；仅当 --layers 非 0,1,2,3       │
+     │    时按规则重算（num_hidden_layers := len(layers)；compress_ratios :=   │
+     │    [real[l] for l in layers]；三个 source                               │
+     │    列表过滤+映射局部下标；candidate_source_layer* := max(kv_source ∩    │
+     │    slice)；engram/MTP 关闭），任何一步不满足 F4 的约束就报错退出。      │
+     │ 6. 写 SLICE.md：来源、层范围、名字/dtype 差异清单（H2 的 39             │
+     │    项）、排除项与理由（engram 197 GB、mtp、其它 36                      │
+     │    层）、语义偏差（H5：candidate_source 2 vs 20、engram                 │
+     │    关闭、带点拼写的引擎路径）、**"不要改用真实                          │
+     │    config"**的警告（F3）、复现命令。                                    │
+     │ 7. 打印摘要：选名数/字节数、link vs rewrite 的 shard 数、dtype          │
+     │    差异条数、config 差异。                                              │
+     │                                                                         │
+     │ 2. 校验（五层，任一失败即停）                                           │
+     │                                                                         │
+     │ 层: L1 结构                                                             │
+     │ 做法: 每名命中真实 index；shard 键集不变量（H1）成立；total_size =      │
+     │ 选中张量字节和；重写过的 shard 抽查键集与 dtype                         │
+     │ ────────────────────────────────────────                                │
+     │ 层: L2 config                                                           │
+     │ 做法: --layers 0,1,2,3 时与模板零字段差异；断言 F4 四条约束             │
+     │ ────────────────────────────────────────                                │
+     │ 层: L3 可加载                                                           │
+     │ 做法: (a) 训练侧 params-only 冒烟：dump_trainer_stages.py --lengths 64  │
+     │ --out-tag _real_smoke（覆盖 DCP strict / still_meta）；(b) 引擎侧先     │
+     │ params-only：run_dump_engine.sh --skip-params（覆盖 H1 键集、F5         │
+     │ tokenizer、F6                                                           │
+     │  vision/架构解析），再跑完整 dump                                       │
+     │ ────────────────────────────────────────                                │
+     │ 层: L4 数据不变                                                         │
+     │ 做法: 链接的 shard 天然一致；重写的 shard 抽样 torch.equal（含 fp32 的  │
+     │ hc_attn_fn、bf16 的 layers.3.ffn.experts.0.w1.weight）                  │
+     │ ────────────────────────────────────────                                │
+     │ 层: L5 dtype 清单                                                       │
+     │ 做法: 复算真实 vs 模板的 dtype 差异，必须恰好 39 项（36 fp32→bf16 + 3   │
+     │ bf16→fp32），与 H2 一致                                                 │
+     │                                                                         │
+     │ 3. 用切片跑全套 harness                                                 │
+     │                                                                         │
+     │ SLICE=/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-4layer-real      │
+     │ DUMP=/mnt/share/m00899630/dsv41/dump                                    │
+     │                                                                         │
+     │ # 3.1 引擎侧 dump（先 --skip-params 冒烟，再完整）                      │
+     │ MASTER_ADDR=127.0.0.1 GLOO_SOCKET_IFNAME=enp48s3u1u1                    │
+     │ ASCEND_RT_VISIBLE_DEVICES=2,3,4,5,6,7,8,9 \                             │
+     │ bash scripts/dsv41_consistency/run_dump_engine.sh --model-path $SLICE \ │
+     │   --out-dir $DUMP/engine_real4 --lengths 64,200 --mem-util 0.85         │
+     │                                                                         │
+     │ # 3.2 参数指纹核对（H3：脚本改为自动读 config 的 n_routed_experts）     │
+     │ python3 scripts/dsv41_consistency/check_engine_params.py --params       │
+     │ $DUMP/engine_real4/params.json --model-path $SLICE                      │
+     │                                                                         │
+     │ # 3.3 训练侧输入打桩（4 变体 × 长度 64,200）                            │
+     │ MODEL_PATH=$SLICE ENGINE_DIR=$DUMP/engine_real4                         │
+     │ OUT_DIR=$DUMP/probe_input_real4 \                                       │
+     │ MASTER_PORT=59565 bash scripts/dsv41_consistency/sh/run_probe_inputs.sh │
+     │                                                                         │
+     │ # 3.4 汇总（含路由翻转分解）                                            │
+     │ python3 scripts/dsv41_consistency/summarize_probe.py --lengths 64,200 \ │
+     │   --probe-dir $DUMP/probe_input_real4 --engine-dir $DUMP/engine_real4   │
+     │                                                                         │
+     │ # 3.5（可选）§9 输出嫁接、§10 MoE dtype                                 │
+     │ A/B；长序列档（真实权重下才有意义）：--lengths 64,200,700               │
+     │                                                                         │
+     │ # 3.6 ★H2 专项（推荐，见下）                                            │
+     │                                                                         │
+     │ ★H2 专项：36 个参数（hc_*/attn_sink/gate.bias）的 dtype                 │
+     │ 不对称到底贡献多少                                                      │
+     │ 在训练侧加一个 env 门控（如 VERL_DSV41_KEEP_FP32_PARAMS=1）：在         │
+     │ prepare_deepseek_v41_model_for_fsdp 之后把这 36 个参数还原成真实 fp32   │
+     │ 值（从 ckpt 读），跑 baseline 变体与 §9 的 all.attn/all.ffn             │
+     │ 变体，与"当前 bf16 版本"对照 → 得到"参数级差异"这一新种子的量化贡献。   │
+     │ 这一项既是 harness                                                      │
+     │ 的一部分，也是一个可能的生产可修项（若贡献显著，训练侧应让这些参数保持  │
+     │ fp32；注意 FSDP 对同组 dtype 一致性的限制，需要单独的 param group）。   │
+     │                                                                         │
+     │ 4. 顺手要改的小东西                                                     │
+     │                                                                         │
+     │ - check_engine_params.py:167：n_experts 改为从 --model-path/config.json │
+     │   自动读（H3），保留 --n-experts 覆盖。                                 │
+     │ - 三个 trainer 脚本（dump_trainer_stages.py:377、probe_module_inputs.py │
+     │   :262、graft_trainer_stages.py:200）：把丢弃的 report["missing"]       │
+     │   变成断言（H6），失败信息比 DCP 的 RuntimeError 清楚。                 │
+     │ - dump_engine_stages.py:21-28 的 PARAM_PATTERNS 不含 layers.1.：模板    │
+     │   config 下已无必要，建议补上（让层 1 也进指纹）。                      │
+     │                                                                         │
+     │ 风险与 caveat                                                           │
+     │                                                                         │
+     │ 1. 切片 ≠ 真实模型的前 4 层（H5）：candidate_source=2 让层 3            │
+     │    开了候选预筛（真实模型 0–3 层是关的）；engram                        │
+     │    路径被移除；引擎走的是"带点拼写 config"的路径。→                     │
+     │    两栈之间的对照是公平的（同一个 4 层模型），但绝对数值不代表真实 40   │
+     │    层模型的训推差，也不能评估 engram 相关问题。σ/KL                     │
+     │    外推到整模型需要额外做分层累积估计。                                 │
+     │ 2. H1 是本方案的关键新步骤：没有"按 shard 重写多余张量"，引擎侧一定     │
+     │    KeyError。这也是为什么"直接链接/整份拷贝"都不行。                    │
+     │ 3. H2 会污染 baseline：真实权重下 baseline                              │
+     │    里含"参数精度不对称"这一新种子（随机 fixture 无此问题）→             │
+     │    与历史数字对比时要显式扣除/标注；专项实验（§3.6）量化它。            │
+     │ 4. 时间：切片创建（hybrid）读 ~27.5 GiB + 写 ~13.7 GiB ≈ 10–20          │
+     │    分钟；引擎侧会整文件预取 ~120 GiB（H7）+ 加载，首轮 dump 预计 40–70  │
+     │    分钟；训练侧 4 变体 × 2 长度 ≈ 15–25 分钟。                          │
+     │ 5. rank0 匿名内存 ~110 GB、NPU 用 chips                                 │
+     │    2–9、别与大任务并发（本机另有两个交互 session）。                    │
+     │ 6. 忽略 config.json_bak、optional/quarot.safetensors、-scaled/.config.j │
+     │    son.swp。                                                            │
+     │                                                                         │
+     │ 验证（怎么算成功）                                                      │
+     │                                                                         │
+     │ - L1–L5 全过（L1 的键集不变量 + L5 的 39 项 dtype 清单是新增关键项）。  │
+     │ - 引擎侧 check_engine_params 全 OK（--n-experts 384 或自动读）。        │
+     │ - 训练侧 baseline：in.all 残余仍是"均匀无尾"小量（形态对照              │
+     │   §2.3/§2.4）；H2 专项给出"参数级差异"的贡献占比。                      │
+     │ - 路由翻转分解：真实权重下翻转率/误差能量占比与随机权重的对照 →         │
+     │   定量回答"随机权重把放大夸大了多少"，写进工作记录作为方向 B 的判据。   │
+     │                                                                         │
+     │ 交付物                                                                  │
+     │                                                                         │
+     │ 1. make_slice_from_real.py（含 H1 的 shard 重写 + 五层校验 + SLICE.md） │
+     │ 2. 切片目录                                                             │
+     │    /mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-4layer-real/        │
+     │ 3. engine_real4 / probe_input_real4 dump 与汇总表                       │
+     │ 4. H2 专项结果（可用 VERL_DSV41_KEEP_FP32_PARAMS 门控 + 对照表）        │
+     │ 5. 工作记录：worklog_dsv41_module_input_probe.md 增补「真实权重 4       │
+     │    层复跑」；worklog_dsv41_rl.md 的信号阈值若有变化一并回写；H1/H2      │
+     │    两条坑写进 caveat                                                    │
+     │ 6. 顺手修：check_engine_params.py 的 n_experts；三个 trainer 脚本的     │
+     │    missing 断言                                                         │
+     ╰─────────────────────────────────────────────────────────────────────────╯
+
+✻ Worked for 55m 58s · done 7:16 AM
+
+❯ 输出到新的文件夹中                                                            
+
+❯ 输出计划到一个新的文件中                                                      
+
+  Thought for 14s, ran 1 shell command (ctrl+o to expand)
+
+● 明白 —— 我把计划输出到一个新文件夹下的新文件里（沿用本项目 plans/ 约定）：
+
+  Thought for 4s, read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● Update(/mnt/share/m00899630/plans/dsv41-real-weights-4layer/plan.md)
+  ⎿  Added 7 lines
+       1  # 从真实 DeepSeek-V4.1-Flash 权重切出 4 层，并在其上重跑训推一
+          致性全套 harness
+       2  
+       3 +> 计划文档 · 2026-09-22 · 状态：**待执行**（尚未创建切片、未跑 
+         +任何任务；所有"事实"均已核实到文件/行号）                      
+       4 +> 本目录（`/mnt/share/m00899630/plans/dsv41-real-weights-4layer
+         +/`）存放本工作流的计划与记录。                                 
+       5 +> 相关文档：`verl/wiki/work_log/worklog_dsv41_module_input_prob
+         +e.md`（机制闭环与 §5.3 方向 B）、                              
+       6 +> `verl/wiki/work_log/worklog_dsv41_train_infer_consistency.md`
+         +（§9–§11）、`verl/wiki/worklog_dsv41_rl.md`（健康信号阈值）。  
+       7 +> 产物位置约定：切片 `/mnt/share/m00899630/weights/DeepSeek-V4.
+         +1-Flash-4layer-real/`；                                        
+       8 +> dump `/mnt/share/m00899630/dsv41/dump/{engine_real4,probe_inp
+         +ut_real4}/`。                                                  
+       9 +                                                               
+      10  ## Context（为什么做）
+      11  
+      12  - 上一轮已闭环机制（`verl/wiki/work_log/worklog_dsv41_module_in
+          put_probe.md`）：**训推差距 = 每模块 ~0.5% 核差（≈ bf16 的 1 UL
+          P）× MoE 离散路由翻转放大**；专家数只加强放大器，不改变核差。
+
+  Thought for 3s (ctrl+o to expand)
+
+● 计划已输出到新文件夹的新文件：
+
+  /mnt/share/m00899630/plans/dsv41-real-weights-4layer/plan.md（14.6 KB，含 > 
+  计划文档 · 2026-09-22 · 状态：待执行 的文件头与产物位置约定；沿用本项目 plans/
+  约定）
+
+  内容结构：Context → 调研结论（13 条已核实事实，标注文件/行号）→ 方案（切片脚本
+  + 五层校验 + 执行命令 + 顺手要改的小东西）→ 风险与 caveat → 验证标准 →
+  交付物。
+
+  其中两条是本轮对抗性复核新发现、直接改变做法的，请重点看：
+
+  H1（致命）
+  发现: vLLM 是按"文件"而不是按"index"加载张量（weight_utils.py:968-972
+  迭代文件里每个 key，deepseek_v4/…/model.py:1331 裸 params_dict[name]）。真实
+  shard 里含 1086 个不属于切片的张量（898 个 layers.4–39 + 149 个 mtp）→
+  引擎加载会 KeyError。两个已跑通的 4 层 ckpt 的 shard
+  恰好零多余张量，所以这个坑从未暴露；换成整份拷贝也一样会炸
+  影响: 切片工具必须按 shard 分类：键集干净的 24 个直接 hardlink，含多余张量的 7
+   
+  个（model-00079/00085/00158/00164/00228/00235/00267）重写（读 ≈27.5 GB、写
+  ≈13.7 GB），并断言"每个 shard 的键集 == index 指向它的名字"
+  ────────────────────────────────────────
+  H2（真实且可能可修）
+  发现: 真实权重把 hc_*{fn,base,scale}、attn_sink、gate.bias{,_vl}（每层 9 个 ×4
+
+  = 36 个）存成 fp32；而训练侧 prepare_deepseek_v41_model_for_fsdp
+  把所有浮点参数统一转 bf16（adapter.py:395-398），引擎保持 fp32 →
+  参数级差异。随机 fixture 里看不出来（那边本来就存 bf16）→ 真实权重下 baseline
+   会多一个新种子
+  影响: 计划里加了 H2 专项：env 门控把这 36 个参数还原成真实 fp32，对照 σ 变化 →
+
+  量化贡献；若显著则是生产可修项（训练侧应让它们保持 fp32）
+
+  其余：H3 check_engine_params.py 硬编码 32 专家会假 FAIL（改为自动读
+  config）；H6 三个 trainer 脚本丢弃了 report["missing"]（改成断言）；H7 NFS 上
+  vLLM 会整文件预取 ~120 GB（时间预算）；H5 切片语义偏差（candidate_source 2 vs
+  真实 20、engram 关闭、引擎走带点拼写 config 路径）要写进 SLICE.md。
+
+  另外核实过：现有 -4layer-scaled/config.json 可直接作为切片
+  config（不能改用真实 config，否则 engram_meta_init 会建 meta 模块导致 DCP
+  失败）；切片选名 4972/4972 全命中、只需 31 个 shard、不碰那两个 183GB 的 
+  engram shard。
+
+  尚未执行任何动作（未建切片、未跑任务）。要我按这份计划开工吗？
+
+✻ Worked for 1m 10s · done 7:17 AM
+
+❯ 是否可以直接改config.json,，来加载权重                                        
+
+  Thought for 21s (ctrl+o to expand)
+
+● 好问题 —— 我把两条加载路径分别核实一遍再回答（这决定"只改 config"够不够）：
+
+  Thought for 26s, searched for 2 patterns, ran 4 shell commands (ctrl+o to expand)
+
+● 答案：训练侧「可以」，引擎侧「不行」——差别就在两套加载路径的取数方式。
+  我刚把两条路径的源码都读了一遍，并实测了 shard 分类：
+
+  取数方式
+  训练侧（FSDPTurbo）: index.json 驱动：for name in weight_map，不在 param_meta
+  里的名字直接进 skipped，不读字节（fsdp_turbo_dsv41_impl.py:140-150）；shard
+  懒打开，缺的 shard 不会碰
+  引擎侧（vLLM/vllm-ascend）: 文件驱动：safetensors_weights_iterator 对每个文件
+  for name in  f.keys()（weight_utils.py:968-972），唯一过滤是
+  should_skip_weight（只丢"非本 rank 的专家"，ep_weight_filter.py:64-86）；随后
+   params_dict[name] 是裸查表（vllm_ascend/models/deepseek_v4/model.py:1331）
+  ────────────────────────────────────────
+  只改 config.json（num_hidden_layers: 4 + 三个 id 列表截断）后
+  训练侧（FSDPTurbo）: ✅ 能加载：layers 4–39 / mtp / engram
+  的多余张量全部被跳过
+  引擎侧（vLLM/vllm-ascend）: ❌ 加载即 KeyError：31 个需要的 shard 里还躺着
+  1086
+   个多余张量（898 个 layers.4–39 + 149 个 mtp + 其他）
+
+  （vLLM 只按 index 过滤文件，不过滤文件内部的 key —— 这就是关键。）
+
+  我把 31 个 shard 逐个对了"文件内 key 集合 vs 该文件被 index 需要的名字"：
+
+  LINK   model-00001..00007   (7 个, 每个 extra=0)
+  REWRITE model-00079  keys=178 need=77  extra=101
+  LINK   model-00080..00084   (5 个, extra=0)
+  REWRITE model-00085  keys=186 need=175 extra=11
+  REWRITE model-00158  keys=184 need=96  extra=88
+  LINK   model-00159..00163   (5 个, extra=0)
+  REWRITE model-00164  keys=178 need=163 extra=15
+  REWRITE model-00228  keys=178 need=3   extra=175
+  LINK   model-00229..00234   (6 个, extra=0)
+  REWRITE model-00235  keys=178 need=70  extra=108
+  REWRITE model-00267  keys=896 need=308 extra=588
+  LINK   model-00268  keys=9  need=9    extra=0
+  → clean/link = 24，dirty/rewrite = 7，读 27.5 GiB、写 13.7 GiB
+
+  所以三条路：
+
+  方案: A. 只改 config（新目录放 config + 真实 index + shard 符号链接）
+  训练侧: ✅
+  引擎侧: ❌
+  代价 / 风险: 0 ——
+  但只能用于"只跑训练侧"的实验（例如只测训练栈自身的核差/放大）
+  ────────────────────────────────────────
+  方案: B. 改 config + 定向 index + shard 键集清洗（24 link + 7 rewrite）←
+  计划里的方案
+  训练侧: ✅
+  引擎侧: ✅
+  代价 / 风险: 读 27.5 / 写 13.7 GiB（≈10–20 分钟），不改任何加载代码
+  ────────────────────────────────────────
+  方案: C. 改 config + patch vLLM 的权重迭代器（在我们的 harness 里 monkey-patch
+
+  按 index 白名单过滤 key）
+  训练侧: ✅
+  引擎侧: ✅
+  代价 / 风险: 省掉重写，但 VLLM_WORKER_MULTIPROC_METHOD=spawn → patch 必须在
+  worker 加载前生效，时序不确定，风险最高
+
+  另外两点必须提醒：
+
+  1. 不要原地改 /mnt/share/DeepSeek-V4.1-Flash-bf16/config.json —— 那是共享只读
+     用途的真实权重，改了会影响所有使用者；必须放在新目录里（config.json
+     只影响同名目录，所以新目录 + 链接即可）。
+  2. 顺带：即使只走训练侧，也不能用真实 config（engram_meta_init=True 会给层
+     1/14 建 meta Engram 模块、切片里没有对应张量 → DCP 直接失败），所以 config
+     一定是模板那份 4 层 config。
+
+  方案 B 的额外收益：它是唯一能让引擎侧跑起来的「不改代码」路径，而且那 7 个
+  shard 重写后，"每个 shard 的 key 集合 == index
+  指给它的名字"这条不变量正好与两个已跑通的 ckpt
+  完全一致（等于把引擎加载路径恢复到已验证状态）。
+
+  要我把这段「三方案对比」补进计划文件，然后按 B
+  开工吗？或者如果你只想要训练侧数字，我可以先走 A（几分钟就能跑起来）。
+
+✻ Sautéed for 2m 27s · done 7:42 AM
+
+❯ 方案B的权重多大？                                                             
+
+  Thought for 9s (ctrl+o to expand)
+
+● 直接算给你（按真实 ckpt 的 safetensors header 精确统计，只统计切片会暴露的
+  4972 个张量）：
+
+  Thought for 5s, ran 1 shell command (ctrl+o to expand)
+
+● 方案 B 的"权重"要分两个数看（都按真实 ckpt 的 safetensors header 精算过）：
+
+  逻辑大小
+  数值: 105.88 GiB / 113.68 GB
+  含义: 目录里"看得见"、两套加载器要读的张量总量（4972 个张量；与模板 ckpt 的
+  metadata.total_size = 113,675,759,792 逐字节吻合）
+  ────────────────────────────────────────
+  实际新增磁盘
+  数值: ≈ 13.7 GiB
+  含义: 24 个干净 shard 用 hardlink 复用原 inode（0 字节）；只有 7
+  个含多余张量的
+  shard 需要重写成新文件
+
+  组成明细（GB，十进制）：
+
+  路由专家（384/层 × 4 层）   108.72   ← 占 96%
+  注意力（含 compressor/indexer） 1.02
+  shared 专家                0.28
+  base（embed+head+norm+image_*）  2.65   ← embed 与 head 各 1.32
+  vision 塔                  0.82
+  aligner                    0.15
+  ──────────────────────────────
+  合计                      113.68
+
+  7 个要重写的 shard 及其"需要保留"的字节：
+
+  model-00079  1.77 GiB     model-00085  3.85 GiB     model-00158  2.06 GiB
+  model-00164  3.58 GiB     model-00228  0.08 GiB     model-00235  1.54 GiB
+  model-00267  0.80 GiB  →  合计 13.68 GiB（这就是新增磁盘，外加
+  config/tokenizer 几 MB）
+
+  几个参照系（说明这个体量 harness 已经跑过、没问题）：
+
+  ┌─────────────────────────────────┬────────┬─────────────────────────────┐
+  │              目录               │  大小  │            说明             │
+  ├─────────────────────────────────┼────────┼─────────────────────────────┤
+  │ 现有                            │ 113.68 │ 同样的张量集合 → 加载 ~52   │
+  │ -4layer-scaled（随机权重，384   │  GB    │ s、rank0 匿名内存 ~110      │
+  │ 专家）                          │        │ GB，已跑通（§11）           │
+  ├─────────────────────────────────┼────────┼─────────────────────────────┤
+  │ 现有 -4layer-scaled32（32       │ 14.00  │ 快速迭代用                  │
+  │ 专家）                          │ GB     │                             │
+  ├─────────────────────────────────┼────────┼─────────────────────────────┤
+  │ 真实完整 40 层                  │ 1526   │ 全量                        │
+  │                                 │ GB     │                             │
+  └─────────────────────────────────┴────────┴─────────────────────────────┘
+
+  所以方案 B 的取舍是：新增 13.7 GiB 磁盘 + 读 27.5 GiB/写 13.7 GiB 的一次性 
+  I/O（约 10–20 分钟），换来一个 113.68 GB 的 4
+  层真实权重目录，两套加载路径都能用。若改 --mode 
+  copy（自包含、不依赖源目录），新增磁盘变成 105.9 GiB。
+
+  补充两点：① hardlink 与源文件共享 inode，du/监控可能把这份空间重复计数一次，但
+  不占新块、也不受源目录改名影响（这点比 symlink 好）；② 加载时 rank0 匿名内存
+  ~110 GB、引擎侧预取 ~106 GiB（NFS），与 §11 那次 -scaled 运行同量级。
+
+  要按 B 开工吗？（先建切片目录 → 五层校验 → 引擎侧 params-only
+  冒烟，一路验证过去再跑完整 dump。）
+
+✻ Churned for 34s · done 7:46 AM
+
+❯ 按照B方案执行，做好工作记录。                                                 
+
+  Thought for 10s (ctrl+o to expand)
+
+● 方案 B 开工。第一步：写切片工具。
+
+● Write(scripts/dsv41_consistency/make_slice_from_real.py)
+  ⎿  Wrote 309 lines to scripts/dsv41_consistency/make_slice_from_real.py
+       1 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Re
+       2 #
+       3 # Licensed under the Apache License, Version 2.0 (the "License")
+       4 # you may not use this file except in compliance with the Licens
+         e.
+       6 #
+       7 #     http://www.apache.org/licenses/LICENSE-2.0
+       9 # Unless required by applicable law or agreed to in writing, sof
+         tware
+         IS,
+     … +391 lines (ctrl+o to expand)
+  ⎿  Loaded 2 skills from verl/.claude/skills
+  ⎿  2 skills available
+  Thought for 5s (ctrl+o to expand)
+
+● 脚本里有两处疏漏（层张量交叉校验会被 layer-1 的 engram 名字误伤、缺
+  SLICE.md）。重写干净版：
+
+● Write(scripts/dsv41_consistency/make_slice_from_real.py)
+  ⎿  Added 178 lines, removed 123 lines
+      16  
+      17  The consistency harness runs on a 4-layer model (see ``worklog_
+          dsv41_module_input_probe.md``),
+      18  so testing it on the real weights needs a 4-layer checkpoint th
+          at *contains the real tensors*.
+      19 -This script builds one out of ``/mnt/share/DeepSeek-V4.1-Flash-
+         -bf16`` without copying 113 GB.                                 
+      19 +This script builds one from ``/mnt/share/DeepSeek-V4.1-Flash-bf
+         +16`` without copying 113 GB.                                   
+      20  
+      21 -Why not "just rewrite config.json"?  The two consumers read wei
+         -ghts differently:                                              
+      21 +**Why "just rewrite config.json" is not enough.** The two consu
+         +mers read weights differently:                                 
+      22  
+      23 -* **trainer** (``read_dsv41_checkpoint_state_dict``) is *index-
+         -driven*: it iterates                                           
+      24 -  ``model.safetensors.index.json`` and skips every name the 4-l
+         -ayer model does not declare                                    
+      25 -  (``skipped``), without reading those bytes. A rewritten confi
+         -g alone would work here.                                       
+      26 -* **engine** (vLLM) is *file-driven*: ``safetensors_weights_ite
+         -rator`` yields **every key of                                  
+      27 -  every shard** (``weight_utils.py:968-972``; the only filter i
+         -s ``should_skip_weight``, which                                
+      28 -  drops non-local *experts*, ``ep_weight_filter.py:64-86``) and
+         - the v4.1 loader then does a bare                              
+      23 +* trainer (``read_dsv41_checkpoint_state_dict``) is *index-driv
+         +en*: it iterates                                               
+      24 +  ``model.safetensors.index.json`` and routes every name the 4-
+         +layer model does not declare to                                
+      25 +  ``skipped`` without reading those bytes -- a rewritten config
+         + alone would work there;                                       
+      26 +* engine (vLLM) is *file-driven*: ``safetensors_weights_iterato
+         +r`` yields **every key of every                                
+      27 +  shard** (``weight_utils.py:968-972``; the only filter is ``sh
+         +ould_skip_weight``, which drops                                
+      28 +  non-local *experts*, ``ep_weight_filter.py:64-86``) and the v
+         +4.1 loader then does a bare                                    
+      29    ``params_dict[name]`` (``vllm_ascend/models/deepseek_v4/model
+          .py:1331``). Any extra tensor in a
+      30 -  shard is a hard ``KeyError``.                                
+      30 +  linked shard is a hard ``KeyError``.                         
+      31  
+      32 -So the slice must satisfy the same invariant the two existing 4
+         --layer checkpoints satisfy:                                    
+      32 +So the slice must satisfy the invariant both existing 4-layer c
+         +heckpoints satisfy:                                            
+      33  **for every ``*.safetensors`` in the directory, ``set(file keys
+          ) == {names the index maps to it}``**.
+      34 -Shards that already satisfy it are hard-linked (0 bytes); the f
+         -ew that carry extra tensors of the                             
+      35 -other 36 layers are rewritten with only the needed names (dtype
+         - preserved bit-for-bit).                                       
+      34 +Shards that already satisfy it are hard-linked (0 bytes, immune
+         + to the source dir being renamed);                             
+      35 +the few that also carry tensors of the other layers are rewritt
+         +en with only the needed names,                                 
+      36 +dtype preserved bit-for-bit.                                   
+      37  
+      38  Usage:
+      39  
+     ...
+      56  import time
+      57  from pathlib import Path
+      58  
+      58 -# The slice's tensor names are defined by the *template* checkp
+         -oint (the proven-working 4-layer                               
+      59 -# model), not by re-deriving them here: if the template's index
+         - lists it, the harness needs it.                               
+      60 -SKIP_PREFIXES = ("mtp.",)  # never part of a backbone slice    
+      61 -SKIP_SUBSTRINGS = (".engram.",)  # dropped: the 4-layer config 
+         -disables engram (197 GB tables)                                
+      59 +SKIP_PREFIXES = ("mtp.",)  # MTP/DSpark heads are never part of
+         + a backbone slice                                              
+      60 +SKIP_SUBSTRINGS = (".engram.",)  # the 4-layer config disables 
+         +engram (its tables are 197 GB)                                 
+      61  
+      62  
+      63  def parse_args():
+      64      ap = argparse.ArgumentParser(description=__doc__, formatter
+          _class=argparse.RawDescriptionHelpFormatter)
+      65      ap.add_argument("--src", default="/mnt/share/DeepSeek-V4.1-
+          Flash-bf16")
+      66      ap.add_argument("--out", default="/mnt/share/m00899630/weig
+          hts/DeepSeek-V4.1-Flash-4layer-real")
+      68 -    ap.add_argument("--layers", default="0,1,2,3", help="Comma 
+         -separated backbone layer ids (a 0-based prefix).")             
+      69 -    ap.add_argument("--config-template", required=True, help="c
+         -onfig.json of a working same-shape slice.")                    
+      67 +    ap.add_argument("--layers", default="0,1,2,3", help="Comma 
+         +separated backbone layer ids (0-based prefix).")               
+      68 +    ap.add_argument("--config-template", required=True,        
+      69 +                    help="config.json of a working slice with t
+         +he same shape (defines both the config and, "                  
+      70 +                         "via its sibling index, the exact tens
+         +or-name set).")                                                
+      71      ap.add_argument("--mode", choices=("hybrid", "copy"), defau
+          lt="hybrid",
+      71 -                    help="hybrid: hard-link clean shards, rewri
+         -te the rest (default). copy: rewrite everything.")             
+      72 +                    help="hybrid: hard-link clean shards and re
+         +write the rest (default). copy: rewrite all.")                 
+      73      return ap.parse_args()
+      74  
+      75  
+      76  def read_header(path: Path) -> dict[str, int]:
+      76 -    """Return {tensor name: nbytes} from a safetensors header w
+         -ithout touching the data."""                                   
+      77 +    """{tensor name: nbytes} from a safetensors header, without
+         + touching the data."""                                         
+      78      with open(path, "rb") as handle:
+      79          header_len = struct.unpack("<Q", handle.read(8))[0]
+      80          header = json.loads(handle.read(header_len))
+     ...
+      85      }
+      86  
+      87  
+      88 +def is_excluded(name: str) -> bool:                            
+      89 +    return name.startswith(SKIP_PREFIXES) or any(s in name for 
+         +s in SKIP_SUBSTRINGS)                                          
+      90 +                                                               
+      91 +                                                               
+      92  def link_or_copy(src: Path, dst: Path, mode: str, log) -> str:
+      93      if mode == "copy":
+      94          shutil.copy2(src, dst)
+     ...
+       96      try:
+       97          os.link(src, dst)
+       98          return "hardlinked"
+       94 -    except OSError as exc:  # cross-device / unsupported -> fa
+          -ll back to a symlink                                          
+       99 +    except OSError as exc:  # cross-device or unsupported -> s
+          +ymlink keeps the slice usable                                 
+      100          log(f"  hardlink failed ({exc}); falling back to symli
+           nk for {dst.name}")
+      101          os.symlink(src.resolve(), dst)
+      102          return "symlinked"
+      103  
+      104  
+      100 -def rewrite_shard(src: Path, dst: Path, names: list[str], log)
+          - -> int:                                                      
+      101 -    """Write a new shard holding only `names`, preserving each
+          - tensor's dtype and bytes."""                                 
+      105 +def rewrite_shard(src: Path, dst: Path, names: list[str]) -> i
+          +nt:                                                           
+      106 +    """Write a new shard holding only `names`, preserving dtyp
+          +e and bytes exactly."""                                       
+      107      from safetensors import safe_open
+      108      from safetensors.torch import save_file
+      109  
+     ...
+      114          if missing:
+      115              raise SystemExit(f"{src.name}: missing {len(missin
+           g)} wanted tensors, e.g. {missing[:3]}")
+      116          for name in names:
+      112 -            tensor = handle.get_tensor(name)                  
+      113 -            tensors[name] = tensor.contiguous().clone()       
+      117 +            tensors[name] = handle.get_tensor(name).contiguous
+          +().clone()                                                    
+      118      save_file(tensors, str(dst), metadata={"format": "pt"})
+      119      written = sum(t.numel() * t.element_size() for t in tensor
+           s.values())
+      120      del tensors
+     ...
+      122  
+      123  
+      124  def pick_names(src_index: dict[str, str], template_names: list
+           [str], layers: list[int], log) -> list[str]:
+      121 -    """The slice = the template's name set, minus other layers
+          -, verified against the source."""                             
+      122 -    wanted = []                                               
+      123 -    for name in template_names:                               
+      124 -        if name.startswith(SKIP_PREFIXES) or any(s in name for
+          - s in SKIP_SUBSTRINGS):                                       
+      125 -            log(f"  skipping {name} (excluded by rule)")      
+      126 -            continue                                          
+      127 -        if name.startswith("layers."):                        
+      128 -            layer = int(name.split(".")[1])                   
+      129 -            if layer not in layers:                           
+      130 -                continue                                      
+      131 -        wanted.append(name)                                   
+      125 +    wanted = [n for n in template_names                       
+      126 +              if not is_excluded(n) and (not n.startswith("lay
+          +ers.") or int(n.split(".")[1]) in layers)]                    
+      127      missing = [n for n in wanted if n not in src_index]
+      128      if missing:
+      134 -        raise SystemExit(f"{len(missing)} wanted tensors are a
+          -bsent from the source checkpoint, "                           
+      135 -                         f"e.g. {missing[:5]}")               
+      136 -    # Cross-check the layer tensors: the source must not hold 
+          -layer tensors the template misses.                            
+      137 -    src_layer_names = {n for n in src_index if n.startswith("l
+          -ayers.") and int(n.split(".")[1]) in layers}                  
+      138 -    extra = sorted(src_layer_names - set(wanted))             
+      129 +        raise SystemExit(f"{len(missing)} wanted tensors absen
+          +t from the source, e.g. {missing[:5]}")                       
+      130 +    # The source must not hold layer tensors the template lack
+          +s (that would mean an incomplete slice).                      
+      131 +    wanted_set = set(wanted)                                  
+      132 +    src_layer = {n for n in src_index                         
+      133 +                 if n.startswith("layers.") and int(n.split(".
+          +")[1]) in layers and not is_excluded(n)}                      
+      134 +    extra = sorted(src_layer - wanted_set)                    
+      135      if extra:
+      136          raise SystemExit(f"{len(extra)} layer tensors exist in
+            the source but not in the template "
+      137                           f"(slice would be incomplete), e.g. {
+           extra[:5]}")
+      138      return wanted
+      139  
+      140  
+      145 -def rewrite_config(template_path: Path, real_path: Path, layer
+          -s: list[int], log) -> dict:                                   
+      146 -    """Return the slice config: the template byte-for-byte for
+          - a 0-based prefix, else a rewrite.                            
+      141 +def build_config(template_path: Path, real_path: Path, layers:
+          + list[int], log) -> dict:                                     
+      142 +    """Template byte-for-byte for a 0-based prefix; a validate
+          +d rewrite otherwise.                                          
+      143  
+      148 -    A real-config copy would be fatal: `engram_meta_init=True`
+          - builds meta Engram modules for                               
+      149 -    layers 1/14 that no slice tensor can materialize (DCP then
+          - fails).                                                      
+      144 +    Copying the *real* config would be fatal for the trainer: 
+          +`engram_meta_init=True` builds meta                           
+      145 +    Engram modules for layers 1/14 that no slice tensor can ma
+          +terialize, so DCP fails.                                      
+      146      """
+      147      template = json.loads(template_path.read_text())
+      148      text = template.get("text_config", template)
+      149 +    real_text = json.loads(real_path.read_text()).get("text_co
+          +nfig", json.loads(real_path.read_text()))                     
+      150      if layers == list(range(len(layers))):
+      154 -        real = json.loads(real_path.read_text())              
+      155 -        real_text = real.get("text_config", real)             
+      156 -        real_ratios = list(real_text["compress_ratios"])[: len
+          -(layers)]                                                     
+      157 -        if list(text["compress_ratios"]) != real_ratios:      
+      158 -            raise SystemExit(f"template compress_ratios {text[
+          -'compress_ratios']} != real prefix {real_ratios}")            
+      151 +        ratios = list(real_text["compress_ratios"])[: len(laye
+          +rs)]                                                          
+      152 +        if list(text["compress_ratios"]) != ratios:           
+      153 +            raise SystemExit(f"template compress_ratios {text[
+          +'compress_ratios']} != real prefix {ratios}")                 
+      154          for key in ("hidden_size", "n_routed_experts", "num_ex
+           perts_per_tok", "vocab_size"):
+      155              if text.get(key) != real_text.get(key):
+      156                  raise SystemExit(f"template {key}={text.get(ke
+           y)} != real {real_text.get(key)}")
+      162 -        log("config: template used as-is (0-based prefix; comp
+          -ress_ratios/expert count verified against real)")             
+      157 +        log("config: template used as-is (0-based prefix; rati
+          +os/expert count verified against real)")                      
+      158          return template
+      159  
+      165 -    # General case: rebuild the structural fields from the rea
+          -l config, keep the template's                                 
+      166 -    # proven spellings/aliases for everything else. Any ambigu
+          -ity is a hard error.                                          
+      167 -    real = json.loads(real_path.read_text())                  
+      168 -    real_text = real.get("text_config", real)                 
+      160      local = {layer: index for index, layer in enumerate(layers
+           )}
+      161      kv = [local[l] for l in real_text["kv_source_layer_ids"] i
+           f l in local]
+      162      idx = [local[l] for l in real_text["index_source_layer_ids
+           "] if l in local]
+      163      if not kv:
+      173 -        raise SystemExit("no kv_source layer inside the reques
+          -ted slice: candidate_source/compressor "                      
+      174 -                         "semantics are undefined -- decide th
+          -e remap explicitly before slicing")                           
+      175 -    candidate = max(kv)                                       
+      164 +        raise SystemExit("no kv_source layer inside the reques
+          +ted slice: candidate/compressor semantics "                   
+      165 +                         "are undefined -- decide the remap ex
+          +plicitly before slicing")                                     
+      166      if not set(kv).issubset(set(idx)):
+      167          raise SystemExit(f"kv sources {kv} are not a subset of
+            index sources {idx}")
+      168 +    candidate = max(kv)                                       
+      169      log(f"config: general rewrite -> kv={kv} index={idx} candi
+           date={candidate}")
+      170      text["num_hidden_layers"] = len(layers)
+      171      text["compress_ratios"] = [real_text["compress_ratios"][l]
+            for l in layers]
+      181 -    for key_new, key_alias in (("kv_source_layer_ids", "kv_sou
+          -rce_layers"),                                                 
+      182 -                               ("index_source_layer_ids", "ind
+          -ex_source_layers")):                                          
+      183 -        if key_new in text:                                   
+      184 -            text[key_new] = kv if key_new.startswith("kv") els
+          -e idx                                                         
+      185 -        if key_alias in text:                                 
+      186 -            text[key_alias] = kv if key_alias.startswith("kv")
+          - else idx                                                     
+      172 +    for new_key, alias_key, values in (("kv_source_layer_ids",
+          + "kv_source_layers", kv),                                     
+      173 +                                       ("index_source_layer_id
+          +s", "index_source_layers", idx)):                             
+      174 +        for key in (new_key, alias_key):                      
+      175 +            if key in text:                                   
+      176 +                text[key] = values                            
+      177      for key in ("candidate_source_layer_id", "candidate_source
+           _layer"):
+      178          if key in text:
+      179              text[key] = candidate
+      180      return template
+      181  
+      182  
+      183 +def audit(out: Path, needed: dict[str, list[str]], wanted: lis
+          +t[str], index: dict, src: Path,                               
+      184 +          src_index: dict[str, str], template_dir: Path, log) 
+          +-> list[str]:                                                 
+      185 +    """L1/L2/L4/L5 checks. Returns a list of problems (empty =
+          + pass)."""                                                    
+      186 +    from safetensors import safe_open                         
+      187 +                                                              
+      188 +    problems = []                                             
+      189 +    # L1: index <-> files <-> directory agree, and nothing els
+          +e is in the directory                                         
+      190 +    if sorted(index["weight_map"]) != sorted(wanted):         
+      191 +        problems.append("index weight_map != selected names") 
+      192 +    present = {p.name for p in out.glob("*.safetensors")}     
+      193 +    if present != set(needed):                                
+      194 +        problems.append(f"directory shards != needed shards (e
+          +xtra={present - set(needed)}, "                               
+      195 +                        f"missing={set(needed) - present})")  
+      196 +    total = 0                                                 
+      197 +    for shard_name, names in needed.items():                  
+      198 +        sizes = read_header(out / shard_name)                 
+      199 +        if set(sizes) != set(names):                          
+      200 +            problems.append(f"{shard_name}: file keys != index
+          + names "                                                      
+      201 +                            f"(extra={len(set(sizes) - set(nam
+          +es))}, missing={len(set(names) - set(sizes))})")              
+      202 +        total += sum(sizes[n] for n in names)                 
+      203 +    if total != index["metadata"]["total_size"]:              
+      204 +        problems.append(f"total_size {index['metadata']['total
+          +_size']} != summed tensors {total}")                          
+      205 +                                                              
+      206 +    # L2: the slice config must equal the template's (0-based 
+          +prefix case)                                                  
+      207 +    if out.name and (out / "config.json").is_file():          
+      208 +        got = json.loads((out / "config.json").read_text())   
+      209 +        want = json.loads((template_dir / "config.json").read_
+          +text())                                                       
+      210 +        if got != want:                                       
+      211 +            diff = [k for k in set(got) | set(want) if got.get
+          +(k) != want.get(k)]                                           
+      212 +            problems.append(f"config differs from template in 
+          +{diff}")                                                      
+      213 +                                                              
+      214 +    # L4: sampled tensors must be bit-identical to the source 
+      215 +    sample = [n for n in wanted if n.endswith("hc_attn_fn")][:
+          +1] + \                                                        
+      216 +             [n for n in wanted if n.endswith("embed.weight")]
+          + + \                                                          
+      217 +             [n for n in wanted if "compressor.wkv" in n][:1] 
+      218 +    for name in sample:                                       
+      219 +        with safe_open(str(out / src_index[name]), framework="
+          +pt") as left, \                                               
+      220 +                safe_open(str(src / src_index[name]), framewor
+          +k="pt") as right:                                             
+      221 +            got, want = left.get_tensor(name), right.get_tenso
+          +r(name)                                                       
+      222 +        if got.dtype != want.dtype or got.shape != want.shape 
+          +or not bool((got == want).all()):                             
+      223 +            problems.append(f"{name}: slice value/dtype != sou
+          +rce")                                                         
+      224 +                                                              
+      225 +    # L5: dtype audit against the template (the real checkpoin
+          +t stores hc_*/attn_sink/gate.bias in fp32)                    
+      226 +    template_index = json.loads((template_dir / "model.safeten
+          +sors.index.json").read_text())["weight_map"]                  
+      227 +    gaps = collections.Counter()                              
+      228 +    for name in wanted:                                       
+      229 +        with safe_open(str(out / src_index[name]), framework="
+          +pt") as handle:                                               
+      230 +            real_dtype = handle.get_tensor(name).dtype        
+      231 +        with safe_open(str(template_dir / template_index[name]
+          +), framework="pt") as handle:                                 
+      232 +            template_dtype = handle.get_tensor(name).dtype    
+      233 +        if real_dtype != template_dtype:                      
+      234 +            gaps[f"{template_dtype} -> {real_dtype}"] += 1    
+      235 +    log(f"dtype audit vs template: {dict(gaps) if gaps else 'n
+          +o differences'}")                                             
+      236 +    return problems                                           
+      237 +                                                              
+      238 +                                                              
+      239 +def write_slice_doc(out: Path, src: Path, template: Path, laye
+          +rs: list[int], mode: str,                                     
+      240 +                    wanted: list[str], needed: dict[str, list[
+          +str]], index: dict,                                           
+      241 +                    linked: int, rewritten: int, new_bytes: in
+          +t) -> None:                                                   
+      242 +    total = index["metadata"]["total_size"]                   
+      243 +    lines = [                                                 
+      244 +        f"# Slice: {out.name}",                               
+      245 +        "",                                                   
+      246 +        f"- 生成时间：{index['metadata']['dsv41_slice']['creat
+          +ed']}（`make_slice_from_real.py --mode {mode}`）",            
+      247 +        f"- 源：`{src}`（真实 DeepSeek-V4.1-Flash bf16，40 层 
+          ++ 3 MTP，384 专家）",                                         
+      248 +        f"- config 模板：`{template}`（4 层、384 专家；**不要*
+          +*改用真实 config —— `engram_meta_init=True` "                 
+      249 +        f"会给层 1/14 建 meta Engram 模块，切片里没有对应张量 
+          +，DCP 会失败）",                                              
+      250 +        f"- 层：{layers}；张量 {len(wanted)} 个；逻辑大小 {tot
+          +al / 2**30:.2f} GiB（{total} B）",                            
+      251 +        f"- shard：{linked} 个 hardlink（0 字节）+ {rewritten}
+          + 个重写（新增磁盘 {new_bytes / 2**30:.2f} GiB）",             
+      252 +        "",                                                   
+      253 +        "## 为什么要重写 shard（而不是只改 config.json）",    
+      254 +        "",                                                   
+      255 +        "trainer 侧按 `model.safetensors.index.json` 取数（多 
+          +余名字进 `skipped`、不读字节），",                            
+      256 +        "而引擎侧 vLLM 是**按文件**枚举 `f.keys()` 后裸查 `par
+          +ams_dict[name]` → shard 里任何一个多余张量都是 KeyError。",   
+      257 +        "所以切片必须满足：每个 `*.safetensors` 的 key 集合 ==
+          + index 指给它的名字（与两个已跑通的 4 层 ckpt 一致）。",      
+      258 +        "",                                                   
+      259 +        "## 语义偏差（与真实模型前 4 层不完全等价）",         
+      260 +        "",                                                   
+      261 +        "- `candidate_source_layer_id = 2`（真实是 20）→ 层 3 
+          +开了候选预筛，真实模型层 0–3 是关的；",                       
+      262 +        "- engram 关闭（真实层 1 有 197 GB engram 表）；MTP 关
+          +闭；",                                                        
+      263 +        "- 引擎走的是 config 里 `deepseek_v4.1`（带点）拼写的 
+          +代码路径；真实 ckpt 的 config 是下划线拼写；",                
+      264 +        "- 真实权重与模板有 39 个 dtype 差异（36 个 `hc_*`/`at
+          +tn_sink`/`gate.bias{,_vl}` 真实=fp32、模板=bf16；",           
+      265 +        "  `image_start/end/newline` 反向）→ 训练侧会把 fp32  
+          +舍入成 bf16，引擎保持 fp32，",                                
+      266 +        "  这是真实权重下**新增的一个训推差异来源**（详见 plan
+          +.md 的 H2）。",                                               
+      267 +        "- 结论：两栈之间的对照是公平的（同一个 4 层模型），但
+          +绝对数值不代表 40 层真实模型的训推差。",                      
+      268 +        "",                                                   
+      269 +        "## 复现",                                            
+      270 +        "",                                                   
+      271 +        "```bash",                                            
+      272 +        "python3 scripts/dsv41_consistency/make_slice_from_rea
+          +l.py \\",                                                     
+      273 +        f"  --src {src} --out {out} --layers {','.join(str(l) 
+          +for l in layers)} \\",                                        
+      274 +        f"  --config-template {template} --mode {mode}",      
+      275 +        "```",                                                
+      276 +        "",                                                   
+      277 +        f"排除项：其它 {40 - len(layers)} 层的全部张量、`mtp.*
+          +`、`*.engram.*`、`optional/quarot.safetensors`、`config.json_b
+          +ak`。",                                                       
+      278 +    ]                                                         
+      279 +    (out / "SLICE.md").write_text("\n".join(lines) + "\n")    
+      280 +                                                              
+      281 +                                                              
+      282  def main():
+      283      args = parse_args()
+      284      started = time.time()
+      196 -    src = Path(args.src)                                      
+      197 -    out = Path(args.out)                                      
+      198 -    template_config = Path(args.config_template)              
+      285 +    src, out, template_config = Path(args.src), Path(args.out)
+          +, Path(args.config_template)                                  
+      286      layers = [int(x) for x in args.layers.split(",") if x]
+      287  
+      288      def log(message):
+     ...
+      295      template_dir = template_config.parent
+      296      src_index = json.loads((src / "model.safetensors.index.jso
+           n").read_text())["weight_map"]
+      297      template_index = json.loads((template_dir / "model.safeten
+           sors.index.json").read_text())["weight_map"]
+      298 +    log(f"source: {src} ({len(src_index)} tensors) | template:
+          + {template_dir} ({len(template_index)} tensors)")             
+      299  
+      212 -    log(f"source: {src}  ({len(src_index)} tensors)")         
+      213 -    log(f"template: {template_dir}  ({len(template_index)} ten
+          -sors)")                                                       
+      300      wanted = pick_names(src_index, sorted(template_index), lay
+           ers, log)
+      301      log(f"selected {len(wanted)} tensors for layers {layers}")
+      216 -                                                              
+      217 -    # group the wanted names by their source shard            
+      302      needed: dict[str, list[str]] = collections.defaultdict(lis
+           t)
+      303      for name in wanted:
+      304          needed[src_index[name]].append(name)
+     ...
+      307      for stale in out.glob("*.safetensors"):  # never mix shard
+           s from an earlier slice
+      308          stale.unlink()
+      309  
+      226 -    total_bytes = 0                                           
+      227 -    new_bytes = 0                                             
+      228 -    linked = 0                                                
+      229 -    rewritten = 0                                             
+      310 +    total_bytes = new_bytes = 0                               
+      311 +    linked = rewritten = 0                                    
+      312      for shard_name, names in sorted(needed.items()):
+      231 -        src_shard = src / shard_name                          
+      232 -        dst_shard = out / shard_name                          
+      313 +        src_shard, dst_shard = src / shard_name, out / shard_n
+          +ame                                                           
+      314          sizes = read_header(src_shard)
+      234 -        total_bytes += sum(sizes[n] for n in names)           
+      235 -        if sizes.keys() == set(names) and args.mode == "hybrid
+          -":                                                            
+      236 -            new_bytes += 0                                    
+      315 +        mine = sum(sizes[n] for n in names)                   
+      316 +        total_bytes += mine                                   
+      317 +        if args.mode == "hybrid" and set(sizes) == set(names):
+      318              linked += 1
+      238 -            how = link_or_copy(src_shard, dst_shard, "hybrid",
+          - log)                                                         
+      239 -            log(f"  {shard_name}: {len(names)} tensors, {sum(s
+          -izes[n] for n in names) / 2**30:.2f} GiB ({how})")            
+      319 +            how = link_or_copy(src_shard, dst_shard, args.mode
+          +, log)                                                        
+      320 +            log(f"  {shard_name}: {len(names)} tensors, {mine 
+          +/ 2**30:.2f} GiB ({how})")                                    
+      321          else:
+      241 -            extra = len(sizes.keys() - set(names))            
+      242 -            written = rewrite_shard(src_shard, dst_shard, name
+          -s, log)                                                       
+      322 +            written = rewrite_shard(src_shard, dst_shard, name
+          +s)                                                            
+      323              new_bytes += written
+      324              rewritten += 1
+      245 -            log(f"  {shard_name}: rewrote {len(names)}/{len(si
+          -zes)} tensors ({extra} extras dropped), "                     
+      246 -                f"{written / 2**30:.2f} GiB")                 
+      325 +            log(f"  {shard_name}: rewrote {len(names)}/{len(si
+          +zes)} tensors "                                               
+      326 +                f"({len(set(sizes) - set(names))} extras dropp
+          +ed), {written / 2**30:.2f} GiB")                              
+      327  
+      328      index = {
+      329          "metadata": {
+      330              "total_size": total_bytes,
+      331              "dsv41_slice": {
+      252 -                "source": str(src),                           
+      253 -                "config_template": str(template_config),      
+      254 -                "layers": layers,                             
+      255 -                "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+      256 -                "mode": args.mode,                            
+      257 -                "tensors": len(wanted),                       
+      258 -                "linked_shards": linked,                      
+      259 -                "rewritten_shards": rewritten,                
+      332 +                "source": str(src), "config_template": str(tem
+          +plate_config), "layers": layers,                              
+      333 +                "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+          + "mode": args.mode, "tensors": len(wanted),                   
+      334 +                "linked_shards": linked, "rewritten_shards": r
+          +ewritten,                                                     
+      335              },
+      336          },
+      337          "weight_map": {name: src_index[name] for name in wante
+           d},
+      338      }
+      339      (out / "model.safetensors.index.json").write_text(json.dum
+           ps(index, indent=1))
+      265 -                                                              
+      266 -    config = rewrite_config(template_config, src / "config.jso
+          -n", layers, log)                                              
+      267 -    (out / "config.json").write_text(json.dumps(config, indent
+          -=1))                                                          
+      340 +    (out / "config.json").write_text(json.dumps(build_config(t
+          +emplate_config, src / "config.json", layers, log),            
+      341 +                                                indent=1))    
+      342      for name in ("tokenizer.json", "tokenizer_config.json"):
+      343          source = src / name
+      344          if source.is_file():
+     ...
+      347                  target.unlink()
+      348              link_or_copy(source, target, "copy", log)
+      349  
+      276 -    # ---- validation: the engine-side invariant, plus dtype/n
+          -ame audit ----------------------                              
+      277 -    problems = []                                             
+      278 -    dtype_gaps = collections.Counter()                        
+      279 -    for shard_name, names in sorted(needed.items()):          
+      280 -        keys = read_header(out / shard_name).keys()           
+      281 -        if keys != set(names):                                
+      282 -            problems.append(f"{shard_name}: keys != index name
+          -s (extra={len(keys - set(names))}, "                          
+      283 -                            f"missing={len(set(names) - keys)}
+          -)")                                                           
+      284 -    from safetensors import safe_open                         
+      285 -                                                              
+      286 -    real_index = src_index                                    
+      287 -    sample = [n for n in wanted if n.endswith("hc_attn_fn")][:
+          -1] + [n for n in wanted if n.endswith("embed.weight")]        
+      288 -    for name in sample:                                       
+      289 -        with safe_open(str(out / real_index[name]), framework=
+          -"pt") as handle:                                              
+      290 -            got = handle.get_tensor(name)                     
+      291 -        with safe_open(str(src / real_index[name]), framework=
+          -"pt") as handle:                                              
+      292 -            want = handle.get_tensor(name)                    
+      293 -        if not (got.dtype == want.dtype and got.shape == want.
+          -shape and bool((got == want).all())):                         
+      294 -            problems.append(f"{name}: slice value != source va
+          -lue")                                                         
+      295 -    total_written = sum(b for b in (total_bytes,))  # keep tot
+          -al_bytes meaningful for the summary                           
+      296 -                                                              
+      297 -    log(f"index: {len(wanted)} tensors, total_size={total_byte
+          -s} ({total_bytes / 2**30:.2f} GiB)")                          
+      298 -    log(f"shards: {linked} linked + {rewritten} rewritten -> n
+          -ew disk {new_bytes / 2**30:.2f} GiB")                         
+      350 +    problems = audit(out, needed, wanted, index, src, src_inde
+          +x, template_dir, log)                                         
+      351 +    write_slice_doc(out, src, template_config, layers, args.mo
+          +de, wanted, needed, index,                                    
+      352 +                    linked, rewritten, new_bytes)             
+      353 +    log(f"index: {len(wanted)} tensors, total_size={total_byte
+          +s} ({total_bytes / 2**30:.2f} GiB); "                         
+      354 +        f"new disk {new_bytes / 2**30:.2f} GiB")              
+      355      if problems:
+      356          for problem in problems:
+      357              log(f"VALIDATION FAILED: {problem}")
+      358          raise SystemExit(1)
+      303 -    log(f"validation OK (shard key sets match the index; sampl
+          -ed tensors bit-identical to source); "                        
+      304 -        f"{time.time() - started:.1f}s")                      
+      305 -    log(f"slice dir: {out}")                                  
+      359 +    log(f"validation OK (shard key sets == index names; config
+          + == template; sampled tensors bit-identical)")                
+      360 +    log(f"slice dir: {out} ({time.time() - started:.1f}s)")   
+      361  
+      362  
+      363  if __name__ == "__main__":
+
+  Thought for 9s, ran 1 shell command (ctrl+o to expand)
+
+● 小的性能修正：L5 的 dtype 审计原本会为了读 dtype 而加载所有张量（等于多读 227
+  GB）。改成从 header 解析 dtype：
+
+● Update(scripts/dsv41_consistency/make_slice_from_real.py)
+  ⎿  Added 3 lines, removed 3 lines
+      73      return ap.parse_args()
+      74  
+      75  
+      76 -def read_header(path: Path) -> dict[str, int]:                 
+      77 -    """{tensor name: nbytes} from a safetensors header, without
+         - touching the data."""                                         
+      76 +def read_header(path: Path) -> dict[str, tuple[int, str]]:     
+      77 +    """{tensor name: (nbytes, dtype)} from a safetensors header
+         +, without touching the data."""                                
+      78      with open(path, "rb") as handle:
+      79          header_len = struct.unpack("<Q", handle.read(8))[0]
+      80          header = json.loads(handle.read(header_len))
+      81      return {
+      82 -        name: entry["data_offsets"][1] - entry["data_offsets"][
+         -0]                                                             
+      82 +        name: (entry["data_offsets"][1] - entry["data_offsets"]
+         +[0], entry["dtype"])                                           
+      83          for name, entry in header.items()
+      84          if name != "__metadata__"
+      85      }
+
+● Update(scripts/dsv41_consistency/make_slice_from_real.py)
+  ⎿  Added 1 line, removed 1 line
+      199          if set(sizes) != set(names):
+      200              problems.append(f"{shard_name}: file keys != index
+            names "
+      201                              f"(extra={len(set(sizes) - set(nam
+           es))}, missing={len(set(names) - set(sizes))})")
+      202 -        total += sum(sizes[n] for n in names)                 
+      202 +        total += sum(sizes[n][0] for n in names)              
+      203      if total != index["metadata"]["total_size"]:
+      204          problems.append(f"total_size {index['metadata']['total
+           _size']} != summed tensors {total}")
+      205  
+
+● Update(scripts/dsv41_consistency/make_slice_from_real.py)
+  ⎿  Added 14 lines, removed 8 lines
+      222          if got.dtype != want.dtype or got.shape != want.shape 
+           or not bool((got == want).all()):
+      223              problems.append(f"{name}: slice value/dtype != sou
+           rce")
+      224  
+      225 -    # L5: dtype audit against the template (the real checkpoin
+          -t stores hc_*/attn_sink/gate.bias in fp32)                    
+      225 +    # L5: dtype audit against the template, from headers only 
+          +(no data reads).                                              
+      226 +    # The real checkpoint stores hc_*/attn_sink/gate.bias{,_vl
+          +} in fp32 while the template has bf16;                        
+      227 +    # the trainer rounds those to bf16 (param_dtype) but the e
+          +ngine keeps fp32 -- a train-vs-engine                         
+      228 +    # difference that only shows up with real weights (plan.md
+          + H2).                                                         
+      229      template_index = json.loads((template_dir / "model.safeten
+           sors.index.json").read_text())["weight_map"]
+      230 +    real_dtypes: dict[str, str] = {}                          
+      231 +    template_dtypes: dict[str, str] = {}                      
+      232 +    for shard_name in {src_index[n] for n in wanted}:         
+      233 +        real_dtypes.update({k: v[1] for k, v in read_header(sr
+          +c / shard_name).items()})                                     
+      234 +    for shard_name in {template_index[n] for n in wanted}:    
+      235 +        template_dtypes.update({k: v[1] for k, v in read_heade
+          +r(template_dir / shard_name).items()})                        
+      236      gaps = collections.Counter()
+      237      for name in wanted:
+      229 -        with safe_open(str(out / src_index[name]), framework="
+          -pt") as handle:                                               
+      230 -            real_dtype = handle.get_tensor(name).dtype        
+      231 -        with safe_open(str(template_dir / template_index[name]
+          -), framework="pt") as handle:                                 
+      232 -            template_dtype = handle.get_tensor(name).dtype    
+      233 -        if real_dtype != template_dtype:                      
+      234 -            gaps[f"{template_dtype} -> {real_dtype}"] += 1    
+      235 -    log(f"dtype audit vs template: {dict(gaps) if gaps else 'n
+          -o differences'}")                                             
+      238 +        if real_dtypes[name] != template_dtypes[name]:        
+      239 +            gaps[f"{template_dtypes[name]} -> {real_dtypes[nam
+          +e]}"] += 1                                                    
+      240 +    log(f"dtype audit vs template: {dict(gaps) if gaps else 'n
+          +o differences'} "                                             
+      241 +        f"(expected {{{{F32 -> BF16: 36, BF16 -> F32: 3}}}} fo
+          +r the real checkpoint)")                                      
+      242      return problems
+      243  
+      244  
+
+  Thought for 4s (ctrl+o to expand)
+
+● Update(scripts/dsv41_consistency/make_slice_from_real.py)
+  ⎿  Added 1 line, removed 1 line
+      238          if real_dtypes[name] != template_dtypes[name]:
+      239              gaps[f"{template_dtypes[name]} -> {real_dtypes[nam
+           e]}"] += 1
+      240      log(f"dtype audit vs template: {dict(gaps) if gaps else 'n
+           o differences'} "
+      241 -        f"(expected {{{{F32 -> BF16: 36, BF16 -> F32: 3}}}} fo
+          -r the real checkpoint)")                                      
+      241 +        "(expected {F32 -> BF16: 36, BF16 -> F32: 3} with the 
+          +real checkpoint)")                                            
+      242      return problems
+      243  
+      244  
+
+  Thought for 3s, searched for 1 pattern, ran 1 shell command (ctrl+o to expand)
+
+● Update(scripts/dsv41_consistency/make_slice_from_real.py)
+  ⎿  Added 1 line, removed 1 line
+      318      for shard_name, names in sorted(needed.items()):
+      319          src_shard, dst_shard = src / shard_name, out / shard_n
+           ame
+      320          sizes = read_header(src_shard)
+      321 -        mine = sum(sizes[n] for n in names)                   
+      321 +        mine = sum(sizes[n][0] for n in names)                
+      322          total_bytes += mine
+      323          if args.mode == "hybrid" and set(sizes) == set(names):
+      324              linked += 1
+
+  Thought for 5s, ran 1 shell command (ctrl+o to expand)
+
+● 切片在跑（已 link 7 个）。趁这段时间把 H3 的 check_engine_params.py 修好（384
+  专家会假 FAIL）：
+
+● Update(scripts/dsv41_consistency/check_engine_params.py)
+  ⎿  Added 13 lines
+      29      ap.add_argument("--rtol", type=float, default=0.02, help="r
+          elative tolerance on std/absmax/mean")
+      30      ap.add_argument("--tp", type=int, default=8)
+      31      ap.add_argument("--ep", type=int, default=8)
+      32 +    ap.add_argument("--n-experts", type=int, default=0,        
+      33 +                    help="Override the routed-expert count (def
+         +ault: read n_routed_experts from "                             
+      34 +                         "--model-path/config.json). The old ha
+         +rd-coded 32 silently mis-checks "                              
+      35 +                         "384-expert checkpoints.")            
+      36      return ap.parse_args()
+      37  
+      38  
+      39 +def num_routed_experts(model_path: str, override: int) -> int: 
+      40 +    """The checkpoint's routed-expert count, so the EP shard ma
+         +pping is right for any model."""                               
+      41 +    if override:                                               
+      42 +        return override                                        
+      43 +    config = json.loads((Path(model_path) / "config.json").read
+         +_text())                                                       
+      44 +    text_config = config.get("text_config", config)            
+      45 +    return int(text_config["n_routed_experts"])                
+      46 +                                                               
+      47 +                                                               
+      48  class Checkpoint:
+      49      def __init__(self, model_path: str):
+      50          from safetensors import safe_open
+
+● Update(scripts/dsv41_consistency/check_engine_params.py)
+  ⎿  Added 1 line, removed 1 line
+      177                      if tensor is not None:
+      178                          add(f"{base}ffn.shared_experts.w2[tp1]
+           ", tensor)
+      179                  elif rest in ("mlp.experts.routed_experts.w13_
+           weight", "mlp.experts.routed_experts.w2_weight"):
+      180 -                    n_experts = 32                            
+      180 +                    n_experts = num_routed_experts(args.model_
+          +path, args.n_experts)                                         
+      181                      per_rank = n_experts // args.ep
+      182                      mine = range(rank * per_rank, (rank + 1) *
+            per_rank)
+      183                      if rest.endswith("w13_weight"):
+
+  Thought for 11s, ran 2 shell commands (ctrl+o to expand)
+
+● 切片完成（86 s，验证通过）：4972 张量 / 105.88 GiB，新增磁盘仅 13.68
+  GiB，dtype 审计正好是 36 个 fp32→bf16（hc_*/attn_sink/gate.bias）+ 3 个反向（=
+  H2 预期的 39 项）。先修一句日志措辞，再跑训练侧加载冒烟：
+
+● Update(scripts/dsv41_consistency/make_slice_from_real.py)
+  ⎿  Added 2 lines, removed 2 lines
+      237      for name in wanted:
+      238          if real_dtypes[name] != template_dtypes[name]:
+      239              gaps[f"{template_dtypes[name]} -> {real_dtypes[nam
+           e]}"] += 1
+      240 -    log(f"dtype audit vs template: {dict(gaps) if gaps else 'n
+          -o differences'} "                                             
+      241 -        "(expected {F32 -> BF16: 36, BF16 -> F32: 3} with the 
+          -real checkpoint)")                                            
+      240 +    log(f"dtype audit vs template (template dtype -> real dtyp
+          +e): {dict(gaps) if gaps else 'no differences'} "              
+      241 +        "(expected {BF16 -> F32: 36, F32 -> BF16: 3} with the 
+          +real checkpoint)")                                            
+      242      return problems
+      243  
+      244  
+
+  Thought for 6s, ran 1 shell command (ctrl+o to expand)
+
+● 切片 config 字段全对。先补上 H6 的 missing 断言（三个 trainer
+  脚本），再跑冒烟：
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Update(scripts/dsv41_consistency/dump_trainer_stages.py)
+  ⎿  Added 10 lines, removed 1 line
+      374  
+      375      log("materializing parameters from checkpoint")
+      376      started = time.time()
+      377 -    full_state = read_dsv41_checkpoint_state_dict(Path(args.mo
+          -del_path), param_meta)[0] if rank == 0 else {}                
+      377 +    if rank == 0:                                             
+      378 +        full_state, ckpt_report = read_dsv41_checkpoint_state_
+          +dict(Path(args.model_path), param_meta)                       
+      379 +        # Otherwise DCP's strict=True raises a generic "Missin
+          +g key(s)" much later (see H6 in                               
+      380 +        # plans/dsv41-real-weights-4layer/plan.md); fail here 
+          +with the actual names instead.                                
+      381 +        assert not ckpt_report["missing"], (                  
+      382 +            f"checkpoint {args.model_path} lacks {len(ckpt_rep
+          +ort['missing'])} tensors the model needs, "                   
+      383 +            f"e.g. {ckpt_report['missing'][:5]}"              
+      384 +        )                                                     
+      385 +    else:                                                     
+      386 +        full_state = {}                                       
+      387      options = StateDictOptions(full_state_dict=True, broadcast
+           _from_rank0=True, cpu_offload=True)
+      388      set_model_state_dict(model, full_state, options=options)
+      389      del full_state
+
+  Thought for 12s, ran 2 shell commands (ctrl+o to expand)
+
+● 另一个 session 今早只改了端口号（59521→59522），无冲突。继续补两个脚本的
+  missing 断言：
+
+● Update(scripts/dsv41_consistency/probe_module_inputs.py)
+  ⎿  Added 9 lines, removed 1 line
+      259      model = FSDPTurbo(config, model).model
+      260  
+      261      started = time.time()
+      262 -    full_state = read_dsv41_checkpoint_state_dict(Path(args.mo
+          -del_path), param_meta)[0] if rank == 0 else {}                
+      262 +    if rank == 0:                                             
+      263 +        full_state, ckpt_report = read_dsv41_checkpoint_state_
+          +dict(Path(args.model_path), param_meta)                       
+      264 +        # DCP's strict=True would fail much later with a gener
+          +ic "Missing key(s)"; name them here.                          
+      265 +        assert not ckpt_report["missing"], (                  
+      266 +            f"checkpoint {args.model_path} lacks {len(ckpt_rep
+          +ort['missing'])} tensors the model needs, "                   
+      267 +            f"e.g. {ckpt_report['missing'][:5]}"              
+      268 +        )                                                     
+      269 +    else:                                                     
+      270 +        full_state = {}                                       
+      271      options = StateDictOptions(full_state_dict=True, broadcast
+           _from_rank0=True, cpu_offload=True)
+      272      set_model_state_dict(model, full_state, options=options)
+      273      del full_state
+
+  Thought for 3s (ctrl+o to expand)
+
+● Update(scripts/dsv41_consistency/graft_trainer_stages.py)
+  ⎿  Added 9 lines, removed 1 line
+      197      model = FSDPTurbo(config, model).model
+      198  
+      199      started = time.time()
+      200 -    full_state = read_dsv41_checkpoint_state_dict(Path(args.mo
+          -del_path), param_meta)[0] if rank == 0 else {}                
+      200 +    if rank == 0:                                             
+      201 +        full_state, ckpt_report = read_dsv41_checkpoint_state_
+          +dict(Path(args.model_path), param_meta)                       
+      202 +        # DCP's strict=True would fail much later with a gener
+          +ic "Missing key(s)"; name them here.                          
+      203 +        assert not ckpt_report["missing"], (                  
+      204 +            f"checkpoint {args.model_path} lacks {len(ckpt_rep
+          +ort['missing'])} tensors the model needs, "                   
+      205 +            f"e.g. {ckpt_report['missing'][:5]}"              
+      206 +        )                                                     
+      207 +    else:                                                     
+      208 +        full_state = {}                                       
+      209      options = StateDictOptions(full_state_dict=True, broadcast
+           _from_rank0=True, cpu_offload=True)
+      210      set_model_state_dict(model, full_state, options=options)
+      211      del full_state
+  Thought for 21s, ran 5 shell commands (ctrl+o to expand)
+
+● L3a 冒烟通过（训练侧能加载真实切片：102 参数、255 s 物化、len64
+  前向跑通、logprob 是真实量级 -17.9/-9.6/-19.1，logits absmax=21
+  而不是随机权重的 4× 放大）。现在引擎侧：
+
+  Thought for 5s, searched for 1 pattern (ctrl+o to expand)
+
+● --skip-stages
+  正是轻量冒烟选项，但引擎的启动+加载才是大头（两者同样要加载），所以直接跑完整
+  dump。先确认网卡名（§10.4 E1 的坑）：
+
+  Thought for 7s, ran 2 shell commands (ctrl+o to expand)
+
+● 网卡确认 enp48s3u1u1。启动引擎侧完整 dump（真实切片，len 64+200）：
+
+  Thought for 6s, ran 1 shell command (ctrl+o to expand)
+
+● §10.4 E2 又犯了（这次每卡他人占用 ~11.7 GiB，free 只有
+  49.6）。先看上次成功运行的实际显存画像，再定 mem-util：
+
+  Thought for 6s, ran 1 shell command (ctrl+o to expand)
+
+● 上次成功运行的实际占用是 权重 15.74 + 激活 0.42 + 非 torch 3.04 GiB ≈ 19.2 
+  GiB（KV cache 是余量）。当前每卡 free ≈ 49.6 GiB，用 --mem-util 0.72（44.1
+  GiB）既过检查又远超需求：
+
+  Thought for 9s, searched for 1 pattern, ran 1 shell command (ctrl+o to expand)
+
+● 每卡 free 在这两次之间从 49.6 掉到 43/29 GiB ——
+  其他租户正在起任务。按你说的"没显存就等"，我先看全部 16
+  张卡谁空，并确认我们自己没留残留：
+
+  Thought for 10s, ran 2 shell commands (ctrl+o to expand)
+
+● 其他租户的占用是瞬时尖峰（现在 16 张卡都只占 ~3
+  GB）。加个自动重试包装（容忍租户波动），并把 mem-util 降到 0.5（实际只需 ~19.2
+  GiB，留足余量）：
+
+● Write(/tmp/run_engine_real4_retry.sh)
+  ⎿  Wrote 30 lines to ../../tmp/run_engine_real4_retry.sh
+       1 #!/usr/bin/env bash
+         hile other tenants' jobs
+       3 # transiently hold NPU memory (their usage spikes to 10-30 GiB p
+       4 # mem-util 0.5 = 30.6 GiB: well above the ~19.2 GiB the model ne
+         eds (weights 15.74 + activation
+         ating a dip.
+       6 set -uo pipefail
+       8 
+       9 SLICE=/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-4layer-re
+      10 OUT=/mnt/share/m00899630/dsv41/dump/engine_real4
+     … +29 lines (ctrl+o to expand)
+
+  Thought for 5s, ran 1 shell command (ctrl+o to expand)
+
+● 引擎加载成功了（8 个 worker 都过了权重加载 + 分配 KV cache，H1
+  的修复生效）。等它跑完 dump，同时开始写工作记录：
+
+  Thought for 5s, ran 1 shell command (ctrl+o to expand)
+
+● 引擎 dump 完成（两档都出了 179 张量/rank）。关键早期信号：decode↔prefill
+  自一致性在真实权重下 ≤0.006（len64）/ 最大 0.20（len200），而随机权重时是
+  +4.09/+2.65 nats —— 与"随机权重让路由近平局"的假设一致。等它收尾：
+
+  Thought for 9s, ran 2 shell commands (ctrl+o to expand)
+
+● 引擎侧产物齐了。跑 L3c 参数指纹核对（验证引擎持有的就是切片里的真实权重）：
+
+  Thought for 6s, ran 1 shell command (ctrl+o to expand)
+
+● check_engine_params 在后台跑（它要重建 384 专家的 EP
+  分片，比较慢）。同时启动训练侧输入打桩：
+
+  Thought for 6s, ran 1 shell command (ctrl+o to expand)
+
+● 趁训练侧加载，先把工作记录建起来（写到新文件夹）：
+
+● Write(/mnt/share/m00899630/plans/dsv41-real-weights-4layer/worklog.md)
+  ⎿  Wrote 123 lines to
+     ../../mnt/share/m00899630/plans/dsv41-real-weights-4layer/worklog.md
+       1 # 工作记录：真实权重 4 层切片 + 训推一致性复跑（2026-09-22）
+       3 > 状态：**进行中**（切片已完成并验证；引擎侧 dump 已完成；训练侧
+         输入打桩运行中）
+       4 > 计划：[plan.md](plan.md)（同目录）；机制背景：[worklog_dsv41_m
+         _dsv41_module_input_probe.md)
+       5 > 目标：用**真实权重**（40 层 384 专家，`/mnt/share/DeepSeek-V4.
+       6 > 拿生产数字回答"随机权重把放大夸大了多少"。
+       7 
+       8 ## 0. 产物清单
+      10 | 产物 | 位置 | 状态 |
+     … +169 lines (ctrl+o to expand)
+
+  Thought for 3m 38s, ran 2 shell commands (ctrl+o to expand)
+
+● Background command "Verify engine params against the slice" completed (exit
+code 0)
+
+● 两个重要结果同时到。先看参数指纹的 32 个 FAIL（比随机权重的 8 个 vision FAIL
+  多出 24 个）：
+
+  Thought for 28s, ran 5 shell commands (ctrl+o to expand)
+
+● attn_sink 的 FAIL 是检查脚本映射表的 bug（引擎按 TP 切成 8 个头、脚本却拿完整
+  64 头去比；随机权重里 attn_sink 是
+  0，所以一直没暴露）。修掉并重跑；同时看打桩主结果：
+
+● Update(scripts/dsv41_consistency/check_engine_params.py)
+  ⎿  Added 3 lines, removed 1 line
+      156                  if rest in simple:
+      157                      add(f"{base}{simple[rest]}", ck(base + sim
+           ple[rest]))
+      158                  elif rest == "self_attn.attn_sink":
+      159 -                    add(f"{base}attn.attn_sink[tp]", ck(base +
+          - "attn.attn_sink"))                                           
+      159 +                    # TP-sharded along the head axis (engine h
+          +olds n_heads/tp entries per rank).                            
+      160 +                    # The random fixtures zero this tensor, wh
+          +ich hid the missing shard until now.                          
+      161 +                    add(f"{base}attn.attn_sink[tp]", ck(base +
+          + "attn.attn_sink", 0))                                        
+      162                  elif rest == "self_attn.wq_b.weight":
+      163                      add(f"{base}attn.wq_b.weight[tp0]", ck(bas
+           e + "attn.wq_b.weight", 0))
+      164                  elif rest == "self_attn.wo_b.weight":
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Please run /login · API Error: 403 The socket connection was closed 
+  unexpectedly. For more information, pass `verbose: true` in the second
+  argument to fetch()
+
+✻ Brewed for 45m 43s · done 8:39 AM
+
+❯ 继续                                                                          
+
+● Please run /login · API Error: 403 The socket connection was closed 
+  unexpectedly. For more information, pass `verbose: true` in the second
+  argument to fetch()
+✻ Crunched for 1s · done 8:42 AM

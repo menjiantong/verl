@@ -1,0 +1,725 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Dump every stage of the FSDPTurbo training forward for a fixed token stream.
+
+This is the "training side" half of the train-vs-inference consistency harness
+(``scripts/dsv41_consistency/``): it builds/lodes the model exactly like the
+``fsdp_turbo_dsv41`` engine does (same builder kwargs, same FSDPTurbo topology, same
+checkpoint loader), runs the fixture sequences from ``make_fixture.py`` and writes, for
+every hooked module, the activation it produced -- so the engine-side dump can be
+compared stage by stage instead of only end-to-end logprobs.
+
+Output (rank 0 only), one file per fixture sequence:
+
+    <out-dir>/trainer_len<LEN>.pt
+      input_ids       [S]        int64
+      logprobs        [S]        float32  (log_softmax of the final logits, gathered)
+      top1_ids        [S]        int64    (argmax of the final logits)
+      stages          {name: tensor}      float32 activations, see HOOK_PATTERNS
+
+Usage (8 NPUs; must match the GRPO script's topology):
+
+    PYTHONPATH=/workspace-verl/vllm:/workspace-verl/vllm-ascend-v41-private:/workspace-verl/FSDPTurbo \
+    torchrun --nproc_per_node=8 scripts/dsv41_consistency/dump_trainer_stages.py \
+        --model-path /mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-4layer-scaled32 \
+        --out-dir /mnt/share/m00899630/dsv41/dump/trainer
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+HOOK_SUFFIXES = [
+    "model.embed",
+    "model.norm",
+    "model.head",
+]
+BLOCK_SUFFIXES = [
+    "",
+    ".attn",
+    ".attn_norm",
+    ".ffn_norm",
+    ".ffn",
+    ".ffn.gate",
+    ".ffn.experts",
+    ".ffn.shared_experts",
+    # layer 2 owns the compressed KV and the index; layer 3 reads layer 2's selection.
+    ".attn.compressor",
+    ".attn.indexer",
+    # [2026-10-13 tii q-chain split] prolog intermediates, to compare op-by-op against
+    # the engine eager path (wq_a -> q_norm -> wq_b; wkv -> kv_norm).
+    ".attn.wq_a",
+    ".attn.q_norm",
+    ".attn.wq_b",
+    ".attn.wkv",
+    ".attn.kv_norm",
+]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-path", default=os.environ.get("MODEL_PATH", ""))
+    parser.add_argument("--tokenizer-path",
+                        default=os.environ.get("TOKENIZER_PATH", "/mnt/share/m00899630/dsv41/rl_tokenizer"),
+                        help="Engram needs the tokenizer for its compressed token map (engram.py:182); "
+                             "the revision must match the checkpoint (vocab-size check inside).")
+    parser.add_argument("--fixture", default="/mnt/share/m00899630/dsv41/dump/fixture.json")
+    parser.add_argument("--out-dir", default="/mnt/share/m00899630/dsv41/dump/trainer")
+    parser.add_argument("--lengths", default="", help="Comma separated subset of fixture lengths (default: all).")
+    parser.add_argument("--fsdp-size", type=int, default=8)
+    parser.add_argument("--tp-size", type=int, default=1)
+    parser.add_argument("--ep-size", type=int, default=8)
+    parser.add_argument("--efsdp-size", type=int, default=1)
+    parser.add_argument("--max-seq-len", type=int, default=int(os.environ.get("VERL_DSV41_MAX_SEQ_LEN", "2048")))
+    parser.add_argument("--max-elements", type=int, default=40_000_000, help="Skip stages larger than this (safety).")
+    parser.add_argument("--sparse-flash-attn", action="store_true",
+                        help="Build the model with the fused NPU SparseFlashMla instead of the eager torch fallback.")
+    parser.add_argument("--out-tag", default="", help="Suffix for the output files (A/B runs).")
+    parser.add_argument("--force-cmp-mask-mode-3", action="store_true",
+                        help="Work around the A2/A3 tiling check for window-only layers.")
+    parser.add_argument("--fp32-attention", action="store_true",
+                        help="Run the eager indexed attention with fp32 scores/probabilities (A/B).")
+    parser.add_argument("--logprob-probe", action="store_true",
+                        help="Compare the trainer's logprob kernel (torch_npu.npu_cross_entropy_loss "
+                             "via verl's logprobs_from_logits) against the engine's formula "
+                             "(`log_softmax` + gather) on identical logits. Any difference enters "
+                             "dlogp undiluted.")
+    parser.add_argument("--padding-probe", default="",
+                        help="Comma-separated left-pad lengths. For each, re-run the same token "
+                             "stream left-padded to (pad + len) with an attention mask -- the layout "
+                             "verl's padded batch path produces -- and log the next-token logprob "
+                             "difference against the unpadded (engine-layout) run. Empty = off.")
+    return parser.parse_args()
+
+
+def init_distributed():
+    import torch
+    import torch.distributed as dist
+
+    try:
+        import torch_npu  # noqa: F401
+
+        device = torch.device("npu", int(os.environ.get("LOCAL_RANK", 0)))
+        torch.npu.set_device(device)
+        backend = "hccl"
+    except ImportError:
+        device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
+        torch.cuda.set_device(device)
+        backend = "nccl"
+
+    dist.init_process_group(backend=backend)
+    torch.manual_seed(int(os.environ.get("RANK", 0)))
+    return torch, dist, device
+
+
+def build_fsdp_turbo_config(args):
+    from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig, _dict_to_dataclass
+
+    turbo_config = {
+        "distributed": {
+            "fully_shard_parallel_size": args.fsdp_size,
+            "tensor_parallel_size": args.tp_size,
+            "expert_parallel_size": args.ep_size,
+            "expert_fully_shard_parallel_size": args.efsdp_size,
+            "ulysses_parallel_size": 1,
+            "fsdp_plan": {
+                "apply_modules": {
+                    "model.embed": {},
+                    "model.layers.{*}": {},
+                    "model.norm": {},
+                    "model.head": {},
+                },
+                "hook_modules": ["model.layers.{*}"],
+                "param_dtype": "bf16",
+                "reduce_dtype": "fp32",
+                "output_dtype": None,
+                "cast_forward_inputs": False,
+                "num_to_forward_prefetch": 1,
+                "num_to_backward_prefetch": 1,
+                "fsdp_implementation": "native",
+            },
+            "ep_plan": {
+                "apply_modules": ["model.layers.{*}.ffn.experts"],
+                "dispatcher": "fused",
+            },
+        },
+        "memory": {"recompute": False, "recompute_plan": []},
+    }
+    config = _dict_to_dataclass(FSDPTurboConfig, turbo_config)
+    config.distributed.fsdp_plan.cpu_offload = True
+    return config
+
+
+def force_cmp_mask_mode_3():
+    """Pass cmp_mask_mode=3 to the SparseFlashMla metadata even without compressed KV.
+
+    The A2/A3 tiling function rejects the dense-BSND layout with cmp_mask_mode=0
+    ("cmpMaskMode should be 3 on A2/A3, but got 0"), and FSDPTurbo sets exactly that for
+    layers whose compress_ratio is 0. The engine does not hit this because it runs the
+    paged (PA_BBND) layout.
+    """
+    from cann_ops_transformer import ops
+
+    originals = []
+    for name in ("sparse_flash_mla_metadata", "sparse_flash_mla", "sparse_flash_mla_grad"):
+        original = getattr(ops, name, None)
+        if original is None:
+            continue
+
+        def patched(*args, __original=original, **kwargs):
+            kwargs["cmp_mask_mode"] = 3
+            return __original(*args, **kwargs)
+
+        setattr(ops, name, patched)
+        originals.append((name, original))
+    return originals
+
+
+def install_fp32_attention(torch):
+    """Run the eager indexed attention in fp32 instead of bf16 scores / bf16 probabilities.
+
+    `indexed_sparse_attention_torch` (fsdp_turbo/ops/cpu/sparse_attention.py:49-76) lets the
+    QK einsum run in the autocast dtype (bf16) and casts the probabilities to bf16 before the
+    PV product. This variant keeps both in fp32 to test whether the gap against the fused
+    engine kernel is caused by that rounding.
+    """
+    import fsdp_turbo.ops.npu.sparse_attention as npu_attn
+
+    def fp32_attention(
+        query,
+        key_value,
+        attention_sink,
+        topk_indices,
+        softmax_scale,
+        attention_mask=None,
+        use_sparse_flash_attn=False,
+        compressed_key_value=None,
+        compressed_topk_indices=None,
+        compress_ratio=1,
+        window_size=128,
+    ):
+        del use_sparse_flash_attn, compress_ratio, window_size
+        if compressed_key_value is not None:
+            if compressed_topk_indices is None:
+                raise ValueError("compressed_topk_indices is required with compressed_key_value")
+            compressed_topk_indices = torch.where(
+                compressed_topk_indices >= 0,
+                compressed_topk_indices + key_value.size(1),
+                compressed_topk_indices,
+            )
+            topk_indices = torch.cat((topk_indices, compressed_topk_indices), dim=-1)
+            key_value = torch.cat((key_value, compressed_key_value), dim=1)
+        batch_size, sequence_length, _, head_dim = query.shape
+        topk_size = topk_indices.shape[-1]
+        topk_indices = topk_indices.to(query.device)
+        safe_indices = topk_indices.clamp_min(0).long()
+        expanded_key_value = key_value.unsqueeze(1).expand(-1, sequence_length, -1, -1)
+        selected_key_value = torch.gather(
+            expanded_key_value, 2,
+            safe_indices.unsqueeze(-1).expand(batch_size, sequence_length, topk_size, head_dim),
+        )
+        attention_scores = (
+            torch.einsum("bshd,bskd->bshk", query.float(), selected_key_value.float()) * softmax_scale
+        )
+        attention_scores = attention_scores.masked_fill(topk_indices.unsqueeze(2) < 0, -torch.inf)
+        if attention_mask is not None and key_value.size(1) == attention_mask.size(1):
+            selected_key_mask = torch.gather(attention_mask.bool(), 1, safe_indices.flatten(1)).view(
+                batch_size, sequence_length, topk_size
+            )
+            attention_scores = attention_scores.masked_fill(~selected_key_mask.unsqueeze(2), -torch.inf)
+        sink_scores = attention_sink.float().view(1, 1, -1, 1).expand(batch_size, sequence_length, -1, -1)
+        attention_probabilities = torch.softmax(torch.cat((attention_scores, sink_scores), dim=-1), dim=-1)[..., :-1]
+        attention_output = torch.einsum(
+            "bshk,bskd->bshd", attention_probabilities, selected_key_value.float()
+        )
+        return attention_output.to(query.dtype)
+
+    npu_attn.indexed_sparse_attention_torch = fp32_attention
+    return npu_attn
+
+
+def to_cpu_fp32(value, max_elements):
+    """Best-effort conversion of a hook payload to a detachable fp32 CPU tensor."""
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        if value.numel() > max_elements:
+            return None
+        return value.detach().float().cpu()
+    if isinstance(value, (tuple, list)):
+        return {f"[{i}]": to_cpu_fp32(v, max_elements) for i, v in enumerate(value)}
+    return None
+
+
+def buffer_fingerprint(buffer) -> str:
+    """sha1 of the raw bytes: the fp32 router bias is checked *bit-exactly*, not approximately."""
+    import hashlib
+
+    return hashlib.sha1(buffer.detach().float().cpu().contiguous().numpy().tobytes()).hexdigest()[:16]
+
+
+def restore_fp32_parameters(model, model_path, log, device, only: str = ""):
+    """Compute with the checkpoint's fp32 parameter values where the trainer holds bf16 (H2).
+
+    **Superseded for the router bias** (`=gate`, and therefore the `=1` "everything" mode):
+    `Gate.bias` is an fp32 *buffer* now (see `fsdp_turbo.../model.py`), so the trainer holds the
+    checkpoint value by construction and this override finds nothing to swap for it -- a `=gate`
+    run should therefore come out identical to a plain run. It is kept for the remaining case:
+    the fp32 *parameters* that are still normalized to bf16 (`attn_sink`, the six `hc_*` per
+    layer), which the real-weight A/B measured as contributing nothing (`=continuous`), and as
+    the effect preview that motivated the fix.
+
+    `prepare_deepseek_v41_model_for_fsdp` normalizes *every* floating parameter to bf16, so the
+    architecture's own fp32 declarations get rounded on load while the engine keeps the
+    checkpoint's fp32 values. The parameter itself must stay bf16: FSDP2 asserts one original
+    dtype per parameter group (`_fsdp_param_group.py::_init_mp_dtypes`, hit when this used to
+    reassign `parameter.data`). So the fp32 value is swapped in around the owning module's
+    forward instead -- same tensors the engine holds, and FSDP never sees a second dtype.
+    Env-gated by the caller (`VERL_DSV41_KEEP_FP32_PARAMS=1|gate|continuous`).
+    Returns the names overridden.
+    """
+    import torch
+    from safetensors import safe_open
+
+    from verl.workers.engine.fsdp.fsdp_turbo_dsv41_impl import _MODEL_PREFIX, _checkpoint_weight_map
+
+    weight_map = _checkpoint_weight_map(Path(model_path))
+    handles: dict[str, object] = {}
+    overrides: dict[str, dict[str, torch.Tensor]] = {}  # module path -> {attr: fp32 tensor}
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            ckpt_name = name[len(_MODEL_PREFIX):] if name.startswith(_MODEL_PREFIX) else name
+            shard = weight_map.get(ckpt_name)
+            if shard is None or parameter.is_meta or parameter.dtype == torch.float32:
+                continue
+            if shard not in handles:
+                handles[shard] = safe_open(str(Path(model_path) / shard), framework="pt", device="cpu")
+            handle = handles[shard]
+            if handle.get_slice(ckpt_name).get_dtype() != "F32":
+                continue
+            value = handle.get_tensor(ckpt_name)
+            if tuple(value.shape) != tuple(parameter.shape):
+                log(f"skip fp32 override of {name}: ckpt shape {tuple(value.shape)} != {tuple(parameter.shape)}")
+                continue
+            module_path, _, attr = name.rpartition(".")
+            if only == "gate" and attr != "bias":  # `=gate`: router correction bias only
+                continue
+            if only == "continuous" and attr == "bias":  # `=continuous`: hc_*/attn_sink only
+                continue
+            # The load uses cpu_offload=True, so `parameter.device` is cpu; the swap has to
+            # land where the forward runs (the module's activations), not where it was loaded.
+            overrides.setdefault(module_path, {})[attr] = value.to(device=device, dtype=torch.float32)
+
+    module_names = {name for name, _ in model.named_modules()}
+    for module_path, attrs in overrides.items():
+        if module_path not in module_names:
+            log(f"skip fp32 override for unknown module {module_path!r}")
+            continue
+        module = model.get_submodule(module_path)
+        saved: dict[str, tuple[bool, object]] = {}
+
+        def swap_in(mod, _inputs, _attrs=attrs, _saved=saved):  # pre-hook: (module, args)
+            for attr, tensor in _attrs.items():
+                _saved[attr] = (attr in mod.__dict__, mod.__dict__.get(attr))
+                object.__setattr__(mod, attr, tensor)
+
+        def swap_out(mod, _inputs, output, _saved=saved):  # post-hook: (module, args, output)
+            for attr, (existed, old) in _saved.items():
+                if existed:
+                    object.__setattr__(mod, attr, old)
+                else:
+                    mod.__dict__.pop(attr, None)
+            return output
+
+        module.register_forward_pre_hook(swap_in)
+        module.register_forward_hook(swap_out)
+
+    names = [f"{path}.{attr}" for path, attrs in overrides.items() for attr in attrs]
+    log(f"fp32 use-site override on {len(names)} parameters ({len(overrides)} modules): "
+        f"{sorted({n.split('.')[-1] for n in names})}")
+    return names
+
+
+def install_attention_op_hooks(torch, stage_sink, max_elements):
+    """Record the inputs/output of `indexed_sparse_attention` per layer.
+
+    The attention itself is a plain function call inside `Attention.forward` (there is no
+    submodule to hook), so wrap the module-level name the model imported. Calls happen in
+    layer order during a forward, which is how the entries get their layer index.
+    """
+    import fsdp_turbo.models.deepseek_v41.model as model_module
+
+    # Re-install per stage_sink: the wrapper closes over *this* sink, so a second call must
+    # rebind, not early-return (the old `_dump_wrapped` guard left every later sample's
+    # attn_op tensors in the first sample's dict -- fix regression log shows it as
+    # `stages=57 (len=64) / stages=37 (len=200)`).
+    original = getattr(model_module.indexed_sparse_attention, "_dump_original", model_module.indexed_sparse_attention)
+
+    def wrapper(query, key_value, attention_sink, topk_indices, softmax_scale, attention_mask=None, **kwargs):
+        output = original(
+            query, key_value, attention_sink, topk_indices, softmax_scale, attention_mask, **kwargs
+        )
+        index = len({key.split(".")[0] for key in stage_sink if key.startswith("attn_op")})
+        payload = {
+            "query": query,
+            "key_value": key_value,
+            "attn_sink": attention_sink,
+            "topk_indices": topk_indices,
+            "output": output,
+        }
+        for key, value in payload.items():
+            tensor = to_cpu_fp32(value, max_elements)
+            if isinstance(tensor, torch.Tensor):
+                stage_sink[f"attn_op{index}.{key}"] = tensor
+        return output
+
+    wrapper._dump_original = original
+    model_module.indexed_sparse_attention = wrapper
+    return original
+
+
+def install_hooks(model, torch, max_elements, stage_sink):
+    """Hook the milestone modules; store fp32 CPU copies under short stage names."""
+
+    def make_hook(name):
+        def hook(_module, _inputs, output):
+            payload = to_cpu_fp32(output, max_elements)
+            if payload is None:
+                return
+            if isinstance(payload, dict):
+                for suffix, tensor in payload.items():
+                    if tensor is not None:
+                        stage_sink[f"{name}{suffix}"] = tensor
+            else:
+                stage_sink[name] = payload
+
+        return hook
+
+    handles = []
+    for name, module in model.named_modules():
+        short = None
+        if name in HOOK_SUFFIXES:
+            short = name
+        elif name.startswith("model.layers."):
+            parts = name.split(".", 3)
+            if len(parts) == 4:
+                rest = "." + parts[3]
+                if rest in BLOCK_SUFFIXES:
+                    short = name
+        if short is not None:
+            handles.append(module.register_forward_hook(make_hook(short)))
+    return handles
+
+
+def main():
+    args = parse_args()
+    args.padding_probe = [int(x) for x in args.padding_probe.split(",") if x.strip()]
+    if not args.model_path:
+        raise SystemExit("--model-path (or MODEL_PATH) is required")
+    if args.sparse_flash_attn:
+        # `torch_npu` breaks the search path for `cann_ops_transformer` (verified: the same
+        # import succeeds before torch_npu is loaded and fails after), and FSDPTurbo imports
+        # the ops lazily at first attention call. Importing the package here, before
+        # init_distributed() pulls in torch_npu, keeps it importable from then on.
+        from cann_ops_transformer import ops as _cann_ops  # noqa: F401  (pre-import, see above)
+        print("[dump-trainer] pre-imported cann_ops_transformer (fused sparse attention)", flush=True)
+        if args.force_cmp_mask_mode_3:
+            force_cmp_mask_mode_3()
+            print("[dump-trainer] forcing cmp_mask_mode=3 on sparse_flash_mla_metadata", flush=True)
+    torch, dist, device = init_distributed()
+    rank = dist.get_rank()
+
+    from fsdp_turbo.distributed.parallel_state import init_parallel_state
+    from fsdp_turbo.fsdp_turbo import FSDPTurbo
+    from fsdp_turbo.models.deepseek_v41 import (
+        build_deepseek_v41_model,
+        initialize_deepseek_v41_model,
+        prepare_deepseek_v41_model_for_fsdp,
+    )
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
+    from verl.workers.engine.fsdp.fsdp_turbo_dsv41_impl import (
+        _MODEL_PREFIX,
+        checkpoint_buffer_meta,
+        host_offload_engram_tables,
+        move_buffers_to_device,
+        place_checkpoint_buffers_for_load,
+        read_dsv41_checkpoint_state_dict,
+        refresh_dsv41_expert_metadata,
+    )
+
+    def log(message):
+        if rank == 0:
+            print(f"[dump-trainer] {message}", flush=True)
+
+    config = build_fsdp_turbo_config(args)
+    init_parallel_state(config)
+
+    log("building model (routed experts deferred to meta)")
+    started = time.time()
+
+    # [2026-10-13 dtype-probe] locate where the main-stream precision becomes fp32.
+    def _dt(tag: str) -> None:
+        hits = {}
+        for n, p in model.named_parameters():
+            if n.endswith(("attn.wq_a.weight", "attn_norm.weight", "embed_tokens.weight")):
+                hits[".".join(n.split(".")[-3:])] = str(p.dtype)
+        log(f"[dtype-probe] {tag}: {hits}")
+
+    # [2026-10-13 top32] Engram's NgramHashState builds its compressed token map from the
+    # tokenizer (engram.py:182); it must be the revision the checkpoint was trained with
+    # (build_compressed_token_map checks the vocab size against the checkpoint config).
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+    model = build_deepseek_v41_model(
+        tokenizer=tokenizer,
+        engram_meta_init=True,
+        # [2026-10-13 top32] Engram layers only support host_offload (the adapter forces it
+        # in production); row_sharded was a 4-layer-fixture-only path.
+        engram_storage_backend="host_offload",
+        use_sparse_flash_attn=args.sparse_flash_attn,  # the engine builds it with False (eager torch)
+        experts_meta_init=True,
+        config_path=args.model_path,
+        max_seq_len=args.max_seq_len,
+    )
+    initialize_deepseek_v41_model(model)
+    model = prepare_deepseek_v41_model_for_fsdp(model, device=device, parameter_dtype=torch.bfloat16)
+    _dt("after prepare(bf16)")
+    param_meta = {name: (tuple(param.shape), param.dtype) for name, param in model.named_parameters()}
+    buffer_meta = checkpoint_buffer_meta(model)
+    # [2026-10-13 top32] Host-offload Engram tables are loaded outside DCP (production:
+    # fsdp_turbo_dsv41_impl._load_host_engram_tables reads each rank's own row slice). Keep
+    # them out of param_meta so no loader ever materializes the ~366 GiB table -- that
+    # allocation is what blocked top32 probing before (worklog_dsv41_consistency_v2 §4.11).
+    engram_tables = host_offload_engram_tables(model)
+    for checkpoint_name, _ in engram_tables:
+        param_meta.pop(_MODEL_PREFIX + checkpoint_name, None)
+    log(f"model built in {time.time() - started:.1f}s ({len(param_meta)} parameters, "
+        f"{len(buffer_meta)} checkpoint buffers: {sorted(buffer_meta)[:2]} ...)")
+
+    model = FSDPTurbo(config, model).model
+    _dt("after FSDPTurbo wrap")
+
+    log("materializing parameters from checkpoint (production path)")
+    started = time.time()
+    # [2026-10-13 top32] Run the *production* materialization so the Engram host-offload
+    # tables (model.layers.{1,14}.engram.embed) load exactly the way the GRPO trainer loads
+    # them: DCP never sees the ~366 GiB table, every rank row-slice-reads its own range
+    # straight from the checkpoint and freezes it (fsdp_turbo_dsv41_impl._load_host_engram_tables).
+    # The legacy rank0-read + DCP-broadcast path OOM'd on top32 ("Tried to allocate
+    # 183.11 GiB", worklog_dsv41_consistency_v2 §4.11); production code supersedes it.
+    from types import SimpleNamespace
+
+    from verl.workers.engine.fsdp.fsdp_turbo_dsv41_impl import (
+        FSDPTurboDSV41EngineWithLMHead as _EngineCls,
+    )
+
+    engine_shim = _EngineCls.__new__(_EngineCls)  # uninitialized: only model_config is read
+    engine_shim.model_config = SimpleNamespace(local_hf_config_path=str(args.model_path))
+    engine_shim._materialize_dsv41_parameters(
+        model, param_meta, buffer_meta, offload_policy=True, engram_tables=engram_tables
+    )
+    log(f"parameters materialized in {time.time() - started:.1f}s")
+    _dt("after materialize")
+
+    # Note: the production path already places checkpoint buffers and verifies them
+    # bit-exact against the checkpoint (see _materialize_dsv41_parameters / _finish_*).
+
+    move_buffers_to_device(model, device, log)
+    fp32_mode = os.environ.get("VERL_DSV41_KEEP_FP32_PARAMS", "")
+    if fp32_mode:
+        restore_fp32_parameters(model, args.model_path, log, device, only="" if fp32_mode == "1" else fp32_mode)
+    refresh_dsv41_expert_metadata(model, device)
+    still_meta = [name for name, parameter in model.named_parameters() if parameter.is_meta]
+    assert not still_meta, f"parameters left on meta: {still_meta[:5]}"
+    # Read the buffers back from the model (the load *replaces* those tensors, so anything
+    # captured before it is a stale tensor): this is the value the forward will actually use,
+    # and the dump carries it for a bit-exact check against the checkpoint.
+    checkpoint_buffers = {name: buffer for name, buffer in model.named_buffers() if name in buffer_meta}
+    for name, buffer in sorted(checkpoint_buffers.items()):
+        log(f"checkpoint buffer {name}: dtype={buffer.dtype} shape={tuple(buffer.shape)} "
+            f"sha1={buffer_fingerprint(buffer)} first={[round(x, 7) for x in buffer.detach().float().flatten()[:4].tolist()]}")
+
+    with open(args.fixture) as f:
+        fixture = json.load(f)
+    want = {int(x) for x in args.lengths.split(",") if x} or None
+    samples = [s for s in fixture["samples"] if want is None or s["target_len"] in want]
+
+    model.eval()
+    out_dir = Path(args.out_dir)
+    if rank == 0:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    for sample in samples:
+        length = sample["target_len"]
+        real_len = length
+        input_ids = torch.tensor([sample["input_ids"]], dtype=torch.long, device=device)
+        attention_mask = torch.ones_like(input_ids)
+        stage_sink: dict[str, torch.Tensor] = {}
+        if args.fp32_attention and not getattr(install_fp32_attention, "_installed", False):
+            install_fp32_attention(torch)
+            install_fp32_attention._installed = True
+            print("[dump-trainer] using fp32 eager attention", flush=True)
+        install_attention_op_hooks(torch, stage_sink, args.max_elements)
+        handles = install_hooks(model, torch, args.max_elements, stage_sink)
+        try:
+            with torch.no_grad():
+                output = model(input_ids=input_ids, attention_mask=attention_mask)
+        finally:
+            for handle in handles:
+                handle.remove()
+        logits = output.logits.float()
+        print(f" ---------------------------- debug input_ids shape is {input_ids.shape} --------------------------------  ")
+        print(f" ---------------------------- debug logics shape is {logits.shape} --------------------------------  ")
+        logprobs = torch.log_softmax(logits, dim=-1)
+        print(f" ---------------------------- debug logprobs shape is {logprobs.shape} --------------------------------  ")
+
+        seq = input_ids.shape[1]
+        # (a) canonical next-token convention: logprob of token t comes from logits[t-1].
+        #     Position 0 has no context, so it is dropped -- this is what the engine reports.
+        next_logprobs = logprobs[0, :-1].gather(-1, input_ids[0, 1:].unsqueeze(-1)).squeeze(-1)
+        # (b) the convention verl's engine uses for the padded path: labels are the *rolled*
+        #     flat token stream (`torch.roll(input_ids.values(), -1)`), so the last position
+        #     predicts the first token of the sequence (a wrap-around) instead of nothing.
+        rolled_ids = torch.roll(input_ids, shifts=-1, dims=1)
+        rolled_logprobs = logprobs[0].gather(-1, rolled_ids[0].unsqueeze(-1)).squeeze(-1)
+        topk = torch.topk(logits[0], k=16, dim=-1)
+        if rank == 0:
+            payload = {
+                "input_ids": input_ids[0].cpu(),
+                "logprobs": rolled_logprobs.float().cpu(),
+                "next_logprobs": next_logprobs.float().cpu(),
+                "topk_ids": topk.indices.cpu(),
+                "topk_logprobs": logprobs[0].gather(-1, topk.indices).cpu(),
+                "logits_absmax": float(logits.abs().max().item()),
+                "stages": stage_sink,
+                "checkpoint_buffers": {
+                    name: buffer.detach().float().cpu() for name, buffer in checkpoint_buffers.items()
+                },
+            }
+            if length <= 64:
+                payload["logits"] = logits[0].to(torch.float16).cpu()
+            path = out_dir / f"trainer{args.out_tag}_len{length}.pt"
+            torch.save(payload, path)
+            sizes = ", ".join(f"{k}{tuple(v.shape)}" for k, v in sorted(stage_sink.items())[:6])
+            log(f"len={length}: next_logprobs[1:4]={[round(x, 4) for x in next_logprobs[:3].tolist()]} "
+                f"roll_last={rolled_logprobs[-1].item():.4f} logits absmax={payload['logits_absmax']:.2f} "
+                f"stages={len(stage_sink)} ({sizes} ...)")
+            log(f"len={length}: wrote {path}")
+        # Logprob-kernel probe (2026-09-27, wiki/work_log/pearson_0999/).
+        # The *last* operation in the comparison is not a model kernel but the logprob formula.
+        # The engine samples with `logits.log_softmax(dim=-1, dtype=torch.float32)`
+        # (vllm/v1/sample/sampler.py `compute_logprobs`). The trainer goes through
+        # `verl/utils/torch_functional.logprobs_from_logits`, and on NPU (no flash-attn) that
+        # dispatches to `logprobs_from_logits_torch_npu` = `torch_npu.npu_cross_entropy_loss`
+        # -- a completely different fused kernel over the 129280-way reduction. Any difference
+        # here enters dlogp *undiluted* (nothing downstream averages it out), unlike the
+        # per-layer kernel differences.
+        if args.logprob_probe:
+            from verl.utils.torch_functional import (
+                logprobs_from_logits,
+                logprobs_from_logits_v2,
+            )
+
+            labels = input_ids[0, 1:]
+            logits_flat = logits[0, :-1].float()
+            trainer_way = logprobs_from_logits(
+                logits=logits_flat.unsqueeze(0), labels=labels.unsqueeze(0)
+            ).squeeze(0)
+            engine_way = torch.log_softmax(logits_flat, dim=-1).gather(
+                -1, labels.unsqueeze(-1)
+            ).squeeze(-1)
+            d = engine_way - trainer_way
+            # also the pure-pytorch fallback path, to separate "cross-entropy kernel" from
+            # "log_softmax variant"
+            fallback_way = logprobs_from_logits_v2(
+                logits_flat.unsqueeze(0), labels.unsqueeze(0)
+            ).squeeze(0)
+            d2 = engine_way - fallback_way
+            if rank == 0:
+                log(
+                    f"LOGPROB-PROBE len={real_len} npu_cross_entropy vs log_softmax: "
+                    f"mean={d.mean():+.5f} std={d.std():.5f} med|d|={d.abs().median():.5f} "
+                    f"max|d|={d.abs().max():.5f} bits_eq={(d == 0).float().mean() * 100:.2f}%"
+                )
+                log(
+                    f"LOGPROB-PROBE len={real_len} v2(torch) vs log_softmax:        "
+                    f"mean={d2.mean():+.5f} std={d2.std():.5f} med|d|={d2.abs().median():.5f} "
+                    f"max|d|={d2.abs().max():.5f} bits_eq={(d2 == 0).float().mean() * 100:.2f}%"
+                )
+            dist.barrier()
+
+        # Padding probe (2026-09-27, wiki/work_log/pearson_0999/).
+        # The engine always sees `prompt + response` with positions 0..N-1 and no padding. The
+        # trainer's padded batch path (agent_loop.py: `padding_side="left"` to
+        # `rollout_config.prompt_length`) hands the model a *left-padded* row, and
+        # `FSDPTurboDSV41EngineWithLMHead.prepare_model_inputs` deliberately drops `position_ids`
+        # ("the V4.1 reference forward indexes its RoPE tables by absolute position"). So the
+        # trainer evaluates the very same tokens at RoPE positions `pad + i` instead of `i`.
+        # This probe measures that effect on its own: run the identical token stream twice, once
+        # unpadded (engine layout) and once left-padded with an attention mask (trainer layout),
+        # and compare the next-token logprobs of the real tokens.
+        for pad in args.padding_probe:
+            real = input_ids.shape[1]
+            padded_ids = torch.cat(
+                [torch.full((1, pad), 0, dtype=torch.long, device=device), input_ids], dim=1
+            )
+            padded_mask = torch.cat(
+                [
+                    torch.zeros(1, pad, dtype=torch.long, device=device),
+                    torch.ones(1, real, dtype=torch.long, device=device),
+                ],
+                dim=1,
+            )
+            for name, buffer in model.named_buffers():
+                if name.endswith("kv_cache"):
+                    buffer.zero_()
+            with torch.no_grad():
+                out_padded = model(input_ids=padded_ids, attention_mask=padded_mask)
+            lp_padded = torch.log_softmax(out_padded.logits.float(), dim=-1)
+            nxt_padded = lp_padded[0, :-1].gather(
+                -1, padded_ids[0, 1:].unsqueeze(-1)
+            ).squeeze(-1)
+            # the real token at padded column `pad + t` is predicted by column `pad + t - 1`
+            b = nxt_padded[pad : pad + real - 1]
+            d = next_logprobs - b
+            if rank == 0:
+                log(
+                    f"PADDING-PROBE len={real} pad={pad} (parity {'even' if pad % 2 == 0 else 'odd'}): "
+                    f"dlogp mean={d.mean():+.4f} std={d.std():.4f} med|d|={d.abs().median():.4f} "
+                    f"p99={d.abs().quantile(0.99):.4f} max={d.abs().max():.4f} "
+                    f"|d|>0.5={(d.abs() > 0.5).float().mean() * 100:.1f}%"
+                )
+            dist.barrier()
+        # The ring buffers (window/compress KV) must start clean for the next sample, the way a
+        # fresh engine request would.
+        for name, buffer in model.named_buffers():
+            if name.endswith("kv_cache"):
+                buffer.zero_()
+        dist.barrier()
+
+    dist.barrier()
+    dist.destroy_process_group()
+    log("done")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
