@@ -883,7 +883,15 @@ class AgentLoopWorker:
         if self.processor is None:
             return multi_modal_inputs
 
+        # A vision-capable checkpoint (e.g. DeepSeek-V4.1 with a vision_config) gets a
+        # processor even for text-only RL data, and that processor returns
+        # `images=[[]]` + `token_types` for `images=None`.  Forwarding those to a
+        # trainer built with VERL_DSV41_VISION=0 makes the adapter reject the batch
+        # ("Image inputs require an enabled DeepSeek vision tower").  Only run the
+        # processor when the sample actually carries media.
         multi_modal_data = output.multi_modal_data or {}
+        if not any(multi_modal_data.get(k) for k in ("images", "videos", "audios")):
+            return multi_modal_inputs
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
         audios = multi_modal_data.get("audios")

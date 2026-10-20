@@ -55,7 +55,37 @@ export TRAIN_FILE=${TRAIN_FILE:-/mnt/share/m00899630/dsv41/rl_data/gsm8k_main_tr
 export TEST_FILE=${TEST_FILE:-/mnt/share/m00899630/dsv41/rl_data/gsm8k_main_test_rl.parquet}
 export TRAIN_BSZ=${TRAIN_BSZ:-8} SAMPLE_N=${SAMPLE_N:-8}
 export LR=${LR:-5e-6} USE_KL=${USE_KL:-1} KL_COEF=${KL_COEF:-0.001}
-export MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN:-1024} ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.6}
+export MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN:-1024}
+
+# ---------- 内存/offload 策略（均可用环境变量覆盖） ----------
+# 4 层 smoke 模型：参数/梯度/Adam 全部留在 NPU 更省 host（~400G -> ~100G）；
+#   每 rank 只有 ~1.3 GiB 参数分片 + ~5 GiB Adam，64 GB 卡放得下。
+# 全模型：每 rank 参数+梯度+Adam ~88 GiB > 64 GB，offload 必须保持 True；
+#   此时 host 内存由 offload 决定，无法靠关 offload 降下来，只能降 rollout util
+#   给 HBM 留余量，或改 EP/EFSDP 拓扑减少专家副本。
+if [[ "$(basename "${MODEL_PATH}")" == *4layer* ]]; then
+  _SMALL_MODEL=1
+else
+  _SMALL_MODEL=0
+fi
+if [ "${_SMALL_MODEL}" = "1" ]; then
+  export ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.3}
+  export PARAM_OFFLOAD=${PARAM_OFFLOAD:-False}
+  export OPTIMIZER_OFFLOAD=${OPTIMIZER_OFFLOAD:-False}
+  export OFFLOAD_POLICY=${OFFLOAD_POLICY:-False}
+else
+  # 全模型 weights ~126 GiB / 16 rank ≈ 7.9 GiB/rank；0.5*64=32 GiB 预算仍够
+  # weights+activation+KV；再低可能触发 "No available memory for the cache blocks"。
+  export ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.5}
+  export PARAM_OFFLOAD=${PARAM_OFFLOAD:-True}
+  export OPTIMIZER_OFFLOAD=${OPTIMIZER_OFFLOAD:-True}
+  export OFFLOAD_POLICY=${OFFLOAD_POLICY:-True}
+fi
+export REF_PARAM_OFFLOAD=${REF_PARAM_OFFLOAD:-${PARAM_OFFLOAD}}
+REF_OFFLOAD_ARGS=()
+if [ "${USE_KL}" = "1" ]; then
+  REF_OFFLOAD_ARGS=("actor_rollout_ref.ref.fsdp_config.param_offload=${REF_PARAM_OFFLOAD}")
+fi
 # 训推一致性开关（默认全关）。⚠️ E39：这些是 **worker 进程读 env** 的开关，而 worker 继承本机
 # raylet 的环境（≠ driver）——只写在主机命令行上会导致从机 worker 拿不到！两机要一致必须
 # 双方命令行都传（或改这里的默认值，脚本双方都执行，最稳）。任务 55 起：两机都在命令行显式传。
@@ -141,7 +171,7 @@ if [ "$MODE" = "master" ]; then
   STEPS=${2:-50}
   python3 -c "import torch_npu, vllm_ascend" 2>/dev/null || { echo "ERROR: torch_npu/vllm_ascend 导入失败"; exit 1; }
   [ $((TRAIN_BSZ * SAMPLE_N % (NNODES * CPN))) -eq 0 ] || { echo "ERROR: TRAIN_BSZ*SAMPLE_N % (NNODES*CPN=$((NNODES * CPN))) != 0"; exit 1; }
-  echo "[master] $MY_IP | chips=$ASCEND_RT_VISIBLE_DEVICES | nodes=$NNODES steps=$STEPS lr=$LR kl=$USE_KL bsz=${TRAIN_BSZ}x${SAMPLE_N}"
+  echo "[master] $MY_IP | chips=$ASCEND_RT_VISIBLE_DEVICES | nodes=$NNODES steps=$STEPS lr=$LR kl=$USE_KL bsz=${TRAIN_BSZ}x${SAMPLE_N} util=$ROLLOUT_GPU_MEM_UTIL offload=$PARAM_OFFLOAD/$OPTIMIZER_OFFLOAD/$OFFLOAD_POLICY"
   for p in "VLLM::" "ray::" "vllm serve"; do pkill -9 -f "$p" 2>/dev/null || true; done
   sleep 5; ray stop --force >/dev/null 2>&1 || true
   ray start --head --port="$RAY_PORT" --node-ip-address="$MY_IP" --disable-usage-stats
@@ -159,19 +189,27 @@ if [ "$MODE" = "master" ]; then
   bash examples/grpo_trainer/run_deepseek_v41_top64_grpo_fsdp_turbo_npu.sh \
       trainer.total_training_steps="${STEPS}" \
       data.max_response_length=${MAX_RESPONSE_LEN:-1024} \
+      actor_rollout_ref.actor.fsdp_config.param_offload=${PARAM_OFFLOAD} \
+      actor_rollout_ref.actor.fsdp_config.optimizer_offload=${OPTIMIZER_OFFLOAD} \
+      actor_rollout_ref.actor.fsdp_config.offload_policy=${OFFLOAD_POLICY} \
+      "${REF_OFFLOAD_ARGS[@]}" \
       +actor_rollout_ref.actor.fsdp_config.turbo_config.memory.recompute=true \
       '+actor_rollout_ref.actor.fsdp_config.turbo_config.memory.recompute_plan=["model.layers.{*}.ffn"]' \
       algorithm.rollout_correction.rollout_is=${ROLLOUT_IS:-null} \
       2>&1 | tee "${RUN_LOG}"
 elif [ "$MODE" = "single" ]; then
   STEPS=${2:-50}
-  echo "[single] $MY_IP | chips=$ASCEND_RT_VISIBLE_DEVICES | steps=$STEPS lr=$LR kl=$USE_KL bsz=${TRAIN_BSZ}x${SAMPLE_N}"
+  echo "[single] $MY_IP | chips=$ASCEND_RT_VISIBLE_DEVICES | steps=$STEPS lr=$LR kl=$USE_KL bsz=${TRAIN_BSZ}x${SAMPLE_N} util=$ROLLOUT_GPU_MEM_UTIL offload=$PARAM_OFFLOAD/$OPTIMIZER_OFFLOAD/$OFFLOAD_POLICY"
   for p in "VLLM::" "ray::" "vllm serve"; do pkill -9 -f "$p" 2>/dev/null || true; done
   sleep 5; ray stop --force >/dev/null 2>&1 || true
   cd "$MIRROR_ROOT/verl"
   bash examples/grpo_trainer/run_deepseek_v41_top64_grpo_fsdp_turbo_npu.sh \
       trainer.total_training_steps="${STEPS}" \
       data.max_response_length=${MAX_RESPONSE_LEN:-1024} \
+      actor_rollout_ref.actor.fsdp_config.param_offload=${PARAM_OFFLOAD} \
+      actor_rollout_ref.actor.fsdp_config.optimizer_offload=${OPTIMIZER_OFFLOAD} \
+      actor_rollout_ref.actor.fsdp_config.offload_policy=${OFFLOAD_POLICY} \
+      "${REF_OFFLOAD_ARGS[@]}" \
       +actor_rollout_ref.actor.fsdp_config.turbo_config.memory.recompute=true \
       '+actor_rollout_ref.actor.fsdp_config.turbo_config.memory.recompute_plan=["model.layers.{*}.ffn"]' \
       algorithm.rollout_correction.rollout_is=${ROLLOUT_IS:-null} \

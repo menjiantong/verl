@@ -51,7 +51,16 @@ export MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-1152} MAX_RESPONSE_LEN=${MAX_RESPONSE_LE
 # above 0.3*total, so vLLM raised "No available memory for the cache blocks".
 # 0.6 leaves ~39 GiB/rank for weights+KV; the actor is CPU-offloaded while the
 # engine runs (colocated), so physical HBM stays within budget.
-export ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.6}
+# [2026-10-20] 0.6 -> 0.5：每卡省 ~6.4 GiB HBM。若 VL profile 仍报
+#   "No available memory for the cache blocks"，回调 0.55/0.6；纯文本模型 0.3 即可。
+export ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.5}
+# 全模型每 rank 参数+梯度+Adam ~88 GiB > 64 GB，offload 不能关：
+#   关掉会直接把 HBM 打爆；这里显式固定 True，避免从 example 继承的值被误改。
+# 要把 host (~1.1 TB) 真正降下来，需要减少专家副本（EP_SIZE=16 或 EFSDP_SIZE=2），
+#   而不是动这两个开关；EFSDP=2 会关闭 LOCAL_EXPERT_EXPORT，weight sync 会变慢。
+export PARAM_OFFLOAD=${PARAM_OFFLOAD:-True}
+export OPTIMIZER_OFFLOAD=${OPTIMIZER_OFFLOAD:-True}
+export OFFLOAD_POLICY=${OFFLOAD_POLICY:-True}
 # [2026-10-19 E05] This checkpoint is an unaligned base model: the official
 # thinking prompt (with the Reasoning Effort preamble) degenerates into
 # repetition loops in standalone vLLM, while chat mode answers simple counting
@@ -98,7 +107,7 @@ echo "[single] host=$(hostname) ip=$MY_IP chips=$ASCEND_RT_VISIBLE_DEVICES steps
 echo "[single] model=$MODEL_PATH"
 echo "[single] train=$TRAIN_FILE"
 echo "[single] vision=$VERL_DSV41_VISION freeze=$VERL_DSV41_VISION_FREEZE agent=$AGENT_LOOP thinking=$ENABLE_THINKING"
-echo "[single] bsz=${TRAIN_BSZ}x${SAMPLE_N} lr=$LR kl=$USE_KL prompt=$MAX_PROMPT_LEN response=$MAX_RESPONSE_LEN util=$ROLLOUT_GPU_MEM_UTIL"
+echo "[single] bsz=${TRAIN_BSZ}x${SAMPLE_N} lr=$LR kl=$USE_KL prompt=$MAX_PROMPT_LEN response=$MAX_RESPONSE_LEN util=$ROLLOUT_GPU_MEM_UTIL offload=$PARAM_OFFLOAD/$OPTIMIZER_OFFLOAD/$OFFLOAD_POLICY"
 
 for p in "VLLM::" "ray::" "vllm serve"; do pkill -9 -f "$p" 2>/dev/null || true; done
 sleep 5
@@ -109,6 +118,9 @@ bash examples/grpo_trainer/run_deepseek_v41_top64_grpo_fsdp_turbo_npu.sh \
     trainer.total_training_steps="${STEPS}" \
     data.max_prompt_length="${MAX_PROMPT_LEN}" \
     data.max_response_length="${MAX_RESPONSE_LEN}" \
+    actor_rollout_ref.actor.fsdp_config.param_offload=${PARAM_OFFLOAD} \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=${OPTIMIZER_OFFLOAD} \
+    actor_rollout_ref.actor.fsdp_config.offload_policy=${OFFLOAD_POLICY} \
     data.filter_overlong_prompts=True \
     data.truncation=error \
     +actor_rollout_ref.actor.fsdp_config.turbo_config.memory.recompute=true \
