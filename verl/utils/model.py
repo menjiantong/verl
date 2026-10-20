@@ -833,6 +833,12 @@ def extract_multi_modal_inputs(
             # some multi-modal keys with variable length are put in non-tensor batch,
             # so we need to pad them manually.
             multi_modal_inputs[key] = _pad_last_dim_and_cat(values, key)
+        elif not all(isinstance(value, torch.Tensor) for value in values):
+            # [2026-10-19 countbenchqa VL] Object-valued features such as
+            # DeepSeek-V4.1's per-image patch records are consumed as a list of
+            # per-sample lists (the model iterates ``images[batch][image]``);
+            # they are not stackable tensors.
+            multi_modal_inputs[key] = values
         else:
             try:
                 multi_modal_inputs[key] = torch.cat(values, dim=0)

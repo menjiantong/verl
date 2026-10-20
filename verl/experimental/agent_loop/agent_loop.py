@@ -100,6 +100,10 @@ class AgentLoopOutput(BaseModel):
     """Routed experts for the total tokens."""
     multi_modal_data: Optional[dict[str, Any]] = None
     """Multi-modal data for multi-modal tools."""
+    multi_modal_inputs: Optional[dict[str, Any]] = None
+    """Trainer-side multimodal inputs computed by the loop (e.g. DeepSeek-V4.1
+    ``token_types`` plus per-sample image records). ``AgentLoopWorker`` uses
+    these verbatim when present instead of re-deriving them from decoded text."""
     reward_score: Optional[float] = None
     """Reward score for the trajectory."""
     num_turns: int = 0
@@ -867,6 +871,14 @@ class AgentLoopWorker:
 
     def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
         """Compute multi-modal inputs with image, video and audio."""
+        # [2026-10-19 countbenchqa VL] A loop that already produced the
+        # trainer-side expanded token stream (DeepSeek-V4.1 vision) hands it
+        # over in ``output.multi_modal_inputs``.  Pad/align it to the run's
+        # fixed sequence length; the engine trims to each micro-batch.
+        stored = getattr(output, "multi_modal_inputs", None) or {}
+        if "token_types" in stored and "images" in stored:
+            return self._align_precomputed_multi_modal_inputs(stored, input_ids)
+
         multi_modal_inputs = {}
         if self.processor is None:
             return multi_modal_inputs
@@ -916,6 +928,41 @@ class AgentLoopWorker:
             images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
             multi_modal_inputs["images_seqlens"] = images_seqlens
         return multi_modal_inputs
+
+    def _align_precomputed_multi_modal_inputs(self, stored, input_ids) -> dict[str, torch.Tensor]:
+        """Align a loop-provided expanded VL token stream to the training batch.
+
+        ``stored["token_types"]`` covers the expanded prompt and
+        ``stored["images"]`` is the sample's list of image records.  The
+        TransferQueue path hands over an unpadded 1-D ``[prompt+response]``
+        tensor; the padded path hands over a left-padded
+        ``[1, prompt_length+response_length]`` tensor.  token_types are emitted
+        at the run's fixed maximum length so samples stack, and the engine trims
+        them to each micro-batch's own sequence length.
+        """
+        from dataclasses import replace
+
+        token_types = stored["token_types"]
+        images = stored["images"]
+        prompt_types = token_types[0]
+        total = int(self.rollout_config.prompt_length) + int(self.rollout_config.response_length)
+        left_pad = 0
+        if input_ids.dim() != 1:
+            left_pad = int(self.rollout_config.prompt_length) - int(prompt_types.numel())
+            if left_pad < 0:
+                raise ValueError(
+                    f"Expanded prompt ({prompt_types.numel()} tokens) exceeds the padded prompt "
+                    f"length ({self.rollout_config.prompt_length})."
+                )
+        if left_pad + prompt_types.numel() > total:
+            raise ValueError(
+                f"token_types ({prompt_types.numel()} tokens) do not fit in the training "
+                f"sequence ({total} tokens, left_pad={left_pad})."
+            )
+        full = torch.full((1, total), -1, dtype=torch.long)
+        full[0, left_pad : left_pad + prompt_types.numel()] = prompt_types
+        shifted_images = [replace(image, start=image.start + left_pad) for image in images]
+        return {"token_types": full, "images": shifted_images}
 
     def _compute_position_ids(
         self,

@@ -162,6 +162,17 @@ FSDP_APPLY_MODULES='{model.embed:{},'\
 
 HOOK_MODULES="['model.layers.{*}']"
 
+# [2026-10-19 countbenchqa VL] The vision tower/aligner params are frozen by
+# the engine (VERL_DSV41_VISION_FREEZE=1) and kept out of FSDP: they are small
+# (~0.6 GB), replicated per rank, and never receive gradients. Leaving them in
+# the root FSDP group would shard/unshard them on every forward for no gain.
+VISION_FSDP_OVERRIDES=()
+if [ "${VERL_DSV41_VISION:-0}" = "1" ]; then
+    VISION_FSDP_OVERRIDES=(
+        "+actor_rollout_ref.actor.fsdp_config.turbo_config.distributed.fsdp_plan.ignored_modules=['model.vision','model.aligner']"
+    )
+fi
+
 # vLLM engine args that the V4.1 Ascend path needs (see scripts/run_vllm2.sh).
 # Set as individual overrides: hydra cannot parse a JSON blob containing `{}`.
 VLLM_ADDITIONAL_CONFIG_ROOT="+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config"
@@ -270,6 +281,7 @@ ACTOR=(
     actor_rollout_ref.actor.fsdp_config.offload_policy=True
     actor_rollout_ref.actor.fsdp_config.param_offload=True
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
+    "${VISION_FSDP_OVERRIDES[@]}"
 )
 
 REF=()
@@ -294,6 +306,7 @@ if [ "${USE_KL:-1}" = "1" ]; then REF=(
     actor_rollout_ref.ref.use_torch_compile=False
     actor_rollout_ref.ref.fsdp_config.offload_policy=True
     actor_rollout_ref.ref.fsdp_config.param_offload=True
+    "${VISION_FSDP_OVERRIDES[@]/actor\./ref.}"
 ); fi
 
 ROLLOUT=(

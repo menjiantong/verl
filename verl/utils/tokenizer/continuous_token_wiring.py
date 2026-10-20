@@ -36,7 +36,7 @@ from .continuous_token import (
     QwenVLContinuousTokenBuilder,
     VLContinuousTokenBuilder,
 )
-from .deepseek import DeepSeekV4ContinuousTokenBuilder
+from .deepseek import DeepSeekV4ContinuousTokenBuilder, DeepSeekV41VLContinuousTokenBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,7 @@ class ContinuousTokenModelFamily(str, Enum):
     GLM4V = "glm4v"
     DEEPSEEK_VL2 = "deepseekvl2"
     DEEPSEEKV4 = "deepseekv4"
+    DEEPSEEKV41_VL = "deepseekv41vl"
 
 
 _CONTINUOUS_TOKEN_BUILDER_REGISTRY: dict[ContinuousTokenModelFamily, type[Any]] = {
@@ -101,6 +102,7 @@ _CONTINUOUS_TOKEN_BUILDER_REGISTRY: dict[ContinuousTokenModelFamily, type[Any]] 
     ContinuousTokenModelFamily.GLM4V: GLM46VContinuousTokenBuilder,
     ContinuousTokenModelFamily.DEEPSEEK_VL2: DeepSeekVL2ContinuousTokenBuilder,
     ContinuousTokenModelFamily.DEEPSEEKV4: DeepSeekV4ContinuousTokenBuilder,
+    ContinuousTokenModelFamily.DEEPSEEKV41_VL: DeepSeekV41VLContinuousTokenBuilder,
 }
 
 CONTINUOUS_TOKEN_BUILDER_FAMILIES = tuple(family.value for family in _CONTINUOUS_TOKEN_BUILDER_REGISTRY)
@@ -152,6 +154,9 @@ _TEXT_TO_VL_FAMILY: dict[ContinuousTokenModelFamily, ContinuousTokenModelFamily]
     ContinuousTokenModelFamily.DEFAULT: ContinuousTokenModelFamily.VL_DEFAULT,
     ContinuousTokenModelFamily.GEMMA4: ContinuousTokenModelFamily.GEMMA4_VL,
     ContinuousTokenModelFamily.QWEN35: ContinuousTokenModelFamily.QWEN3_VL,
+    # [2026-10-19 countbenchqa] deepseek_v41 resolves to the text family; a
+    # multimodal processor upgrades it to the compact-placeholder VL builder.
+    ContinuousTokenModelFamily.DEEPSEEKV4: ContinuousTokenModelFamily.DEEPSEEKV41_VL,
 }
 
 

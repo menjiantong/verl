@@ -64,6 +64,37 @@ logger = logging.getLogger(__name__)
 _EXPERT_WEIGHT_PATTERN = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w1|w2|w3)\.weight$")
 # The adapter wraps the backbone as ``self.model``, the checkpoint names the backbone.
 _MODEL_PREFIX = "model."
+
+
+def _normalize_dsv41_images(images):
+    """Rehydrate DeepSeek-V4.1 ``ImageInput`` records that crossed a boundary as dicts.
+
+    Pydantic's ``model_dump`` (``AgentLoopOutput.as_dict``) and the
+    TransferQueue's object serialization can turn the dataclass image records
+    into plain dicts.  The model's ``merge_image_embeddings`` indexes
+    ``img.patches``/``img.types``, so rebuild the dataclass here (and restore
+    the bf16 patch dtype) instead of failing at the first training forward.
+    """
+    from fsdp_turbo.models.deepseek_v41.image_processor import ImageInput
+
+    normalized = []
+    for sample in images:
+        records = []
+        for image in sample or ():
+            if isinstance(image, dict):
+                records.append(
+                    ImageInput(
+                        start=int(image["start"]),
+                        patches=torch.as_tensor(image["patches"]).to(torch.bfloat16),
+                        n_vit_h=int(image["n_vit_h"]),
+                        n_vit_w=int(image["n_vit_w"]),
+                        types=torch.as_tensor(image["types"], dtype=torch.long),
+                    )
+                )
+            else:
+                records.append(image)
+        normalized.append(records)
+    return normalized
 # Host-offload Engram table suffix (both Engram layers, ``layers.{1,14}.engram.embed``).
 _ENGRAM_EMBED_SUFFIX = ".engram.embed.weight"
 # Fused (stacked) routed-expert parameters: the checkpoint stores one tensor per expert
@@ -921,6 +952,22 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
                 "DeepSeek-V4.1 training does not support packed (remove-padding) inputs; "
                 "set actor_rollout_ref.model.use_remove_padding=False."
             )
+        # [2026-10-19 countbenchqa VL] The agent loop stores token_types at the
+        # run's maximum prompt+response length; the engine re-pads each
+        # micro-batch to its own longest valid sequence, so align here.
+        images = model_inputs.get("images")
+        if images is not None:
+            model_inputs["images"] = _normalize_dsv41_images(images)
+        token_types = model_inputs.get("token_types")
+        input_ids = model_inputs.get("input_ids")
+        if token_types is not None and input_ids is not None:
+            seq_len = int(input_ids.shape[1])
+            if token_types.shape[1] < seq_len:
+                padding = token_types.new_full(
+                    (token_types.shape[0], seq_len - token_types.shape[1]), -1
+                )
+                token_types = torch.cat([token_types, padding], dim=1)
+            model_inputs["token_types"] = token_types[:, :seq_len]
         return model_inputs, output_args
 
     def _build_dsv41_module(self):
@@ -937,6 +984,7 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
         # over the EP mesh by FSDP-Turbo's ``pre_fsdp_hook``; this engine loads each
         # rank's row range from the checkpoint afterwards (see
         # :meth:`_load_host_engram_tables`).
+        vision_enabled = os.environ.get("VERL_DSV41_VISION", "0") == "1"
         training_model = build_deepseek_v41_model(
             tokenizer=self.model_config.tokenizer,
             engram_meta_init=True,
@@ -946,9 +994,30 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
             # materializes each rank's shard.
             experts_meta_init=True,
             config_path=_config_path_from_model_path(self._dsv41_model_path()),
+            include_vision=vision_enabled,
             max_seq_len=self._dsv41_max_seq_len(),
             max_batch_size=self._dsv41_max_batch_size(),
         )
+        if vision_enabled:
+            # [2026-10-19 countbenchqa VL] The vision tower/aligner and the three
+            # image-span delimiter vectors are not part of the FSDP plan (the
+            # text-only plan leaves them replicated). Freeze them: replicated
+            # parameters would otherwise accumulate per-rank gradients that no
+            # FSDP collective reduces, and RL on counting benefits from a stable
+            # visual encoder. The weight sync still exports them, so the vLLM
+            # engine receives the same values it was loaded with.
+            frozen = 0
+            if os.environ.get("VERL_DSV41_VISION_FREEZE", "1") == "1":
+                for name, parameter in training_model.named_parameters():
+                    if name.startswith(
+                        ("model.vision.", "model.aligner.", "model.image_start",
+                         "model.image_end", "model.image_newline")
+                    ):
+                        parameter.requires_grad_(False)
+                        frozen += 1
+                _log_rank0("vision tower enabled: %d parameters frozen", frozen)
+            else:
+                _log_rank0("vision tower enabled: parameters remain trainable (not FSDP-managed!)")
         initialize_deepseek_v41_model(training_model)
         training_model = prepare_deepseek_v41_model_for_fsdp(
             training_model,

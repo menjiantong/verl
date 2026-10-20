@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -21,6 +22,8 @@ from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_auto_config_with_vllm_fallback, get_generation_config, update_model_config
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["HFModelConfig", "MtpConfig"]
 
@@ -187,6 +190,25 @@ class HFModelConfig(BaseConfig):
             trust_remote_code=self.trust_remote_code,
             attn_implementation=attn_implementation,
         )
+
+        # [2026-10-19 countbenchqa VL] The DeepSeek-V4.1 vision checkpoints ship no
+        # HF ProcessorMixin (image preprocessing is plain functions in the official
+        # repo), so hf_processor() above returns None and RLHFDataset cannot place
+        # image spans.  Build the reference-backed processor here; it renders the
+        # V4 template and expands <｜deepseek_image｜> exactly like vLLM does.
+        if (
+            self.processor is None
+            and getattr(self.hf_config, "model_type", None) == "deepseek_v41"
+            and getattr(self.hf_config, "vision_n_layers", 0) > 0
+        ):
+            from verl.utils.tokenizer.deepseek_v41_vl import build_deepseek_v41_vl_processor
+
+            self.processor = build_deepseek_v41_vl_processor(self.tokenizer, self.local_hf_config_path)
+            logger.info(
+                "Built DeepSeek-V4.1 VL processor (vision_n_layers=%d, image_token_id=%d)",
+                self.hf_config.vision_n_layers,
+                self.processor.image_token_id,
+            )
 
         override_config_kwargs = {}
 

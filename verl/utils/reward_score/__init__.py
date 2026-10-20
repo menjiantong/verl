@@ -94,6 +94,13 @@ def default_compute_score(
         from . import geo3k
 
         res = geo3k.compute_score(solution_str, ground_truth)
+    elif data_source in ["countbenchqa_lite", "countbenchqa"]:
+        # [2026-10-19 countbenchqa RL] V4.1 think/boxed format; see
+        # verl/utils/reward_score/countbenchqa.py and
+        # wiki/worklog_dsv41_2nodes_countbenchqa_rl_1019.md.
+        from . import countbenchqa
+
+        res = countbenchqa.compute_score(solution_str, ground_truth)
     elif data_source in [
         "searchR1_nq",
         "searchR1_triviaqa",
