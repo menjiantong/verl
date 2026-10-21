@@ -1438,6 +1438,19 @@ class PPOTrainer(ABC):
 
     def _fetch_one_gen_batch(self) -> TensorDict:
         """Fetch one ``gen_batch_size`` chunk from the dataloader."""
+        _rewind_after = int(os.environ.get("VERL_DSV41_REWIND_AFTER_STEP", "0") or 0)
+        if (
+            _rewind_after
+            and self.global_steps == _rewind_after + 1
+            and not getattr(self, "_dsv41_rewound", False)
+        ):
+            self.train_dataloader_it = None
+            self._dsv41_rewound = True
+            logger.warning(
+                "VERL_DSV41_REWIND_AFTER_STEP=%s: rewinding dataloader at step %s",
+                _rewind_after,
+                self.global_steps,
+            )
         try:
             if self.train_dataloader_it is None:
                 self.train_dataloader_it = iter(self.train_dataloader)

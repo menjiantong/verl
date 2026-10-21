@@ -759,9 +759,15 @@ class vLLMHttpServer:
                     sp2 = SamplingParams(max_tokens=1, prompt_logprobs=0)
                     if getattr(sampling_params, "temperature", None) is not None:
                         sp2.temperature = sampling_params.temperature
+                    rescore_kwargs = {
+                        "prompt_token_ids": full_ids,
+                        "multi_modal_data": multi_modal_data,
+                    }
+                    if mm_processor_kwargs:
+                        rescore_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
                     res2 = None
                     async for out2 in self.engine.generate(
-                        prompt=TokensPrompt(prompt_token_ids=full_ids),
+                        prompt=TokensPrompt(**rescore_kwargs),
                         sampling_params=sp2,
                         request_id=f"{request_id}_plp",
                     ):
@@ -769,14 +775,20 @@ class vLLMHttpServer:
                     plp = getattr(res2, "prompt_logprobs", None)
                     vals = []
                     if plp is not None:
-                        start = len(prompt_ids)
-                        for j in range(start, start + len(token_ids)):
-                            entry = plp[j] if j < len(plp) else None
-                            lp = entry.get(full_ids[j]) if entry else None
-                            if lp is None:
-                                vals = []
-                                break
-                            vals.append(float(lp.logprob))
+                        # prompt_logprobs is aligned with the *processed* prompt. For VLM
+                        # the image placeholder expands to a span, so response position
+                        # zero is len(plp) - len(token_ids), not len(prompt_ids).
+                        start = len(plp) - len(token_ids)
+                        if start < 0:
+                            vals = []
+                        else:
+                            for offset, tok in enumerate(token_ids):
+                                entry = plp[start + offset] if start + offset < len(plp) else None
+                                lp = entry.get(tok) if entry else None
+                                if lp is None:
+                                    vals = []
+                                    break
+                                vals.append(float(lp.logprob))
                     global _PLP_DEBUG_DONE
                     if not _PLP_DEBUG_DONE:
                         _PLP_DEBUG_DONE = True

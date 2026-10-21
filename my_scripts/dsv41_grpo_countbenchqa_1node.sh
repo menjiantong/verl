@@ -36,7 +36,7 @@ RAY_PORT=${RAY_PORT:-6390}
 
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
 export NNODES=1 NDEVICES_PER_NODE=16 FSDP_SIZE=16 EP_SIZE=8 EFSDP_SIZE=1 TP_SIZE=1
-export GEN_TP=8 GEN_DP=2 GEN_EP=16
+export GEN_TP=8 GEN_DP=${GEN_DP:-2} GEN_EP=${GEN_EP:-16}
 
 export EXPERIMENT_NAME=${EXPERIMENT_NAME:-GRPO-DeepSeekV41-countbenchqa-$(date +%m%d-%H%M)}
 export MODEL_PATH=${MODEL_PATH:-/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-top32-bf16-noengram}
@@ -111,7 +111,7 @@ echo "[single] bsz=${TRAIN_BSZ}x${SAMPLE_N} lr=$LR kl=$USE_KL prompt=$MAX_PROMPT
 
 for p in "VLLM::" "ray::" "vllm serve"; do pkill -9 -f "$p" 2>/dev/null || true; done
 sleep 5
-ray stop --force >/dev/null 2>&1 || true
+timeout 30 ray stop --force >/dev/null 2>&1 || true
 
 cd "$MIRROR_ROOT/verl"
 bash examples/grpo_trainer/run_deepseek_v41_top64_grpo_fsdp_turbo_npu.sh \
@@ -129,4 +129,5 @@ bash examples/grpo_trainer/run_deepseek_v41_top64_grpo_fsdp_turbo_npu.sh \
     +data.apply_chat_template_kwargs.enable_thinking="${ENABLE_THINKING}" \
     trainer.v1.sampler.sync_refill_failed_groups=True \
     algorithm.rollout_correction.rollout_is=${ROLLOUT_IS:-null} \
+    actor_rollout_ref.rollout.logprobs_mode=${LOGPROBS_MODE:-processed_logprobs} \
     2>&1 | tee "${RUN_LOG}"

@@ -106,6 +106,13 @@ def parse_args():
                              "stream left-padded to (pad + len) with an attention mask -- the layout "
                              "verl's padded batch path produces -- and log the next-token logprob "
                              "difference against the unpadded (engine-layout) run. Empty = off.")
+    parser.add_argument("--mask-probe", action="store_true",
+                        help="Run the unpadded token stream with an all-ones attention_mask (the "
+                        "production micro-batch path) and compare against attention_mask=None.")
+    parser.add_argument("--autocast-probe", action="store_true",
+                        help="Run the unpadded forward under torch.autocast(npu, bf16), as the "
+                        "production old_log_prob forward_step does, and compare to the plain "
+                        "forward.")
     return parser.parse_args()
 
 
@@ -489,6 +496,7 @@ def main():
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+    vlm_fixture = args.fixture.endswith(".pt")
     model = build_deepseek_v41_model(
         tokenizer=tokenizer,
         engram_meta_init=True,
@@ -499,6 +507,7 @@ def main():
         experts_meta_init=True,
         config_path=args.model_path,
         max_seq_len=args.max_seq_len,
+        include_vision=vlm_fixture,
     )
     initialize_deepseek_v41_model(model)
     model = prepare_deepseek_v41_model_for_fsdp(model, device=device, parameter_dtype=torch.bfloat16)
@@ -558,10 +567,20 @@ def main():
         log(f"checkpoint buffer {name}: dtype={buffer.dtype} shape={tuple(buffer.shape)} "
             f"sha1={buffer_fingerprint(buffer)} first={[round(x, 7) for x in buffer.detach().float().flatten()[:4].tolist()]}")
 
-    with open(args.fixture) as f:
-        fixture = json.load(f)
-    want = {int(x) for x in args.lengths.split(",") if x} or None
-    samples = [s for s in fixture["samples"] if want is None or s["target_len"] in want]
+    if vlm_fixture:
+        payload = torch.load(args.fixture, map_location="cpu", weights_only=False)
+        samples = [{
+            "target_len": int(payload["input_ids"].shape[1]),
+            "input_ids": payload["input_ids"][0].tolist(),
+            "token_types": payload["token_types"][0].tolist(),
+            "images": payload["images"],
+        }]
+        want = None
+    else:
+        with open(args.fixture) as f:
+            fixture = json.load(f)
+        want = {int(x) for x in args.lengths.split(",") if x} or None
+        samples = [s for s in fixture["samples"] if want is None or s["target_len"] in want]
 
     model.eval()
     out_dir = Path(args.out_dir)
@@ -580,9 +599,15 @@ def main():
             print("[dump-trainer] using fp32 eager attention", flush=True)
         install_attention_op_hooks(torch, stage_sink, args.max_elements)
         handles = install_hooks(model, torch, args.max_elements, stage_sink)
+        model_kwargs = {}
+        if "token_types" in sample:
+            model_kwargs["token_types"] = torch.tensor(
+                [sample["token_types"]], dtype=torch.long, device=device
+            )
+            model_kwargs["images"] = sample["images"]
         try:
             with torch.no_grad():
-                output = model(input_ids=input_ids, attention_mask=attention_mask)
+                output = model(input_ids=input_ids, attention_mask=attention_mask, **model_kwargs)
         finally:
             for handle in handles:
                 handle.remove()
@@ -677,18 +702,82 @@ def main():
         # This probe measures that effect on its own: run the identical token stream twice, once
         # unpadded (engine layout) and once left-padded with an attention mask (trainer layout),
         # and compare the next-token logprobs of the real tokens.
+        real = input_ids.shape[1]
+        if args.autocast_probe:
+            for name, buffer in model.named_buffers():
+                if name.endswith("kv_cache"):
+                    buffer.zero_()
+            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                out_ac = model(input_ids=input_ids)
+            lp_ac = torch.log_softmax(out_ac.logits.float(), dim=-1)
+            nxt_ac = lp_ac[0, :-1].gather(
+                -1, input_ids[0, 1:].unsqueeze(-1)
+            ).squeeze(-1)
+            d = next_logprobs - nxt_ac[: real - 1]
+            dp = (next_logprobs.exp() - nxt_ac[: real - 1].exp()).abs()
+            if rank == 0:
+                torch.save(
+                    {"input_ids": input_ids[0].cpu(), "next_logprobs": nxt_ac.float().cpu()},
+                    Path(args.out_dir) / "autocast_next_logprobs.pt",
+                )
+                log(
+                    f"AUTOCAST-PROBE len={real} bf16 autocast vs plain: "
+                    f"dlogp mean={d.mean():+.4f} std={d.std():.4f} med|d|={d.abs().median():.4f} "
+                    f"p99={d.abs().quantile(0.99):.4f} max={d.abs().max():.4f} "
+                    f"|d|>0.5={(d.abs() > 0.5).float().mean() * 100:.1f}% "
+                    f"dp mean={dp.mean():.5f} med={dp.median():.5f} p99={dp.quantile(0.99):.4f}"
+                )
+            dist.barrier()
+        if args.mask_probe:
+            for name, buffer in model.named_buffers():
+                if name.endswith("kv_cache"):
+                    buffer.zero_()
+            mask_all = torch.ones_like(input_ids)
+            with torch.no_grad():
+                out_mask = model(input_ids=input_ids, attention_mask=mask_all)
+            lp_mask = torch.log_softmax(out_mask.logits.float(), dim=-1)
+            nxt_mask = lp_mask[0, :-1].gather(
+                -1, input_ids[0, 1:].unsqueeze(-1)
+            ).squeeze(-1)
+            d = next_logprobs - nxt_mask[: real - 1]
+            dp = (next_logprobs.exp() - nxt_mask[: real - 1].exp()).abs()
+            if rank == 0:
+                log(
+                    f"MASK-PROBE len={real} all-ones mask vs none: "
+                    f"dlogp mean={d.mean():+.4f} std={d.std():.4f} med|d|={d.abs().median():.4f} "
+                    f"p99={d.abs().quantile(0.99):.4f} max={d.abs().max():.4f} "
+                    f"|d|>0.5={(d.abs() > 0.5).float().mean() * 100:.1f}% "
+                    f"dp mean={dp.mean():.5f} med={dp.median():.5f} p99={dp.quantile(0.99):.4f}"
+                )
+            dist.barrier()
         for pad in args.padding_probe:
-            real = input_ids.shape[1]
-            padded_ids = torch.cat(
-                [torch.full((1, pad), 0, dtype=torch.long, device=device), input_ids], dim=1
-            )
-            padded_mask = torch.cat(
-                [
-                    torch.zeros(1, pad, dtype=torch.long, device=device),
-                    torch.ones(1, real, dtype=torch.long, device=device),
-                ],
-                dim=1,
-            )
+            if pad >= 0:
+                padded_ids = torch.cat(
+                    [torch.full((1, pad), 0, dtype=torch.long, device=device), input_ids], dim=1
+                )
+                padded_mask = torch.cat(
+                    [
+                        torch.zeros(1, pad, dtype=torch.long, device=device),
+                        torch.ones(1, real, dtype=torch.long, device=device),
+                    ],
+                    dim=1,
+                )
+                offset = pad
+                side = "left"
+            else:
+                rpad = -pad
+                padded_ids = torch.cat(
+                    [input_ids, torch.full((1, rpad), 0, dtype=torch.long, device=device)], dim=1
+                )
+                padded_mask = torch.cat(
+                    [
+                        torch.ones(1, real, dtype=torch.long, device=device),
+                        torch.zeros(1, rpad, dtype=torch.long, device=device),
+                    ],
+                    dim=1,
+                )
+                offset = 0
+                side = "right"
             for name, buffer in model.named_buffers():
                 if name.endswith("kv_cache"):
                     buffer.zero_()
@@ -698,15 +787,17 @@ def main():
             nxt_padded = lp_padded[0, :-1].gather(
                 -1, padded_ids[0, 1:].unsqueeze(-1)
             ).squeeze(-1)
-            # the real token at padded column `pad + t` is predicted by column `pad + t - 1`
-            b = nxt_padded[pad : pad + real - 1]
+            # the real token at padded column `offset + t` is predicted by column `offset + t - 1`
+            b = nxt_padded[offset : offset + real - 1]
             d = next_logprobs - b
+            dp = (next_logprobs.exp() - b.exp()).abs()
             if rank == 0:
                 log(
-                    f"PADDING-PROBE len={real} pad={pad} (parity {'even' if pad % 2 == 0 else 'odd'}): "
+                    f"PADDING-PROBE len={real} side={side} pad={abs(pad)}: "
                     f"dlogp mean={d.mean():+.4f} std={d.std():.4f} med|d|={d.abs().median():.4f} "
                     f"p99={d.abs().quantile(0.99):.4f} max={d.abs().max():.4f} "
-                    f"|d|>0.5={(d.abs() > 0.5).float().mean() * 100:.1f}%"
+                    f"|d|>0.5={(d.abs() > 0.5).float().mean() * 100:.1f}% "
+                    f"dp mean={dp.mean():.5f} med={dp.median():.5f} p99={dp.quantile(0.99):.4f}"
                 )
             dist.barrier()
         # The ring buffers (window/compress KV) must start clean for the next sample, the way a
