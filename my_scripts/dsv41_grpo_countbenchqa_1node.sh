@@ -130,4 +130,5 @@ bash examples/grpo_trainer/run_deepseek_v41_top64_grpo_fsdp_turbo_npu.sh \
     trainer.v1.sampler.sync_refill_failed_groups=True \
     algorithm.rollout_correction.rollout_is=${ROLLOUT_IS:-null} \
     actor_rollout_ref.rollout.logprobs_mode=${LOGPROBS_MODE:-processed_logprobs} \
+    ${TRAIN_EXTRA_ARGS:-} \
     2>&1 | tee "${RUN_LOG}"

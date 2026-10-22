@@ -89,3 +89,34 @@ def compute_score(
         "expected": expected,
         "boxed": boxed,
     }
+
+
+if __name__ == '__main__':
+    import json
+    # 替换为你的 jsonl 文件路径
+    file_path = "infer_rollout_top16_se_32.jsonl"
+
+    data = []
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            # 去除行尾的换行符并跳过空行
+            line = line.strip()
+            if line:
+                item = json.loads(line)
+                data.append(item)
+                # 你可以在这里直接处理单行数据，例如：print(item['name'])
+
+    # 查看读取到的前 2 条数据
+    print(f"共读取了 {len(data)} 条数据")
+    for d in data:
+        print('----------begin--------------')
+        # print(d)
+        
+        # if (d['index'] == 22):
+        print(d['index'])
+        print(d['answer'])
+        print(d['prediction'])
+        print('---------output end---------------')
+        print(compute_score(d['prediction'], d['answer']))
+        # else:
+        #     print(compute_score(d['prediction'], d['answer']))
