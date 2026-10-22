@@ -355,3 +355,302 @@ ETA：前两步平均 (495+459)/2 ≈ 477s/step，500 step 约 **66 小时**（�
    长跑应禁用 AdamWSwap（只保留 expandable_segments）；若仍 ~0.0105，则差异来自 25 段节点/驱动，
    需要换节点或按节点重新标定。
 3. A/B 通过后再启动 500 step 长跑；因为 `save_freq=-1`，本次 56 step 无法续跑，只能从 step0 重来。
+
+## 12. `_launch_baseline_prof_1022.sh` 审查（2026-10-22）
+
+结论：**既不是 W2 长跑，也不是原始 perf baseline，而是两者混合**。
+性能优化确实已删除；但 W2 的任务配置没有搬全，且 `TRAIN_EXTRA_ARGS` 未被转发，
+脚本里的 `load_format=auto` / `total_epochs=1000` 实际不生效。
+
+### 12.1 实际生效的配置
+
+入口：`dsv41-verl-copy/verl/my_scripts/dsv41_grpo_2node_new.sh single`
+→ `examples/grpo_trainer/run_deepseek_v41_top64_grpo_fsdp_turbo_npu.sh`
+
+- 数据：**GSM8K** `gsm8k_main_train_rl.parquet`（7473 行），不是 countbenchqa。
+- 模型：noengram（launcher 覆盖，OK）。
+- 拓扑：GEN_TP=8（example 默认）×GEN_DP=1×GEN_EP=8；FSDP16/EP8/EFSDP1/TP1（OK）。
+- batch：8×8（OK）；KL=0（OK）；rollout util=0.6（OK）。
+- prompt/response：**1024/512**（example 默认 1024；W2 是 1152/512）。
+- 无 vision、无 agent loop、thinking 未设置、无 `VERL_DSV41_VISION(_FREEZE)`。
+- `save_freq=-1` / `test_freq=-1`（example 硬编码，OK）。
+- `load_format`：默认 `dummy`；脚本写的 `auto` 没传进去。
+- `total_epochs`：example 硬编码 1；脚本写的 1000 没传进去。
+- 性能优化：没有 `expandable_segments`、没有 `AdamWSwap`/`optimizer_impl`、
+  没有 `optimizer_offload=False`（已删干净）。
+
+### 12.2 关键断点：`TRAIN_EXTRA_ARGS` 没人接收
+
+- W2 base `dsv41_grpo_countbenchqa_1node.sh:133` 有 `${TRAIN_EXTRA_ARGS:-}`。
+- `dsv41_grpo_2node_new.sh` 和 example 脚本中 `TRAIN_EXTRA_ARGS` 均 **0 处引用**。
+- 因此 launcher 里的 `trainer.total_epochs=1000`、`actor_rollout_ref.rollout.load_format=auto`
+  都是空操作。GSM8K 7473//8=934 step/epoch，跑 500 step 时 epoch 上限不触发；
+  但换成 countbenchqa（450//8=56）会重演 56 step 停止；VLM 则会回到 dummy 加载。
+
+### 12.3 其他问题
+
+- `cd .../dsv41-verl-copy/verl/my_scripts`，但 base 脚本 `MIRROR_ROOT` 固定为
+  `/mnt/.../dsv41-verl`，实际代码/FSDPTurbo 走主树；两份 2node 脚本 md5 相同，
+  所以目前只影响 `RUN_LOG` 落点（主树 `verl/logs`）与外层 log（copy 树 `verl/logs`）。
+- 所有 profiler 参数被注释，`PROFILE_STEP`/`ANALYSIS`/`SAVE_PATH` 未设置；
+  脚本名仍是 `prof`，但不会产生 profile。
+- 顶部注释写 “GSM8K, KL=1, resp 1024, util=0.5”，实际 export 是 KL0/resp512/util0.6，
+  注释与代码不一致；原始 baseline log（`perf_profile_20261020_230432.outer.log:133`）
+  确实是 KL1/resp1024/util0.5 且 profiler 开启。
+- `MY_IP=80.5.25.119`：该地址在 50002 无监听（本会话不可达）；在别的节点直接跑会
+  因 HCCL_IF_IP 不匹配失败。需改成实际节点（如 25.120）或由 .119 本机执行。
+- 外层 `> "$LOG"` 没有 `2>&1`/nohup；长跑会占住终端，外层错误不进 log。
+
+### 12.4 建议
+
+- 若要 **W2 配置但不带性能优化**：用主树 `dsv41_grpo_countbenchqa_1node.sh`，
+  显式 `GEN_DP=1 GEN_EP=8 ROLLOUT_GPU_MEM_UTIL=0.6 USE_KL=0 MAX_RESPONSE_LEN=512`，
+  `TRAIN_EXTRA_ARGS="trainer.total_epochs=1000 actor_rollout_ref.rollout.load_format=auto"`；
+  不要 `ENABLE_ADAMW_SWAP`，不要 `PYTORCH_NPU_ALLOC_CONF=expandable_segments`。
+- 若要 **原始 perf baseline**：恢复 KL1/resp1024/util0.5 和 profiler 参数；
+  当前的 KL0/resp512/util0.6 已经改了 workload，不能和优化 run 直接 A/B。
+- 若坚持用 `_launch_baseline_prof_1022.sh`：先在 `dsv41_grpo_2node_new.sh` 的 single 分支
+  末尾加 `${TRAIN_EXTRA_ARGS:-}`，再补 countbenchqa/vision/agent/thinking/prompt1152，
+  并把 `MY_IP` 改成实际节点。
+
+## 13. W2 长跑脚本重写（基于 2node_new，2026-10-22）
+
+新增：`verl/my_scripts/_launch_W2_longrun_1022.sh`；本地副本
+`D:\remote_workplace\worklog\launch_W2_longrun_1022.sh`。
+
+基座：`my_scripts/dsv41_grpo_2node_new.sh single`。该基座已打两个补丁
+（备份 `dsv41_grpo_2node_new.sh.bak_20261022_w2_longrun`）：
+
+- master/single 的 hydra 命令末尾增加 `${TRAIN_EXTRA_ARGS:-}`，让额外覆盖真正透传；
+- `RUN_LOG` 改为 `${RUN_LOG:-...}`，允许外层脚本指定 inner log。
+
+W2 配置（全部显式）：
+
+- 数据：countbenchqa_lite train/val；模型：noengram。
+- 引擎：TP8×DP1×EP8（16 卡 2 replica）；训练：FSDP16/EP8/EFSDP1/TP1。
+- batch 8×8；prompt 1152 / response 512；LR 5e-6；KL0；rollout util 0.6。
+- vision=1/freeze=1；agent=`deepseek_v41_vl_single_turn`；thinking=false；
+  logprobs=`processed_logprobs`；save/test=-1；offload=True/True/True。
+- 无 `expandable_segments`、无 `AdamWSwap`/`optimizer_impl`/`optimizer_offload=False`。
+
+今天的问题修复：
+
+- `trainer.total_epochs=1000`：countbenchqa 450//8=56 步/epoch，默认 1 会停在第 56 步。
+- `actor_rollout_ref.rollout.load_format=auto`：VLM vision tower 必须从 checkpoint 读。
+- `TRAIN_EXTRA_ARGS` 从零构建，不再继承旧 shell 里可能残留的 AdamWSwap。
+- `MY_IP` 自动取本机 `80.5.25.x`，不再硬编码 `80.5.25.119`。
+- 外层/内层日志分离，`nohup` + `2>&1`，默认后台；启动前 `pgrep main_ppo` 防叠加。
+
+配置验证（只做 Hydra `--cfg job`，未训练）：
+
+```bash
+cd /mnt/share/m00899630/workspace/dsv41-verl/verl
+EXTRA_ARGS="--cfg job" DETACH=0 STEPS=1 \
+  bash my_scripts/_launch_W2_longrun_1022.sh
+```
+
+结果 `EXIT=0`，解析值：
+
+| 项 | 值 |
+|---|---|
+| `trainer.total_epochs` | **1000** |
+| `actor_rollout_ref.rollout.load_format` | **auto** |
+| `data.max_prompt_length` / `max_response_length` | **1152 / 512** |
+| `actor_rollout_ref.rollout.gpu_memory_utilization` | **0.6** |
+| `default_agent_loop` | `deepseek_v41_vl_single_turn` |
+| `enable_thinking` | `false` |
+| `logprobs_mode` | `processed_logprobs` |
+
+验证后无 `main_ppo`、无 Ray 残留。
+
+启动：
+
+```bash
+cd /mnt/share/m00899630/workspace/dsv41-verl/verl
+bash my_scripts/_launch_W2_longrun_1022.sh            # 500 步，后台
+STEPS=10 bash my_scripts/_launch_W2_longrun_1022.sh   # 10 步冒烟
+DRY_RUN=1 bash my_scripts/_launch_W2_longrun_1022.sh  # 只打印配置
+```
+
+日志：`verl/logs/W2_longrun_<TS>.outer.log` 与 `.inner.log`。
+
+### 13.1 与 W2 的逐项 diff
+
+用 W2 日志 `long_W2_20261021_000307.nohup.log:120` 的 `python3 -m verl.trainer.main_ppo`
+命令行，与新脚本 `--cfg job` 的命令行逐项比较（84 项 key）：
+
+**完全相同的部分**：数据、模型、TP8×DP1×EP8、FSDP16/EP8/EFSDP1/TP1、bsz8×8、
+prompt1152/response512、LR5e-6、KL0、util0.6、vision/freeze、agent loop、
+thinking=false、logprobs、offload、save/test、FFN recompute、`rollout_is=null`。
+
+**仅新脚本有**：
+
+- `actor_rollout_ref.rollout.load_format=auto`。W2 命令行没有这个覆盖，实际 vLLM
+  启动参数是 `--load_format dummy`（W2 日志第 1201 行）。这是 VLM vision tower
+  的加载差异，不只是性能差异；新脚本启动时会多读一遍完整 checkpoint。
+
+**有意不同**：
+
+- `trainer.total_epochs`：W2=1，新=1000。W2 因此在 450//8=56 步停；新脚本可跑满 500。
+- experiment name / `default_local_dir`：仅命名不同。
+
+**不是差异**：
+
+- `trainer.total_training_steps`：W2=500；新脚本实际启动 500，`--cfg job` 校验时用
+  `STEPS=1`，所以 diff 里显示 1，不代表正式运行值。
+
+**刚补上的差异**：
+
+- `trainer.v1.sampler.sync_refill_failed_groups`：W2 显式 True；2node example 默认
+  false。已在 wrapper 的 `TRAIN_EXTRA_ARGS` 补 `=True`，`--cfg job` 解析为 true。
+
+**非 hydra 配置差异**：
+
+- 节点：W2=80.5.21.104；新脚本自动检测 80.5.25.x（当前 80.5.25.120）。这是目前
+  一致性 56 step 差异（0.0105 vs 0.0071）最可疑的来源，尚未通过同节点 A/B 排除。
+- 基座：W2=`dsv41_grpo_countbenchqa_1node.sh`；新=`dsv41_grpo_2node_new.sh single`
+  + `TRAIN_EXTRA_ARGS`/`RUN_LOG` 补丁。解析后的 hydra 参数除上面几项外一致。
+- 性能优化：两边都没有 `expandable_segments` / `AdamWSwap`。
+
+### 13.2 简化版（2026-10-22 12:31，最终采用）
+
+按要求把 wrapper 简化到 42 行：
+
+- 直接 `cd /mnt/share/m00899630/workspace/dsv41-verl/verl`，不再动态算 ROOT；
+- 直接 `MY_IP=80.5.25.120`、`NIC=enp48s3u1u1`，删除 hostname/NIC 自动探测；
+- 只保留 W2 相对 base 默认值的 delta：model、countbenchqa 数据、prompt1152、response512、
+  KL0、util0.6、vision/freeze、experiment；拓扑、batch、LR、offload、save/test 全部
+  交给 `dsv41_grpo_2node_new.sh` 的默认值；
+- `TRAIN_EXTRA_ARGS` 保留 `total_epochs=1000`、`load_format=auto`、agent loop、
+  thinking=false、logprobs、`sync_refill_failed_groups=True`；
+- 删除 DETACH/FORCE/DRY_RUN/EXTRA_ARGS/pgrep 和长串 unset，只保留
+  `unset PYTORCH_NPU_ALLOC_CONF ENABLE_ADAMW_SWAP`；
+- 保留 base patch 检查：`grep -Fq '${TRAIN_EXTRA_ARGS:-}'`。
+
+`--cfg job` 重新校验通过：`total_epochs=1000`、`load_format=auto`、prompt1152、
+response512、util0.6、agent loop、thinking=false、logprobs=processed、
+`sync_refill_failed_groups=true`。与 W2 的 diff 仍只有 load_format / total_epochs /
+experiment 三类（`total_training_steps` 校验时为 1，正式运行为 500）。
+
+### 13.3 去重最终版（40 行）
+
+按“base 里已经完全相同的值不要重复”再删三项：
+
+- `NIC=enp48s3u1u1`：`dsv41_grpo_2node_new.sh:28` 的默认值就是它；
+- `VERL_DSV41_VISION_FREEZE=1`：`fsdp_turbo_dsv41_impl.py:1010` 的默认值就是 1；
+- `actor_rollout_ref.rollout.logprobs_mode=processed_logprobs`：rollout 配置默认就是
+  `processed_logprobs`（`rollout/rollout.yaml:93`）。
+
+最终 wrapper 为 40 行。`--cfg job` 重新校验仍为：`total_epochs=1000`、`load_format=auto`、
+prompt1152、response512、util0.6、agent loop、thinking=false、logprobs=processed（默认）、
+`sync_refill_failed_groups=true`。
+
+命令行 diff 里会看到 `ONLY_W2 logprobs_mode=processed_logprobs`，这是因为 W2 显式写了、
+新脚本靠默认值；解析后的实际值相同，不是行为差异。
+
+### 13.4 TRAIN_EXTRA_ARGS 逐行书写（44 行）
+
+为可读性，`TRAIN_EXTRA_ARGS` 改为反斜杠续行，每个 override 一行：
+
+```bash
+export TRAIN_EXTRA_ARGS="trainer.total_epochs=1000 \
+actor_rollout_ref.rollout.load_format=auto \
+actor_rollout_ref.rollout.agent.default_agent_loop=deepseek_v41_vl_single_turn \
++data.apply_chat_template_kwargs.enable_thinking=false \
+trainer.v1.sampler.sync_refill_failed_groups=True"
+```
+
+双引号内的 `\` 换行会被 shell 去掉，变量展开后仍是空格分隔的多个 hydra 参数；
+base 脚本的 `${TRAIN_EXTRA_ARGS:-}` 未加引号，能正常拆分。
+
+`--cfg job` 重新校验通过，解析值与 §13.3 完全一致：`total_epochs=1000`、
+`load_format=auto`、prompt1152、response512、util0.6、agent loop、thinking=false、
+logprobs=processed（默认）、`sync_refill_failed_groups=true`。
+
+### 13.5 前台输出修复（2026-10-22）
+
+现象：删除 `nohup` 后执行 `bash _launch_W2_longrun_1022.sh`，终端没有训练输出。
+
+原因：脚本最后一行仍是
+
+```bash
+bash "$BASE" single "$STEPS" > "$LOG" 2>&1 < /dev/null &
+```
+
+`&` 仍然把任务放到后台，`> "$LOG" 2>&1` 又把所有输出重定向到日志；
+删除 `nohup` 只是去掉了对 SIGHUP 的保护，并不会变成前台，反而更容易在
+shell/SSH 退出时被带走。最新一次后台尝试的日志停在
+`Failed to register worker to Raylet: IOError: Failed to read data from the socket: End of file`，
+之后没有 `main_ppo` 残留，和后台进程被挂断的现象一致。
+
+修复：
+
+```bash
+set -eo pipefail
+...
+bash "$BASE" single "$STEPS" 2>&1 | tee "$LOG"
+```
+
+- 前台运行，输出同时进终端和 `$LOG`；
+- base 自己的 `tee "$RUN_LOG"` 仍写 inner log；
+- 需要后台时在脚本外使用：
+  `nohup bash my_scripts/_launch_W2_longrun_1022.sh > /tmp/w2.out 2>&1 &`
+
+另外清理了编辑残留的单独 `nohup` 行，`bash -n` 通过。
+
+### 13.6 12:52 长跑失败：HCCL_SOCKET_IFNAME 被设成 IP（2026-10-22）
+
+日志：`verl/logs/W2_longrun_20261022_125210.outer.log`
+
+失败点：vLLM EngineCore 初始化，训练还没开始。
+
+根因：
+
+```text
+Config_Error_Invalid_Environment_Variable(EI0001):
+Value 80.5.25.120 for environment variable HCCL_SOCKET_IFNAME is invalid.
+```
+
+`dsv41_grpo_2node_new.sh:97` 是：
+
+```bash
+export GLOO_SOCKET_IFNAME=$NIC HCCL_SOCKET_IFNAME=$NIC HCCL_IF_IP=$MY_IP
+```
+
+仓库里没有任何脚本写 `NIC=80.5.25.120`（全文 grep 只在本工作记录里出现）。
+12:52 使用的 wrapper 在 12:36 的“去重”编辑中删掉了 `export NIC=enp48s3u1u1`，
+只保留 `MY_IP=80.5.25.120`；base 的 `NIC=${NIC:-enp48s3u1u1}` 只在 `NIC`
+未设置时生效，所以启动 shell 里已有的 `NIC`（值与 `MY_IP` 相同）被继承，
+最终导出成 `HCCL_SOCKET_IFNAME=80.5.25.120`。这不是仓库脚本写死的值。
+
+另外，报错里的 expect 文案 “an ip address that exists in the local network
+interfaces list” 来自 `libhccl_plf.so` 的 IP 校验分支；同文件里网卡名校验的
+文案是 “a valid network interface name (e.g., eth0, bound0) present on this
+host”。节点实际是 `.119` 时，`HCCL_IF_IP=80.5.25.120` 同样不成立。
+
+另一个不一致：
+
+- 脚本 `MY_IP` 是 `80.5.25.120`；
+- 日志里的 Ray actor 是 `ip=80.5.25.119`；
+- 也就是实际运行节点/容器是 `.119`，`HCCL_IF_IP=.120` 同样不对。
+
+修复：
+
+```bash
+export MY_IP=80.5.25.119     # 按实际节点；如果换到 .120 就改这里
+export NIC=enp48s3u1u1
+[ -d "/sys/class/net/$NIC" ] || { echo "NIC not found"; exit 1; }
+```
+
+修复后 base 会得到：
+
+```text
+GLOO_SOCKET_IFNAME=enp48s3u1u1
+HCCL_SOCKET_IFNAME=enp48s3u1u1
+HCCL_IF_IP=80.5.25.119
+```
+
+`createHCCLCommOrigin ... hcclGetRootInfo ... error code 6` 只是上层表现；
+真正根因是 `HCCL_SOCKET_IFNAME` 的变量值错误。日志里的 W2 参数
+（`total_epochs=1000`、`load_format=auto`、agent loop、sync_refill）都正确，
+失败与模型/训练配置无关。

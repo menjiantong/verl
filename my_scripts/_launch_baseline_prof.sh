@@ -50,5 +50,4 @@ mkdir -p "$SAVE_PATH" "$(dirname "$LOG")"
 echo "[baseline-prof] steps=$STEPS profile_step=$PROFILE_STEP analysis=$ANALYSIS"
 echo "[baseline-prof] save_path=$SAVE_PATH"
 echo "[baseline-prof] log=$LOG"
-nohup bash dsv41_grpo_1node_21.sh single "$STEPS" > "$LOG" 2>&1 < /dev/null &
-echo "launched pid $!"
+ bash dsv41_grpo_1node_21.sh single "$STEPS"

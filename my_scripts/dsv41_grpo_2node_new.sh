@@ -26,7 +26,7 @@ ulimit -n 1048576 2>/dev/null || ulimit -n 655350 2>/dev/null || true
 # 本机业务网卡 IP：默认从 hostname -I 里取 80.5.25.x 段（131 机=80.5.25.131，119 机=80.5.25.119），可用 MY_IP 覆盖
 MY_IP=${MY_IP:-$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -m1 '^80\.5\.25\.')}
 NIC=${NIC:-enp48s3u1u1}
-RUN_LOG="logs/grpo_top32_sft_steps${STEPS}_$(date +%Y%m%d_%H%M%S).log"
+RUN_LOG="${RUN_LOG:-logs/grpo_top32_sft_steps${STEPS}_$(date +%Y%m%d_%H%M%S).log}"
 
 
 RAY_PORT=${RAY_PORT:-6390}                                  # 避外部 GCS（F-77）
@@ -196,6 +196,7 @@ if [ "$MODE" = "master" ]; then
       +actor_rollout_ref.actor.fsdp_config.turbo_config.memory.recompute=true \
       '+actor_rollout_ref.actor.fsdp_config.turbo_config.memory.recompute_plan=["model.layers.{*}.ffn"]' \
       algorithm.rollout_correction.rollout_is=${ROLLOUT_IS:-null} \
+      ${TRAIN_EXTRA_ARGS:-} \
       2>&1 | tee "${RUN_LOG}"
 elif [ "$MODE" = "single" ]; then
   STEPS=${2:-50}
@@ -213,6 +214,7 @@ elif [ "$MODE" = "single" ]; then
       +actor_rollout_ref.actor.fsdp_config.turbo_config.memory.recompute=true \
       '+actor_rollout_ref.actor.fsdp_config.turbo_config.memory.recompute_plan=["model.layers.{*}.ffn"]' \
       algorithm.rollout_correction.rollout_is=${ROLLOUT_IS:-null} \
+      ${TRAIN_EXTRA_ARGS:-} \
       2>&1 | tee "${RUN_LOG}"
 elif [ "$MODE" = "join" ]; then
   # [2026-10-17 E42] 安全加入模式：有外部租户的机器（124/126 等）用它——只 ray start，绝不 pkill。
