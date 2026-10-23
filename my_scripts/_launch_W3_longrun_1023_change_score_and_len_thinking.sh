@@ -41,7 +41,7 @@ export EXPERIMENT_NAME=GRPO-DSV41-countbenchqa2-W3-longrun-${TS}
 export TRAIN_EXTRA_ARGS="trainer.total_epochs=1000 \
 actor_rollout_ref.rollout.load_format=auto \
 actor_rollout_ref.rollout.agent.default_agent_loop=deepseek_v41_vl_single_turn \
-+data.apply_chat_template_kwargs.enable_thinking=false \
++data.apply_chat_template_kwargs.enable_thinking=true \
 trainer.v1.sampler.sync_refill_failed_groups=True \
 reward.custom_reward_function.path=${MY_ENV_REWARD_FN_PATH} \
 reward.custom_reward_function.name=compute_score"
