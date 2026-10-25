@@ -14,14 +14,17 @@ LOG=logs/W3_longrun_${TS}.outer.log
 RUN_LOG="${RUN_LOG:-logs/W3_long_run_baseline${STEPS}_$(date +%Y%m%d_%H%M%S).log}"
 
 
-export MY_IP=80.5.25.119
+# [2026-10-23 task2] 允许外部覆盖节点；不设置时保持 119。
+export MY_IP=${MY_IP:-80.5.25.119}
 export NIC=enp48s3u1u1
 
 export MODEL_PATH=/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-top32-bf16-noengram
 export TRAIN_FILE=/mnt/share/m00899630/dsv41/rl_data/countbenchqa_lite_train.parquet
 export TEST_FILE=/mnt/share/m00899630/dsv41/rl_data/countbenchqa_lite_val.parquet
 export MAX_PROMPT_LEN=1152
-export MAX_RESPONSE_LEN=512
+# [2026-10-23 task2] 允许用 MY_ENV_MAX_RESPONSE_LEN 覆盖（默认 512，兼容旧用法）；
+# 任务二用它测试短 response（50）下 diff_mean 是否仍恶化。
+export MAX_RESPONSE_LEN=${MY_ENV_MAX_RESPONSE_LEN:-512}
 export USE_KL=0
 export ROLLOUT_GPU_MEM_UTIL=0.6
 export VERL_DSV41_VISION=1   # freeze defaults to 1 in fsdp_turbo_dsv41_impl.py

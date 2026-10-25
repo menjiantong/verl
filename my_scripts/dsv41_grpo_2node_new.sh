@@ -96,7 +96,10 @@ export VERL_DSV41_MOE_BF16=${VERL_DSV41_MOE_BF16:-0}
 
 export GLOO_SOCKET_IFNAME=$NIC HCCL_SOCKET_IFNAME=$NIC HCCL_IF_IP=$MY_IP
 export HCCL_CONNECT_TIMEOUT=1500 HCCL_EXEC_TIMEOUT=3600 HCCL_ASYNC_ERROR_HANDLING=0
-export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050 HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
+# [2026-10-25 全量模型] 16 rank/机 + FSDP128/EP64 的 comm 数比 top32 单机多，端口段从 50 放宽到
+# 150；engine server actor 在 vllm_async_server.py 里固定用 60200-60350/61200-61350，互不重叠
+# （10-19 v9 端口冲突证据见 worklog_dsv41_16nodes_1019.md 01:40）。
+export HCCL_HOST_SOCKET_PORT_RANGE=${MY_ENV_HCCL_HOST_RANGE:-60000-60150} HCCL_NPU_SOCKET_PORT_RANGE=${MY_ENV_HCCL_NPU_RANGE:-61000-61150}
 export VLLM_VERSION=0.30.0 HCCL_BUFFSIZE=1024 VLLM_USE_V2_MODEL_RUNNER=0
 export VLLM_ENGINE_READY_TIMEOUT_S=3600 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000
 export ASCEND_CONNECT_TIMEOUT=10000 ASCEND_TRANSFER_TIMEOUT=10000
@@ -153,14 +156,22 @@ else
   # 16 路专家分片，故每机训练内存不随 NNODES 变小）；引擎仍是"每机本地 TP8×DP2"一个副本。
   # ⚠️ bash 陷阱（E45）：同一行 export 里 FSDP_SIZE=$((NNODES * CPN)) 展开时 NNODES 尚未生效（=空→0）
   # → fully_shard_parallel_size=0 → FSDPTurbo get_last_mesh_dim 除零。必须分两行。
-  export NNODES=${NNODES:-2} NDEVICES_PER_NODE=${CPN} EP_SIZE=8 EFSDP_SIZE=${EFSDP_SIZE:-2} TP_SIZE=1
+  # [2026-10-25 全量模型 8/16 机] 允许 wrapper 用 MY_ENV_* 覆盖专家/引擎拓扑；不设置时
+  # 完全保持历史双机默认（EP8 / EFSDP2 / GEN_TP8 / GEN_DP=CPN/8 / GEN_EP=TP*DP）。
+  # EP64+EFSDP2 = 128 路专家分片，使 566B 去 engram 模型每 rank 只持 4.35B 参数
+  # （param+grad+Adam 约 70GB host），这是 2.4TB/节点能容纳全量模型的关键；推导见
+  # wiki/worklog_20261025_full_noengram_8_16node_fit.md。
+  export NNODES=${NNODES:-2} NDEVICES_PER_NODE=${CPN} EP_SIZE=${MY_ENV_EP_SIZE:-8} EFSDP_SIZE=${MY_ENV_EFSDP_SIZE:-${EFSDP_SIZE:-2}} TP_SIZE=1
   export FSDP_SIZE=$((NNODES * CPN))
-  export GEN_TP=${GEN_TP:-8}
+  export GEN_TP=${MY_ENV_GEN_TP:-${GEN_TP:-8}}
   # 引擎 DP = 每机本地 DP（CPN/TP）：每节点一个"§八 式 单机 DP2×TP8"引擎（表共享、start_rank=0、全本地），
   # 双机 = 2 个节点局部副本（verl 级 replica，每站一个 API server）。不要用"跨机 DP4 单引擎"
   # （vLLM hybrid-LB 会拒绝远端 headless：E22）。
-  export GEN_DP=${GEN_DP:-$((CPN / GEN_TP))}
-  export GEN_EP=${GEN_EP:-$((GEN_TP * GEN_DP))}
+  # [2026-10-25 全量模型] 允许 MY_ENV_GEN_DP=8 的跨机 DP（TP8×DP8=64 卡/replica）；
+  # 前提是 vllm_async_server.py 不再向非 headless 节点传 data_parallel_start_rank
+  # （E22 根因与修复见 worklog_20261025_full_noengram_8_16node_fit.md）。
+  export GEN_DP=${MY_ENV_GEN_DP:-${GEN_DP:-$((CPN / GEN_TP))}}
+  export GEN_EP=${MY_ENV_GEN_EP:-${GEN_EP:-$((GEN_TP * GEN_DP))}}
   export VLLM_ENGRAM_DP_SHARED_MEMORY=${VLLM_ENGRAM_DP_SHARED_MEMORY:-1}
 fi
 

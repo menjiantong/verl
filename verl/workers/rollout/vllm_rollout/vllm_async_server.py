@@ -413,7 +413,17 @@ class vLLMHttpServer:
             dp_args = {
                 "data_parallel_size": self.config.data_parallel_size,
                 "data_parallel_size_local": data_parallel_size_local,
-                "data_parallel_start_rank": self.node_rank * data_parallel_size_local,
+                # [2026-10-25 全量模型跨机 DP] 故意不传 data_parallel_start_rank。
+                # 证据：vLLM arg_utils.py 在 start_rank != None 且本节点非 headless 时，
+                # 会把 data_parallel_hybrid_lb 推断为 True（arg_utils.py:2265-2269，实测
+                # with_start_rank -> hybrid_lb=True）；而 v1/engine/utils.py:1266-1367 要求
+                # hybrid/external LB 模式下远端 engine 不能是 headless。verl 的
+                # RolloutReplica 对 node_rank>0 固定走 run_headless，于是必报
+                # "Remote engine N must not use --headless ..."（历史 E22）。
+                # 去掉该键后 dp_rank 仍由 node_rank 推断（arg_utils.py:2286，实测
+                # dp_rank=0），hybrid_lb=False，远端 headless 校验通过；单机 DP2
+                # （local==size）行为不变。跨机 DP 拓扑见
+                # wiki/worklog_20261025_full_noengram_8_16node_fit.md。
                 "data_parallel_address": self._master_address,
                 "data_parallel_rpc_port": self._dp_rpc_port,
             }
@@ -1462,6 +1472,17 @@ class vLLMReplica(RolloutReplica):
                     for k, v in os.environ.items()
                     if k.startswith(("VA_V41_", "VERL_DSV41_"))
                 },
+                # [2026-10-25 全量模型跨机 DP] trainer 与 engine 同卡不同进程，HCCL 端口段必须分离：
+                # 10-19 15 机全量模型 v9 实测 trainer FSDP all-gather 与 engine 初始化抢同一端口，
+                # 报 Communication_Error_Bind_IP_Port(EI0020)（worklog_dsv41_16nodes_1019.md 01:40）。
+                # trainer 段由 dsv41_grpo_2node_new.sh 设为 60000-60150/61000-61150；
+                # engine server actor 固定用 60200-60350/61200-61350，两者不重叠。
+                "HCCL_HOST_SOCKET_PORT_RANGE": os.environ.get(
+                    "MY_ENV_ENGINE_HCCL_HOST_RANGE", "60200-60350"
+                ),
+                "HCCL_NPU_SOCKET_PORT_RANGE": os.environ.get(
+                    "MY_ENV_ENGINE_HCCL_NPU_RANGE", "61200-61350"
+                ),
             }
 
             global _REPLICA_PROBE_DONE

@@ -15,7 +15,8 @@ RUN_LOG="${RUN_LOG:-logs/W3_long_run_countbenchqa2_2048_$(date +%Y%m%d_%H%M%S).l
 
 
 # [2026-10-23 W3] 本次长跑在 120 上启动（119 仍被 W2 遗留 vLLM 进程占用，避开）。
-export MY_IP=80.5.25.120
+# [2026-10-23 v2] 允许外部覆盖节点；不设置时保持 120，兼容旧用法。
+export MY_IP=${MY_IP:-80.5.25.120}
 export NIC=enp48s3u1u1
 
 export MODEL_PATH=/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-top32-bf16-noengram
@@ -25,7 +26,9 @@ export MAX_PROMPT_LEN=1152
 # [2026-10-23 W3] 按用户要求 response length 512 -> 2048；
 # max_model_len = max_prompt 1152 + max_response 2048 = 3200。
 # 新增可调项统一 MY_ENV_ 前缀，再映射到基座脚本读取的 MAX_RESPONSE_LEN。
-export MY_ENV_MAX_RESPONSE_LEN=2048
+# [2026-10-23 v1] 允许外部覆盖 response 长度：2048 在 16 卡单机 update 阶段 OOM，
+# v1 通过 MY_ENV_MAX_RESPONSE_LEN=1024 覆盖；不设置时保持原默认 2048，兼容旧用法。
+export MY_ENV_MAX_RESPONSE_LEN=${MY_ENV_MAX_RESPONSE_LEN:-2048}
 export MAX_RESPONSE_LEN=${MY_ENV_MAX_RESPONSE_LEN}
 # [2026-10-23 W3] 改用 countbenchqa2 打分器：严格解析 </think> 后的 response 通道，
 # 只认末尾 boxed 整数格式。通过 verl custom_reward_function 注入，不改 __init__.py

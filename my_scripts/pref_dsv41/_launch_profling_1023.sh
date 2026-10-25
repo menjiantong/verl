@@ -38,7 +38,7 @@ trainer.v1.sampler.sync_refill_failed_groups=True"
 STEPS=${STEPS:-3}
 PROFILE_STEP=${PROFILE_STEP:-2}
 ANALYSIS=${ANALYSIS:-True}
-SAVE_PATH=${SAVE_PATH:-/mnt/share/m00899630/workspace/dsv41-verl-copy/profiles/run_baseline_profile_${TS}}
+SAVE_PATH=${SAVE_PATH:-/mnt/share/m00899630/workspace/dsv41-verl/profiles/run_baseline_profile_${TS}}
 
 PROFILING_ARGS=""
 PROFILING_ARGS="${PROFILING_ARGS} global_profiler.tool=npu"
