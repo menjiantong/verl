@@ -19,10 +19,11 @@ from .agent_loop import (
     AgentLoopWorker,
     get_trajectory_info,
 )
+from .dsv41_vl_agent_loop import DeepSeekV41VLAgentLoop
 from .single_turn_agent_loop import SingleTurnAgentLoop
 from .tool_agent_loop import ToolAgentLoop
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop]
+_ = [SingleTurnAgentLoop, ToolAgentLoop, DeepSeekV41VLAgentLoop]
 
 __all__ = [
     "AgentLoopBase",

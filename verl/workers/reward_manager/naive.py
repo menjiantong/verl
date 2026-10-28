@@ -126,6 +126,16 @@ class NaiveRewardManager(AbstractRewardManager):
             extra_info["num_turns"] = num_turns
             extra_info["rollout_reward_scores"] = rollout_reward_scores
 
+            # [dsv41 2026-10-17] 打分合理性排查：按需 dump 逐样本 (prompt, response, gt, score)
+            import os as _os_rw
+            _dump = _os_rw.environ.get("VERL_REWARD_DUMP", "")
+            if _dump:
+                try:
+                    _os_rw.makedirs(_dump, exist_ok=True)
+                    _fp = _os_rw.path.join(_dump, f"rank{_os_rw.environ.get('RANK','x')}.jsonl")
+                    _n = sum(1 for _ in open(_fp)) if _os_rw.path.exists(_fp) else 0
+                except Exception:
+                    _fp = None
             try:
                 with _score_timeout(self.compute_score_timeout):
                     score = self.compute_score(
@@ -141,6 +151,22 @@ class NaiveRewardManager(AbstractRewardManager):
                     f"assigning reward 0.0 and continuing."
                 )
                 score = 0.0
+
+            if _dump and _fp is not None and _n < 400:
+                try:
+                    import json as _json
+                    with open(_fp, "a") as _f:
+                        _f.write(_json.dumps({
+                            "data_source": data_source,
+                            "gt": str(ground_truth),
+                            "response_len": int(valid_response_length),
+                            "score": float(score),
+                            "prompt_tail": prompt_str[-300:],
+                            "response_tail": response_str[-400:],
+                        }, ensure_ascii=False) + "\n")
+                    _n += 1
+                except Exception:
+                    pass
 
             if isinstance(score, dict):
                 reward = score["score"]

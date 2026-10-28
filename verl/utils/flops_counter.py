@@ -675,6 +675,59 @@ def _estimate_hy_v3_flops(config, tokens_sum, batch_seqlens, delta_time):
     return flops_achieved
 
 
+
+def _estimate_deepseek_v41_flops(config, tokens_sum, batch_seqlens, delta_time, **kargs):
+    """DeepSeek-V4.1 Flash (top32) training FLOPs.
+
+    Matches the actual trainable graph of the noengram checkpoint:
+      * 40 backbone layers, 32 routed experts x top-6 + 1 shared expert,
+        MoE intermediate 2304, hidden 5120, vocab 129280;
+      * MLA-style low-rank attention (q_lora 1280, head_dim 512, 64 heads,
+        o_groups 8 / o_lora 1024) -- linear terms are taken from the same
+        per-layer parameter shape formula as the checkpoint;
+      * Engram tables, MTP/nextn draft layers and the vision tower are NOT
+        part of the causal-LM training graph (config.engram_layer_ids=[],
+        adapter pins n_mtp_layers/dspark off, include_vision=False), so they
+        are excluded from the parameter count;
+      * core attention is the usual causal QK^T + AV term, capped by the
+        sparse-attention budget (index_topk + sliding window) because the
+        model does not attend to the full prefix when L exceeds that budget.
+    """
+    text = getattr(config, "text_config", None) or config
+    H = text.hidden_size
+    L = text.num_hidden_layers
+    V = text.vocab_size
+    M = text.moe_intermediate_size
+    E = text.n_routed_experts
+    K = text.num_experts_per_tok
+    S = getattr(text, "n_shared_experts", 1) or 1
+    NH = text.num_attention_heads
+    D = getattr(text, "head_dim", None) or (H // NH)
+    QL = getattr(text, "q_lora_rank", None) or 0
+    OG = getattr(text, "o_groups", 8) or 8
+    OL = getattr(text, "o_lora_rank", None) or 0
+    TOPK = getattr(text, "index_topk", None) or 0
+    WIN = getattr(text, "sliding_window", 0) or 0
+
+    # per-layer linear parameter count (embed/head handled separately)
+    attn_linear = QL * H + (NH * D) * QL + H * D + (OG * OL) * (OG * D) + H * (OG * OL)
+    gate = H * E
+    moe = (K + S) * 3 * H * M
+    dense_N = (attn_linear + gate + moe) * L + V * H * 2
+    dense_flops = 6.0 * dense_N * tokens_sum
+
+    # core attention: per-token causal QK^T + AV, capped by sparse budget
+    budget = TOPK + WIN if TOPK > 0 else 0
+    if budget > 0:
+        seq_len_sum = sum(float(x) * min(float(x), float(budget)) for x in batch_seqlens)
+    else:
+        seq_len_sum = sum(float(x) * float(x) for x in batch_seqlens)
+    attn_flops = 3.0 * seq_len_sum * (D + D) * NH * L
+
+    flops_all_token = dense_flops + attn_flops
+    return flops_all_token * (1.0 / delta_time) / 1e12
+
+
 ESTIMATE_FUNC = {
     "qwen2": _estimate_qwen2_flops,
     "llama": _estimate_qwen2_flops,
@@ -688,6 +741,7 @@ ESTIMATE_FUNC = {
     "qwen3_5": _estimate_qwen3_5_flops,
     "qwen3_5_moe": _estimate_qwen3_5_flops,
     "deepseek_v3": _estimate_deepseek_v3_flops,
+    "deepseek_v41": _estimate_deepseek_v41_flops,
     "minicpmv": _estimate_qwen2_flops,
     "minicpmo": _estimate_qwen2_flops,
     "mistral": _estimate_qwen2_flops,

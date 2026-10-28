@@ -372,22 +372,36 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
             hf_config_tokenizer_path = os.path.join(local_path, "huggingface")
             local_mkdir_safe(hf_config_tokenizer_path)
-            model_config = unwrap_model.config
-            generation_config = None
-            if unwrap_model.can_generate() and hasattr(model_config, "name_or_path") and model_config.name_or_path:
-                try:
-                    # Some model's name_or_path is empty if not initialized from pretrained,
-                    # in this cases, we don't save generation config.
-                    generation_config = GenerationConfig.from_pretrained(model_config.name_or_path)
-                    generation_config.save_pretrained(hf_config_tokenizer_path)
-                except Exception:
-                    # if the generation config isn't available, we don't save it
-                    pass
+            # [dsv41 2026-10-10] The DeepSeek-V4.1 adapter (FSDPDeepseekV41ForCausalLMAdapter) is
+            # not a PreTrainedModel: it exposes no HF-style `.config` and no `can_generate()`.
+            # The weight/optimizer shards themselves saved fine; only this metadata tail blew up
+            # (AttributeError 'no attribute config' after the 16 model shards were written).
+            # Guard it, keep the tokenizer copy, and leave an explicit log line.
+            model_config = getattr(unwrap_model, "config", None)
+            if model_config is not None:
+                generation_config = None
+                if unwrap_model.can_generate() and hasattr(model_config, "name_or_path") and model_config.name_or_path:
+                    try:
+                        # Some model's name_or_path is empty if not initialized from pretrained,
+                        # in this cases, we don't save generation config.
+                        generation_config = GenerationConfig.from_pretrained(model_config.name_or_path)
+                        generation_config.save_pretrained(hf_config_tokenizer_path)
+                    except Exception:
+                        # if the generation config isn't available, we don't save it
+                        pass
 
-            if hasattr(model_config, "auto_map") and None in model_config.auto_map:
-                model_config.auto_map = {k: v for k, v in model_config.auto_map.items() if k is not None}
+                if hasattr(model_config, "auto_map") and None in model_config.auto_map:
+                    model_config.auto_map = {k: v for k, v in model_config.auto_map.items() if k is not None}
 
-            model_config.save_pretrained(hf_config_tokenizer_path)
+                model_config.save_pretrained(hf_config_tokenizer_path)
+            else:
+                log_with_rank(
+                    "Model exposes no `.config` (dsv41 adapter): skipping HF config save; "
+                    "the original checkpoint directory remains the config source.",
+                    rank=self.rank,
+                    logger=logger,
+                    log_only_rank_0=True,
+                )
             if self.processing_class is not None:
                 self.processing_class.save_pretrained(hf_config_tokenizer_path)
             log_with_rank(

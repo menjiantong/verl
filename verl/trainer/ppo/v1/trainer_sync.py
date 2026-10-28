@@ -39,6 +39,12 @@ class PPOTrainerSync(PPOTrainer):
 
     def on_sample_end(self):
         # sleep all replicas to discard weights and kv cache
+        # [sleep-debug] temporary instrumentation, see wiki/worklog_dsv41_direct_shard_load.md
+        logger.warning(
+            "[sleep-debug] on_sample_end: entering, %d replica(s) in checkpoint_manager",
+            len(self.checkpoint_manager.replicas),
+        )
         self.checkpoint_manager.sleep_replicas()
+        logger.warning("[sleep-debug] on_sample_end: sleep_replicas returned")
         if self.curr_step_profile:
             self._stop_rollout_profiling()

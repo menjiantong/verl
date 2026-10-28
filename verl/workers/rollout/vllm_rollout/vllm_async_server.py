@@ -25,6 +25,10 @@ from typing import Any, Callable, Optional
 
 import ray
 import vllm.entrypoints.cli.serve
+
+_PLP_DEBUG_DONE = False
+_ENV_PROBE_DONE = False
+_REPLICA_PROBE_DONE = False
 from packaging import version
 from ray.actor import ActorHandle
 from vllm import SamplingParams
@@ -302,6 +306,24 @@ class vLLMHttpServer:
 
         quantization, hf_overrides = self._apply_quantization()
 
+        # Train-vs-inference consistency A/B (wiki/work_log/pearson_0999/).
+        # vLLM defaults the lm_head to the *model* dtype, i.e. bf16 here, so the engine's logits are
+        # bf16-rounded while the trainer's `ParallelHead` computes them in fp32 (it holds the head
+        # weight in fp32 and does `F.linear(x.float(), w.float())`). vLLM's own documentation for
+        # `ModelConfig.head_dtype` says the fp32 head "is required for RL training-inference
+        # consistency (the trainer computes logits in fp32)". `hf_overrides` is `config.update(...)`
+        # on the HF config, and `LogitsProcessor.__init__` reads `model_config.head_dtype` from it.
+        #
+        # RESULT (2026-09-27, real 4-layer weights, 8-card GRPO, 10 steps each): this made things
+        # *worse* -- the median relative error on high-probability tokens went 0.0049 -> 0.0126
+        # (2.5x) on every single step, pooled pearson 0.99464 -> 0.99403. The vLLM docstring's
+        # premise is "the trainer computes logits in fp32"; here
+        # `prepare_deepseek_v41_model_for_fsdp` normalises *every* floating parameter (including
+        # `ParallelHead.weight`) to bf16, so the engine's default bf16 lm_head is already the
+        # rounding-point match. Keep the default; leave this gate for the record.
+        if os.environ.get("VERL_DSV41_ALIGN_HEAD") == "1":
+            hf_overrides["head_dtype"] = "float32"
+
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):
             compilation_config = json.loads(compilation_config)
@@ -391,7 +413,17 @@ class vLLMHttpServer:
             dp_args = {
                 "data_parallel_size": self.config.data_parallel_size,
                 "data_parallel_size_local": data_parallel_size_local,
-                "data_parallel_start_rank": self.node_rank * data_parallel_size_local,
+                # [2026-10-25 全量模型跨机 DP] 故意不传 data_parallel_start_rank。
+                # 证据：vLLM arg_utils.py 在 start_rank != None 且本节点非 headless 时，
+                # 会把 data_parallel_hybrid_lb 推断为 True（arg_utils.py:2265-2269，实测
+                # with_start_rank -> hybrid_lb=True）；而 v1/engine/utils.py:1266-1367 要求
+                # hybrid/external LB 模式下远端 engine 不能是 headless。verl 的
+                # RolloutReplica 对 node_rank>0 固定走 run_headless，于是必报
+                # "Remote engine N must not use --headless ..."（历史 E22）。
+                # 去掉该键后 dp_rank 仍由 node_rank 推断（arg_utils.py:2286，实测
+                # dp_rank=0），hybrid_lb=False，远端 headless 校验通过；单机 DP2
+                # （local==size）行为不变。跨机 DP 拓扑见
+                # wiki/worklog_20261025_full_noengram_8_16node_fit.md。
                 "data_parallel_address": self._master_address,
                 "data_parallel_rpc_port": self._dp_rpc_port,
             }
@@ -570,6 +602,17 @@ class vLLMHttpServer:
         Args:
             kv_transfer_params: vLLM KV-transfer payload for PD requests.
         """
+        global _ENV_PROBE_DONE
+        if not _ENV_PROBE_DONE:
+            _ENV_PROBE_DONE = True
+            logger.warning(
+                "[VA_V41 env probe] PREFILL=%s EAGER=%s PARTIAL=%s AR=%s logprobs_req=%s",
+                os.environ.get("VA_V41_PREFILL_LOGPROBS"),
+                os.environ.get("VA_V41_ATTN_EAGER"),
+                os.environ.get("VA_V41_OPROJ_FP32_PARTIAL"),
+                os.environ.get("VA_V41_OPROJ_FP32_AR"),
+                sampling_params.get("logprobs") if isinstance(sampling_params, dict) else None,
+            )
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
             return await self._pd_dispatch(
                 prompt_ids,
@@ -712,6 +755,80 @@ class vLLMHttpServer:
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+            # [2026-10-13 task1 (C)] Optional prefill-mode logprobs for the response tokens.
+            # The decode-time values above sit on a different batching path than the trainer's
+            # full-sequence recompute (measured engine-internal decode-vs-prefill gap: most
+            # tokens ~0, a few ±0.04-0.065 nats -> 0.02-0.035 mean|d|, ~40-60% of the RL
+            # diff_mean). Re-running [prompt+response] as one prompt yields per-position
+            # logprobs computed in PREFILL -- the mode the trainer recompute uses -- so the
+            # consistency metric stops mixing decode with prefill. Env-gated; any failure
+            # keeps the decode values.
+            if os.environ.get("VA_V41_PREFILL_LOGPROBS", "0") == "1":
+                try:
+                    full_ids = list(prompt_ids) + list(token_ids)
+                    sp2 = SamplingParams(max_tokens=1, prompt_logprobs=0)
+                    if getattr(sampling_params, "temperature", None) is not None:
+                        sp2.temperature = sampling_params.temperature
+                    rescore_kwargs = {
+                        "prompt_token_ids": full_ids,
+                        "multi_modal_data": multi_modal_data,
+                    }
+                    if mm_processor_kwargs:
+                        rescore_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+                    res2 = None
+                    async for out2 in self.engine.generate(
+                        prompt=TokensPrompt(**rescore_kwargs),
+                        sampling_params=sp2,
+                        request_id=f"{request_id}_plp",
+                    ):
+                        res2 = out2
+                    plp = getattr(res2, "prompt_logprobs", None)
+                    vals = []
+                    if plp is not None:
+                        # prompt_logprobs is aligned with the *processed* prompt. For VLM
+                        # the image placeholder expands to a span, so response position
+                        # zero is len(plp) - len(token_ids), not len(prompt_ids).
+                        start = len(plp) - len(token_ids)
+                        if start < 0:
+                            vals = []
+                        else:
+                            for offset, tok in enumerate(token_ids):
+                                entry = plp[start + offset] if start + offset < len(plp) else None
+                                lp = entry.get(tok) if entry else None
+                                if lp is None:
+                                    vals = []
+                                    break
+                                vals.append(float(lp.logprob))
+                    global _PLP_DEBUG_DONE
+                    if not _PLP_DEBUG_DONE:
+                        _PLP_DEBUG_DONE = True
+                        logger.warning(
+                            "[VA_V41_PREFILL_LOGPROBS debug] req=%s prompt=%d resp=%d plp_type=%s "
+                            "plp_len=%s vals=%d nan=%d sample=%s",
+                            request_id,
+                            len(prompt_ids),
+                            len(token_ids),
+                            type(plp).__name__,
+                            len(plp) if plp is not None else None,
+                            len(vals),
+                            sum(1 for v in vals if v != v),
+                            [round(v, 4) for v in vals[:3]],
+                        )
+                    if len(vals) == len(token_ids) == len(log_probs):
+                        log_probs = vals
+                    else:
+                        logger.warning(
+                            "prefill logprob recompute produced %d/%d values for request %s; "
+                            "keeping decode-time logprobs.",
+                            len(vals),
+                            len(token_ids),
+                            request_id,
+                        )
+                except Exception:
+                    logger.exception(
+                        "prefill logprob recompute failed for request %s; keeping decode-time logprobs.",
+                        request_id,
+                    )
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
@@ -852,7 +969,20 @@ class vLLMHttpServer:
             logger.info("skip wake_up in standalone mode")
 
     async def sleep(self):
+        # [sleep-debug] temporary instrumentation, see wiki/worklog_dsv41_direct_shard_load.md
+        print(
+            f"[sleep-debug] server.sleep: node_rank={self.node_rank} free_cache_engine={self.config.free_cache_engine} mode={self.rollout_mode}",
+            flush=True,
+        )
+        logger.warning(
+            "[sleep-debug] server.sleep: node_rank=%s free_cache_engine=%s mode=%s",
+            self.node_rank,
+            self.config.free_cache_engine,
+            self.rollout_mode,
+        )
         if self.node_rank != 0 or not self.config.free_cache_engine:
+            print("[sleep-debug] server.sleep: skipped by gate", flush=True)
+            logger.warning("[sleep-debug] server.sleep: skipped by gate")
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
@@ -861,6 +991,8 @@ class vLLMHttpServer:
             await self.engine.sleep(level=1)
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
+        print("[sleep-debug] server.sleep: engine sleep call returned", flush=True)
+        logger.warning("[sleep-debug] server.sleep: engine sleep call returned")
 
     async def clear_kv_cache(self):
         if self.node_rank == 0:
@@ -1331,8 +1463,36 @@ class vLLMReplica(RolloutReplica):
             env_vars = {
                 **{var: "1" for var in get_platform().ray_noset_envvars()},
                 **get_platform().rollout_env_vars(),
+                # [2026-10-13 task1] Pass the consistency/experiment switches through
+                # explicitly: the server actor is created with this runtime_env whitelist,
+                # and the engine workers inherit from it. Without this, VA_V41_* /
+                # VERL_DSV41_* exported by the launcher never reach the engine.
+                **{
+                    k: v
+                    for k, v in os.environ.items()
+                    if k.startswith(("VA_V41_", "VERL_DSV41_"))
+                },
+                # [2026-10-25 全量模型跨机 DP] trainer 与 engine 同卡不同进程，HCCL 端口段必须分离：
+                # 10-19 15 机全量模型 v9 实测 trainer FSDP all-gather 与 engine 初始化抢同一端口，
+                # 报 Communication_Error_Bind_IP_Port(EI0020)（worklog_dsv41_16nodes_1019.md 01:40）。
+                # trainer 段由 dsv41_grpo_2node_new.sh 设为 60000-60150/61000-61150；
+                # engine server actor 固定用 60200-60350/61200-61350，两者不重叠。
+                "HCCL_HOST_SOCKET_PORT_RANGE": os.environ.get(
+                    "MY_ENV_ENGINE_HCCL_HOST_RANGE", "60200-60350"
+                ),
+                "HCCL_NPU_SOCKET_PORT_RANGE": os.environ.get(
+                    "MY_ENV_ENGINE_HCCL_NPU_RANGE", "61200-61350"
+                ),
             }
 
+            global _REPLICA_PROBE_DONE
+            if not _REPLICA_PROBE_DONE:
+                _REPLICA_PROBE_DONE = True
+                logger.warning(
+                    "[VA_V41 replica env probe] node_rank=%s passthrough=%s",
+                    node_rank,
+                    {k: v for k, v in env_vars.items() if k.startswith(("VA_V41_", "VERL_DSV41_"))},
+                )
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node_id,
@@ -1377,8 +1537,15 @@ class vLLMReplica(RolloutReplica):
     async def sleep(self):
         """Sleep each rollout server."""
         # Drain DP engines for safe sleep.
+        # [sleep-debug] temporary instrumentation, see wiki/worklog_dsv41_direct_shard_load.md
+        print("[sleep-debug] replica.sleep: draining requests", flush=True)
+        logger.warning("[sleep-debug] replica.sleep: draining requests")
         await self.servers[0].wait_for_requests_to_drain.remote()
+        print(f"[sleep-debug] replica.sleep: drained; sleeping {len(self.servers)} server(s)", flush=True)
+        logger.warning("[sleep-debug] replica.sleep: drained; sleeping %d server(s)", len(self.servers))
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
+        print("[sleep-debug] replica.sleep: all servers returned", flush=True)
+        logger.warning("[sleep-debug] replica.sleep: all servers returned")
 
     async def abort_all_requests(self) -> dict[str, Any]:
         """Abort all ongoing generation requests across all servers.

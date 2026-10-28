@@ -172,6 +172,9 @@ def main(config):
     """
     # Automatically set `config.trainer.device = npu` when running on Ascend NPU.
     auto_set_device(config)
+    print(f" ==================================================================================================== ",
+          f"test debug 1.0 end set device",
+          f" ==================================================================================================== ")
 
     # validate config
     validate_config(
@@ -179,6 +182,11 @@ def main(config):
         use_reference_policy=need_reference_policy(config),
         use_critic=need_critic(config),
     )
+
+    print(f" ==================================================================================================== ",
+        f"test debug 1.1 end validate_config",
+        f" ==================================================================================================== ")
+
 
     if config.trainer.use_v1:
         run_ppo(config, task_runner_class=TaskRunnerV1)
