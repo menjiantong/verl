@@ -19,6 +19,7 @@ Not recommended depending on vllm for this file.
 
 import logging
 import os
+import time
 from multiprocessing import shared_memory
 from typing import Callable, TypedDict
 
@@ -47,9 +48,54 @@ def rebuild_ipc(handle: tuple[Callable, tuple], device_id: int | None = None) ->
     if device_id is not None:
         # the key is to change device id to the current device id
         # in case two processes have different CUDA_VISIBLE_DEVICES
+        if len(list_args) < 7:
+            raise RuntimeError(
+                f"Weight handle from {getattr(func, '__qualname__', func)} carries only "
+                f"{len(list_args)} arguments, so it is not an accelerator IPC handle and its "
+                "device index cannot be patched. Handle-producing code must pass a tensor that "
+                f"already lives on the sender's device (see {_stage_on_device_for_ipc.__name__})."
+            )
         list_args[6] = device_id
     buffer = func(*list_args)
     return buffer
+
+
+def _stage_on_device_for_ipc(weight: torch.Tensor, name: str = "") -> torch.Tensor:
+    """Return ``weight`` as a tensor of the sender's accelerator device.
+
+    ``reduce_tensor`` only produces a device IPC handle for an accelerator-resident tensor. A
+    host tensor goes through the CPU reduction instead (``rebuild_tensor``, three arguments), and
+    :func:`rebuild_ipc` then dies with ``IndexError: list assignment index out of range`` in the
+    rollout worker -- observed on Ascend with ``offload_policy=True``, where the generic export
+    path hands over parameters that are not DTensors and therefore stay on the host. The receiver
+    copies the weight onto its own card anyway, so staging it here costs one host-to-device copy
+    and nothing else.
+    """
+    device_name = get_device_name()
+    if weight.device.type == device_name:
+        return weight
+    # Fail fast rather than OOM the card: a host tensor this code is asked to publish is only
+    # supposed to be a single weight (embed/head at ~1.2 GiB). Bigger means something upstream
+    # stopped excluding what it should have (a host-resident Engram table is 187 GiB) and the
+    # honest answer is an error naming the tensor, not a device allocation failure minutes later.
+    free_bytes, _ = get_torch_device().mem_get_info(get_device_id())
+    if weight.nbytes > free_bytes // 2:
+        raise RuntimeError(
+            f"Oversized weight {name or '<unnamed>'} ({weight.nbytes / 2**30:.1f} GiB) is on "
+            f"{weight.device} and would not fit in the {free_bytes / 2**30:.1f} GiB free on "
+            f"{device_name}:{get_device_id()}. This tensor should not be synced to the rollout "
+            "engine -- check the engine's export exclusions before assuming the transfer is broken."
+        )
+    staged = weight.to(f"{device_name}:{get_device_id()}")
+    # The handle is published to another process as soon as this returns, so the copy has to be
+    # complete, not merely enqueued.
+    get_torch_device().synchronize()
+    print(
+        f"[bucketed-sync] staged oversized weight {name or '<unnamed>'} "
+        f"{tuple(weight.shape)} {weight.dtype} from {weight.device} onto {device_name} for IPC",
+        flush=True,
+    )
+    return staged
 
 
 def create_shared_memory(size: int, name: str):
@@ -108,6 +154,31 @@ class BucketedWeightSender:
         """
         from verl.workers.rollout.utils import ensure_async_iterator
 
+        # Profiling hook (VERL_SYNC_PROFILE=1): attribute the sync time between producing a weight
+        # on the trainer side (all-gathers, per-expert contiguity copies), filling the bucket, and
+        # waiting for the receiver to load it. This is what identified the export as the sync's
+        # bottleneck (see wiki/worklog_dsv41_rl.md G13), so it stays available.
+        prof = (
+            {"export_s": 0.0, "flush_s": 0.0, "tensors": 0, "bytes": 0, "buckets": 0}
+            if os.environ.get("VERL_SYNC_PROFILE") == "1"
+            else None
+        )
+
+        async def produce(gen):
+            """Time spent *inside the generator* between two yields, i.e. the exporter's work."""
+            src = ensure_async_iterator(gen)
+            while True:
+                t0 = time.perf_counter()
+                try:
+                    name, weight = await src.__anext__()
+                except StopAsyncIteration:
+                    return
+                if prof is not None:
+                    prof["export_s"] += time.perf_counter() - t0
+                    prof["tensors"] += 1
+                    prof["bytes"] += weight.nbytes
+                yield name, weight
+
         try:
             self._init_socket()
             self._init_buffer()
@@ -116,7 +187,7 @@ class BucketedWeightSender:
             offset = 0
             bucket_meta: dict[str, TensorMetadata] = {}
             # dtype = PrecisionType.to_dtype(self.config.dtype)
-            async for name, weight in ensure_async_iterator(weights):
+            async for name, weight in (produce(weights) if prof is not None else ensure_async_iterator(weights)):
                 # model parameters are in fp32 full precision
                 # (vermouth1992) we should not force cast weight here because some parameters
                 # (such as moe gate) have to keep fp32 precision. If a weight is bf16 in the rollout side,
@@ -132,8 +203,12 @@ class BucketedWeightSender:
                 # fill the tensor bucket
                 if offset + weight.nbytes > self.bucket_size and len(bucket_meta) > 0:
                     get_torch_device().synchronize()
+                    t_flush = time.perf_counter()
                     self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
                     self.socket.recv()
+                    if prof is not None:
+                        prof["flush_s"] += time.perf_counter() - t_flush
+                        prof["buckets"] += 1
                     bucket_meta = {}
                     offset = 0
 
@@ -160,8 +235,18 @@ class BucketedWeightSender:
             # send the last bucket
             name = weight = None
             get_torch_device().synchronize()
+            t_flush = time.perf_counter()
             self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
             self.socket.recv()
+            if prof is not None:
+                prof["flush_s"] += time.perf_counter() - t_flush
+                prof["buckets"] += 1
+                print(
+                    f"SYNC-PROFILE sender: {prof['tensors']} tensors, "
+                    f"{prof['bytes'] / 2**30:.2f} GiB, {prof['buckets']} buckets | "
+                    f"export {prof['export_s']:.1f}s, flush(wait for receiver) {prof['flush_s']:.1f}s",
+                    flush=True,
+                )
         finally:
             self._cleanup()
 
@@ -224,7 +309,11 @@ class BucketedWeightSender:
         """Send a weight larger than the bucket size via cuda ipc or share memory."""
         logger.debug(f"Direct sending large weight {name}({weight.shape}, {weight.dtype})")
         # TODO: support fallback to shared memory
-        handle = reduce_tensor(weight)
+        # Keep the device-side tensor bound until the receiver acks: it is the object whose
+        # storage the peer is about to map, and the bucket path follows the same discipline
+        # (see _cleanup, which releases the buffer only after the ack).
+        staged = _stage_on_device_for_ipc(weight, name)
+        handle = reduce_tensor(staged)
         bucket_meta: dict[str, TensorMetadata] = {}
         bucket_meta[name] = {
             "name": name,
@@ -277,6 +366,13 @@ class BucketedWeightReceiver:
             (e.g. vLLM ``add_lora``, which takes one adapter dict per call) can
             defer their finalization until the whole adapter has arrived.
         """
+        # Profiling hook (VERL_SYNC_PROFILE=1): how much of each bucket's time is building the
+        # tensor views vs. the model's weight loaders (and the device sync after them).
+        prof = (
+            {"load_s": 0.0, "view_s": 0.0, "sync_s": 0.0, "buckets": 0, "tensors": 0}
+            if os.environ.get("VERL_SYNC_PROFILE") == "1"
+            else None
+        )
         try:
             self._init_socket()
             self._init_buffer()
@@ -285,6 +381,7 @@ class BucketedWeightReceiver:
             while True:
                 metadata = self.socket.recv_pyobj()
                 weights, tensor = [], None
+                t_view = time.perf_counter()
                 for name, meta in metadata["bucket_meta"].items():
                     shape, dtype, offset, handle = meta["shape"], meta["dtype"], meta["offset"], meta["handle"]
                     if handle is not None:
@@ -297,8 +394,16 @@ class BucketedWeightReceiver:
                         tensor = tensor.to(self.device)
                     weights.append((name, tensor))
                 is_last = metadata["is_last"]
+                t_load = time.perf_counter()
                 on_bucket_received(weights, is_last)
+                t_sync = time.perf_counter()
                 get_torch_device().synchronize()
+                if prof is not None:
+                    prof["view_s"] += t_load - t_view
+                    prof["load_s"] += t_sync - t_load
+                    prof["sync_s"] += time.perf_counter() - t_sync
+                    prof["buckets"] += 1
+                    prof["tensors"] += len(weights)
                 del weights, tensor
                 if not is_last:
                     self.socket.send(b"")
@@ -306,6 +411,13 @@ class BucketedWeightReceiver:
                     self._ack_pending = True
                     break
         finally:
+            if prof is not None:
+                print(
+                    f"SYNC-PROFILE receiver: {prof['buckets']} buckets, {prof['tensors']} tensors | "
+                    f"views {prof['view_s']:.1f}s, load {prof['load_s']:.1f}s, "
+                    f"device sync {prof['sync_s']:.1f}s",
+                    flush=True,
+                )
             self._cleanup()
 
     def _init_socket(self):

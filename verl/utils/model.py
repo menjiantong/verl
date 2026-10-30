@@ -85,13 +85,47 @@ def update_model_config(module_config, override_config_kwargs):
             setattr(module_config, key, val)
 
 
+def get_auto_config_with_vllm_fallback(model_name: str, trust_remote_code: bool = False, **kwargs):
+    """``AutoConfig.from_pretrained`` with a fallback to vLLM's config registry.
+
+    The DeepSeek-V4 family (``deepseek_v4``, ``deepseek_v41`` -- and the older
+    ``deepseek_v4.1`` spelling vllm-ascend used before vLLM v0.30 took the architecture
+    over) is not registered with transformers: the config classes live in vLLM's own
+    registry instead, so load them the way vLLM does. Anything else keeps the default
+    behavior.
+    """
+    try:
+        return AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code, **kwargs)
+    except ValueError as error:
+        lookup_error = error.__cause__ or error.__context__
+        if not isinstance(lookup_error, KeyError) or lookup_error.args not in (
+            ("deepseek_v4",),
+            ("deepseek_v4.1",),
+            ("deepseek_v4.1_text",),
+            ("deepseek_v41",),
+            ("deepseek_v41_text",),
+        ):
+            raise
+        try:
+            # noqa: F401 — importing applies the config-registry patch of the vllm-ascend
+            # build that carried the V4.1 configs itself (<= vLLM 0.27). With vLLM >= 0.30
+            # the module is gone and the registry entry ships upstream, so a failed import
+            # is expected and fine.
+            import vllm_ascend.patch.platform.patch_deepseek_v41_config
+        except ImportError:
+            pass
+        from vllm.transformers_utils.config import get_config
+
+        return get_config(model_name, trust_remote_code=trust_remote_code, **kwargs)
+
+
 def get_huggingface_actor_config(model_name: str, override_config_kwargs=None, trust_remote_code=False) -> dict:
     if override_config_kwargs is None:
         override_config_kwargs = {}
     assert isinstance(override_config_kwargs, dict), (
         f"override_config_kwargs must be a dict, got {type(override_config_kwargs)}"
     )
-    module_config = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    module_config = get_auto_config_with_vllm_fallback(model_name, trust_remote_code=trust_remote_code)
     update_model_config(module_config, override_config_kwargs)
 
     return module_config
@@ -799,6 +833,12 @@ def extract_multi_modal_inputs(
             # some multi-modal keys with variable length are put in non-tensor batch,
             # so we need to pad them manually.
             multi_modal_inputs[key] = _pad_last_dim_and_cat(values, key)
+        elif not all(isinstance(value, torch.Tensor) for value in values):
+            # [2026-10-19 countbenchqa VL] Object-valued features such as
+            # DeepSeek-V4.1's per-image patch records are consumed as a list of
+            # per-sample lists (the model iterates ``images[batch][image]``);
+            # they are not stackable tensors.
+            multi_modal_inputs[key] = values
         else:
             try:
                 multi_modal_inputs[key] = torch.cat(values, dim=0)

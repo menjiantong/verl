@@ -277,6 +277,17 @@ class Worker(WorkerHelper):
             # so we need to set local rank when the flag is set.
             device_name = get_resource_name()
             local_rank = ray.get_runtime_context().get_accelerator_ids()[device_name][0]
+            # Ray reports the accelerator *id* it assigned, which for Ascend NPUs is the entry
+            # of ASCEND_RT_VISIBLE_DEVICES itself (ray/_private/accelerators/npu.py splits the
+            # env var). E.g. with a skipped chip the visible list is "0,1,3,4,5,6,7,8" and the
+            # 8th worker's id is "8", but torch_npu.set_device() wants the *logical* index into
+            # that list (0..n-1; out-of-range ids abort with "Invalid device ID ... Expected
+            # value: [0, 8)"). Map the id back to its position: a no-op for the identity list
+            # "0,1,...,7" that every run used before 2026-10-08.
+            visible_env = "ASCEND_RT_VISIBLE_DEVICES" if device_name == "NPU" else "CUDA_VISIBLE_DEVICES"
+            entries = [e.strip() for e in os.environ.get(visible_env, "").split(",") if e.strip()]
+            if local_rank in entries:
+                local_rank = str(entries.index(local_rank))
             os.environ["LOCAL_RANK"] = local_rank
             get_torch_device().set_device(int(local_rank))
 

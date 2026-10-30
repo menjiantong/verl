@@ -375,3 +375,63 @@ class DeepSeekV4ContinuousTokenBuilder(ContinuousTokenBuilder):
             kind="context",
             inserted_token_ids=inserted_token_ids,
         )
+
+
+class DeepSeekV41VLContinuousTokenBuilder(DeepSeekV4ContinuousTokenBuilder):
+    """Vision-language rollout builder for DeepSeek-V4.1 checkpoints.
+
+    vLLM's ``DeepseekV4VLMultiModalProcessor`` replaces one image placeholder
+    token per image with the expanded image span.  The rollout prompt therefore
+    must stay compact: this builder renders the V4.1 role markers through the
+    VL processor's chat template (which emits ``<｜deepseek_image｜>`` for image
+    content parts) and tokenizes the result without expanding the spans.  The
+    agent loop expands ``prompt_ids`` afterwards, from the same reference
+    preprocessing, so the trainer sees the exact token stream vLLM generated
+    from.
+    """
+
+    @classmethod
+    def supports_multimodal(cls) -> bool:
+        return True
+
+    def __init__(self, tokenizer: Any, processor: Any, mm_processor_kwargs: dict | None = None, **kwargs: Any):
+        # ``mm_processor_kwargs`` is a factory-supplied multimodal knob; the
+        # image transform is fully determined by the checkpoint config here, so
+        # it is kept for interface compatibility only.
+        super().__init__(tokenizer, **kwargs)
+        self.processor = processor
+        self.mm_processor_kwargs = dict(mm_processor_kwargs or {})
+        self.image_token_id = int(getattr(processor, "image_token_id", 129264))
+
+    def build_initial_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        images: list[Any] | None = None,
+        videos: list[Any] | None = None,
+        audios: list[Any] | None = None,
+        mm_inputs_out: dict[str, Any] | None = None,
+    ) -> list[int]:
+        del videos, audios
+        rendered = self.processor.apply_chat_template(
+            messages,
+            tools=tools,
+            add_generation_prompt=True,
+            tokenize=False,
+            **self.chat_template_kwargs,
+        )
+        token_ids = normalize_token_ids(self.tokenizer.encode(rendered, add_special_tokens=False))
+        placeholder_count = sum(1 for token_id in token_ids if token_id == self.image_token_id)
+        image_count = len(images or [])
+        if placeholder_count != image_count:
+            raise ValueError(
+                f"DeepSeek-V4.1 VL prompt has {placeholder_count} image placeholders but "
+                f"{image_count} images were supplied."
+            )
+        if mm_inputs_out is not None:
+            # The agent loop expands the compact ids with the same reference
+            # preprocessing; hand it the rendered text so it does not have to
+            # re-render (and risk drifting from the rollout prompt).
+            mm_inputs_out["rendered_text"] = rendered
+        return token_ids

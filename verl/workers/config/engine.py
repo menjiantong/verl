@@ -303,7 +303,9 @@ class FSDPEngineConfig(EngineConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        assert self.strategy in ["fsdp", "fsdp2", "fsdp_turbo"], f"strategy {self.strategy} not supported"
+        assert self.strategy in ["fsdp", "fsdp2", "fsdp_turbo", "fsdp_turbo_dsv41"], (
+            f"strategy {self.strategy} not supported"
+        )
 
 
 @dataclass
