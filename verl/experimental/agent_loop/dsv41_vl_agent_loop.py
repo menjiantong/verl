@@ -140,7 +140,7 @@ class DeepSeekV41VLAgentLoop(SingleTurnAgentLoop):
 
     def _expand_prompt(self, rendered_text: str, images, compact_ids: list[int]):
         """Expand compact image placeholders with FSDPTurbo's reference preprocessing."""
-        from fsdp_turbo.models.deepseek_v41.image_processor import prepare_vl_inputs
+        from fsdp_turbo.models.deepseek.deepseek_v41.image_processor import prepare_vl_inputs
 
         image_list = list(images or [])
         tokens, token_types, image_inputs = prepare_vl_inputs(

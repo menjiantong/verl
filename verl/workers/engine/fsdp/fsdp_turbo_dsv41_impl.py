@@ -14,7 +14,7 @@
 
 """FSDP-Turbo engine for DeepSeek-V4.1 training models.
 
-DeepSeek-V4.1's trainable model lives in ``fsdp_turbo.models.deepseek_v41``
+DeepSeek-V4.1's trainable model lives in ``fsdp_turbo.models.deepseek.deepseek_v41``
 (``DeepseekV41ForCausalLMAdapter`` + the vendored reference architecture) and is
 *not* a transformers ``AutoModel`` class, so verl's generic ``_build_module``
 (HF ``from_pretrained``) cannot construct it. This engine builds the V4.1 adapter
@@ -75,7 +75,7 @@ def _normalize_dsv41_images(images):
     ``img.patches``/``img.types``, so rebuild the dataclass here (and restore
     the bf16 patch dtype) instead of failing at the first training forward.
     """
-    from fsdp_turbo.models.deepseek_v41.image_processor import ImageInput
+    from fsdp_turbo.models.deepseek.deepseek_v41.image_processor import ImageInput
 
     normalized = []
     for sample in images:
@@ -821,7 +821,7 @@ def _random_state_dict(
     param_meta: dict[str, tuple[tuple[int, ...], torch.dtype]]
 ) -> dict[str, torch.Tensor]:
     """Fallback initializer (``VERL_DSV41_RANDOM_INIT=1``): same recipe as
-    ``fsdp_turbo.models.deepseek_v41.initialize_deepseek_v41_model``, applied to the
+    ``fsdp_turbo.models.deepseek.deepseek_v41.initialize_deepseek_v41_model``, applied to the
     deferred expert tensors only. Lets the RL loop be brought up without checkpoint IO.
     """
     state_dict: dict[str, torch.Tensor] = {}
@@ -971,7 +971,7 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
         return model_inputs, output_args
 
     def _build_dsv41_module(self):
-        from fsdp_turbo.models.deepseek_v41 import (
+        from fsdp_turbo.models.deepseek.deepseek_v41 import (
             build_deepseek_v41_model,
             initialize_deepseek_v41_model,
             prepare_deepseek_v41_model_for_fsdp,
@@ -987,14 +987,17 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
         vision_enabled = os.environ.get("VERL_DSV41_VISION", "0") == "1"
         training_model = build_deepseek_v41_model(
             tokenizer=self.model_config.tokenizer,
-            engram_meta_init=True,
+            # [1030 rebase] 新 FSDPTurbo 的 host-offload engram 表默认在 meta 上构造，
+            # 原 engram_meta_init 形参已移除，保留会 TypeError。
             engram_storage_backend="host_offload",
             use_sparse_flash_attn=False,
             # The routed experts stay on meta until the checkpoint loader
             # materializes each rank's shard.
             experts_meta_init=True,
             config_path=_config_path_from_model_path(self._dsv41_model_path()),
-            include_vision=vision_enabled,
+            # [1030 rebase] 新 FSDPTurbo 由 config.json 的 vision_config 决定是否建视觉塔
+            # (ModelArgs.vision_enabled = vision_n_layers > 0)，不再接受 include_vision 形参。
+            # VERL_DSV41_VISION 仍控制 verl 侧冻结/FSDP 忽略项；本实验=1，与建塔一致。
             max_seq_len=self._dsv41_max_seq_len(),
             max_batch_size=self._dsv41_max_batch_size(),
         )

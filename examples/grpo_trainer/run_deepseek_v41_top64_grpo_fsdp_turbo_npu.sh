@@ -20,13 +20,17 @@
 #    80 s/sync on a 14 GB model -> ~900 s here). Validate it on step 1 via
 #    training/rollout_probs_diff_mean (~1e-2) and pearson (~0.99).
 #
+# [1030 rebase] 本脚本是 dsv41-verl-rebase 唯一的训练配置入口：
+#   128 单机 16 卡 / top32-bf16-noengram / countbenchqa_lite 长跑。
+#   启动：bash my_scripts/_launch_1030_dsv41_grpo.sh [STEPS]
+#
 set -xeuo pipefail
 
 ########################### user-adjustable ###########################
 DEVICE=${DEVICE:-$(python3 -c 'import torch_npu' 2>/dev/null && echo npu || echo gpu)}
 INFER_BACKEND=${INFER_BACKEND:-vllm}
 PROJECT_NAME=${PROJECT_NAME:-GRPO-DeepSeekV41}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-GRPO-DeepSeekV41-top64-8card}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-GRPO-DSV41-countbenchqa-longrun}
 
 NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-}
 NNODES=${NNODES:-1}
@@ -39,33 +43,36 @@ GEN_TP=${GEN_TP:-8}
 GEN_DP=${GEN_DP:-1}
 GEN_EP=${GEN_EP:-8}
 # FSDPTurbo topology (mirrors FSDPTurbo/examples/deepseek_v41/config2.yaml).
-FSDP_SIZE=${FSDP_SIZE:-8}
+FSDP_SIZE=${FSDP_SIZE:-16}
 TP_SIZE=${TP_SIZE:-1}
 EP_SIZE=${EP_SIZE:-8}
 EFSDP_SIZE=${EFSDP_SIZE:-1}
-ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.2}
+ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.6}
 
 # 默认用 SFT 热启动权重；top64-bf16 原始权重会 never-EOS（F-31）勿直接 RL
-MODEL_PATH=${MODEL_PATH:-"/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-top32-sft116"}
+MODEL_PATH=${MODEL_PATH:-"/mnt/share/m00899630/weights/DeepSeek-V4.1-Flash-top32-bf16-noengram"}
 # Released V4.1 checkpoints ship no chat template; this directory carries the same
 # tokenizer files plus the single-turn template (see scripts/make_dsv41_rl_tokenizer.py).
 # tokenizer.json is byte-identical to the checkpoint's, which matters more now: the Engram
 # token map is built from it and must agree with the engine's.
 TOKENIZER_PATH=${TOKENIZER_PATH:-"/mnt/share/m00899630/dsv41/rl_tokenizer"}
-TRAIN_FILE=${TRAIN_FILE:-"/mnt/share/m00899630/dsv41/rl_data/gsm8k_main_train_rl.parquet"}
-TEST_FILE=${TEST_FILE:-"/mnt/share/m00899630/dsv41/rl_data/gsm8k_main_test_rl.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"/mnt/share/m00899630/dsv41/rl_data/countbenchqa_lite_train.parquet"}
+TEST_FILE=${TEST_FILE:-"/mnt/share/m00899630/dsv41/rl_data/countbenchqa_lite_val.parquet"}
 CKPTS_DIR=${CKPTS_DIR:-"/mnt/share/m00899630/dsv41/ckpts/${PROJECT_NAME}/${EXPERIMENT_NAME}"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 
-MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-1024}
-MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN:-1024}
+MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-1152}
+MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN:-512}
 # Sizes the RoPE tables and the per-layer attention scratch caches in the training model;
 # must cover prompt+response (the checkpoint's own max_position_embeddings is 1M).
 export VERL_DSV41_MAX_SEQ_LEN=${VERL_DSV41_MAX_SEQ_LEN:-$((MAX_PROMPT_LEN + MAX_RESPONSE_LEN))}
-SAMPLE_N=${SAMPLE_N:-5}
+SAMPLE_N=${SAMPLE_N:-8}
 TRAIN_BSZ=${TRAIN_BSZ:-8}
 VAL_BSZ=${VAL_BSZ:-8}
+# [1030 longrun] KL 关闭：GRPO/DAPO 做法，同时跳过 ref worker（省一份 engram/优化器内存）。
+USE_KL=${USE_KL:-0}
+KL_COEF=${KL_COEF:-0.001}
 
 # Weight sync: stream only this rank's routed experts instead of all-gathering the packed
 # expert tensor on every rank (see wiki/worklog_dsv41_rl.md G13). Colocate pairs trainer
@@ -96,7 +103,7 @@ fi
 ########################### end user-adjustable ###########################
 
 ########################### derived defaults ###########################
-n_devices_per_node=${NDEVICES_PER_NODE:-8}
+n_devices_per_node=${NDEVICES_PER_NODE:-16}
 
 case "${DEVICE}" in
     gpu)
@@ -137,9 +144,8 @@ case "${DEVICE}" in
         ;;
 esac
 
-# This machine carries several checkouts of the same packages; pin the ones this
-# integration was verified against (see wiki/worklog_dsv41_rl.md §5).
-export PYTHONPATH="/workspace-verl/vllm:/workspace-verl/vllm-ascend-v41-private:/workspace-verl/FSDPTurbo:${PYTHONPATH:-}"
+# [1030 rebase] 依赖包路径（vllm/vllm-ascend/FSDPTurbo/verl）由启动脚本
+# my_scripts/1030_ray_dsv41_env.sh 统一导出；原 /workspace-verl 路径在本机不存在，删除。
 
 start_time=$(date +%Y%m%d)_$(date +%H%M%S)
 # Tag the log with the checkpoint it ran against (layer counts differ between runs).
@@ -239,6 +245,8 @@ DATA=(
     data.filter_overlong_prompts=True
     data.truncation='error'
     data.shuffle=False
+    # [1030 longrun] V4.1 单轮模板关闭 thinking（键不在默认配置中，用 + 追加）
+    +data.apply_chat_template_kwargs.enable_thinking=false
 )
 
 MODEL=(
@@ -258,8 +266,8 @@ ACTOR=(
     actor_rollout_ref.actor.ppo_mini_batch_size=${TRAIN_BSZ}
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
     # KL 由环境变量 USE_KL 控制（默认 1=开，low_var_kl/coef 0.001 作稳定锚；0=关并跳过 ref worker）
-    actor_rollout_ref.actor.use_kl_loss=$([ "${USE_KL:-1}" = "1" ] && echo True || echo False)
-    actor_rollout_ref.actor.kl_loss_coef=${KL_COEF:-0.001}
+    actor_rollout_ref.actor.use_kl_loss=$([ "${USE_KL}" = "1" ] && echo True || echo False)
+    actor_rollout_ref.actor.kl_loss_coef=${KL_COEF}
     actor_rollout_ref.actor.entropy_coeff=0
     actor_rollout_ref.actor.use_dynamic_bsz=False
     actor_rollout_ref.actor.strategy=fsdp_turbo_dsv41
@@ -273,7 +281,7 @@ ACTOR=(
     "+${ACTOR_TURBO}.distributed.fsdp_plan.cast_forward_inputs=False"
     "${ACTOR_TURBO}.distributed.fsdp_plan.output_dtype=null"
     "+${ACTOR_TURBO}.distributed.ep_plan.apply_modules=['model.layers.{*}.ffn.experts']"
-    "+${ACTOR_TURBO}.distributed.ep_plan.dispatcher=fused"
+    "+${ACTOR_TURBO}.distributed.ep_plan.dispatcher=all2all"  # [1030 rebase] 新 FSDPTurbo 已移除 fused 名称；all2all + use_fused_ops(默认 True) 等价
     actor_rollout_ref.actor.fsdp_config.reshard_after_forward=True
     actor_rollout_ref.actor.fsdp_config.entropy_checkpointing=True
     actor_rollout_ref.actor.entropy_from_logits_with_chunking=True
@@ -281,11 +289,16 @@ ACTOR=(
     actor_rollout_ref.actor.fsdp_config.offload_policy=True
     actor_rollout_ref.actor.fsdp_config.param_offload=True
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
+    # [1030 longrun] ffn 激活重算（W3 长跑已验证）；attn 重算是 rebase 后新上游能力
+    # （FSDPTurbo 1dae0be：V4.1-Flash A/B 实测峰值 -11.3%、步时 +2.4%），补上后 update
+    # 峰值再降约 4 GiB，抵消 colocate 下 rollout 引擎 sleep 残差（step4 LM head 处 OOM）。
+    +actor_rollout_ref.actor.fsdp_config.turbo_config.memory.recompute=true
+    '+actor_rollout_ref.actor.fsdp_config.turbo_config.memory.recompute_plan=["model.layers.{*}.ffn","model.layers.{*}.attn"]'
     "${VISION_FSDP_OVERRIDES[@]}"
 )
 
 REF=()
-if [ "${USE_KL:-1}" = "1" ]; then REF=(
+if [ "${USE_KL}" = "1" ]; then REF=(
     # [2026-10-14 KL run] mirror of run_deepseek_v41_grpo_fsdp_turbo_npu.sh's REF block:
     # the ref worker rebuilds the engram-bearing model, so it needs the same 1-D EP mesh.
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1
@@ -300,7 +313,7 @@ if [ "${USE_KL:-1}" = "1" ]; then REF=(
     "+${REF_TURBO}.distributed.fsdp_plan.cast_forward_inputs=False"
     "${REF_TURBO}.distributed.fsdp_plan.output_dtype=null"
     "+${REF_TURBO}.distributed.ep_plan.apply_modules=['model.layers.{*}.ffn.experts']"
-    "+${REF_TURBO}.distributed.ep_plan.dispatcher=fused"
+    "+${REF_TURBO}.distributed.ep_plan.dispatcher=all2all"  # [1030 rebase] 同上
     actor_rollout_ref.ref.fsdp_config.reshard_after_forward=True
     actor_rollout_ref.ref.entropy_from_logits_with_chunking=True
     actor_rollout_ref.ref.use_torch_compile=False
@@ -325,6 +338,10 @@ ROLLOUT=(
     # run_vllm2.sh serves the checkpoint with --enforce-eager.
     actor_rollout_ref.rollout.enforce_eager=True
     actor_rollout_ref.rollout.enable_prefix_caching=False
+    # [1030 longrun] VL 模型必须从 checkpoint 真实加载（dummy 会丢视觉/engram 语义）
+    actor_rollout_ref.rollout.load_format=auto
+    # [1030 longrun] countbenchqa 的 <image> 单轮 agent loop
+    actor_rollout_ref.rollout.agent.default_agent_loop=deepseek_v41_vl_single_turn
     # Keep the transfer bucket small: the export materializes each fused expert tensor
     # on every rank while the rollout engine already holds its share of the card.
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=512
@@ -364,7 +381,10 @@ TRAINER=(
     trainer.val_before_train=False
     trainer.save_freq=-1
     trainer.test_freq=-1
-    trainer.total_epochs=1
+    # [1030 longrun] 长跑按步数停止（默认 500 step），epoch 上限给足
+    trainer.total_epochs=1000
+    # [1030 longrun] 失败组同步重采样，避免组内全失败/全同导致优势全 0
+    trainer.v1.sampler.sync_refill_failed_groups=True
     trainer.default_local_dir="${CKPTS_DIR}"
 )
 

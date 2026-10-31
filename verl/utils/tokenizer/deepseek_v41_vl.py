@@ -90,7 +90,7 @@ class DeepSeekV41VLProcessor:
     """Processor facade backed by FSDPTurbo's reference VL preprocessing."""
 
     def __init__(self, tokenizer, model_args, *, thinking: bool = False):
-        from fsdp_turbo.models.deepseek_v41.image_processor import IMAGE_PLACEHOLDER as _PLACEHOLDER
+        from fsdp_turbo.models.deepseek.deepseek_v41.image_processor import IMAGE_PLACEHOLDER as _PLACEHOLDER
 
         if _PLACEHOLDER != IMAGE_PLACEHOLDER:
             raise ValueError(f"Image placeholder mismatch: {_PLACEHOLDER!r} != {IMAGE_PLACEHOLDER!r}")
@@ -163,7 +163,7 @@ class DeepSeekV41VLProcessor:
     ) -> VLBatchFeature:
         """Expand image placeholders into the reference model's VL token stream."""
         del videos, audio, kwargs
-        from fsdp_turbo.models.deepseek_v41.image_processor import prepare_vl_inputs
+        from fsdp_turbo.models.deepseek.deepseek_v41.image_processor import prepare_vl_inputs
 
         if return_tensors not in (None, "pt"):
             raise ValueError("DeepSeekV41VLProcessor only supports return_tensors='pt'.")
@@ -222,9 +222,12 @@ class DeepSeekV41VLProcessor:
 
 def build_deepseek_v41_vl_processor(tokenizer, model_path: str, *, thinking: bool = False):
     """Build the processor from the checkpoint directory's ``config.json``."""
-    from fsdp_turbo.models.deepseek_v41 import build_deepseek_v41_model_args
+    from fsdp_turbo.models.deepseek.deepseek_v41 import build_deepseek_v41_model_args
 
-    model_args = build_deepseek_v41_model_args(model_path, include_vision=True)
+    # [1030 rebase] 新 FSDPTurbo 的 build_deepseek_v41_model_args 只接受
+    # config_path=/model_name_or_path= 关键字参数；视觉塔由 config.json 的
+    # vision_config 自动启用，不再有 include_vision 形参。
+    model_args = build_deepseek_v41_model_args(model_name_or_path=model_path)
     if not model_args.vision_enabled:
         raise ValueError(f"{model_path} has no vision tower; refusing to build a VL processor.")
     token_id = tokenizer.convert_tokens_to_ids(IMAGE_PLACEHOLDER)
