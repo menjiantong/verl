@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -48,7 +49,7 @@ TRAIN_CLASSES = {
 INFER_CLASSES = {
     "DeepseekV41Model", "AscendDeepseekV41LLMForCausalLM",
     "DeepseekV41DecoderLayer", "DeepseekV41Attention", "DeepseekV41SWAAttention",
-    "DeepseekV41Compressor", "Indexer", "DeepseekV41MoE", "DeepseekV41MLP",
+    "DeepseekV41Compressor", "Indexer", "DeepseekV41Indexer", "DeepseekV41MoE", "DeepseekV41MLP",
     "FusedTopKRouter", "GroupedTopKRouter", "ParallelLMHead",
     "VocabParallelEmbedding", "RMSNorm", "ReplicatedLinear",
 }
@@ -259,6 +260,161 @@ def _dump(mod, cls, role, layer, args, kwargs, out):
         except Exception:
             print(f"[MY_DEBUG_LOG opdump] save failed {path}", file=sys.stderr, flush=True)
             traceback.print_exc()
+
+
+def _external(cls, layer, args, kwargs, out):
+    """落盘非 nn.Module 的算子（融合 router / lm_head GEMM）。
+
+    这些算子在 vLLM 内部以函数/方法调用，不经过 nn.Module.__call__，
+    因此这里复用相同的 fwd/rank 过滤与序列化逻辑。
+    """
+    global _FILE_N
+    if os.environ.get("MY_ENV_OP_DUMP") != "1" or not DUMP_DIR:
+        return
+    if _ONLY_CLASSES and cls not in _ONLY_CLASSES:
+        return
+    if not DUMP_ALL_RANKS and _rank() != 0:
+        return
+    tls = _TLS
+    fwd = getattr(tls, "forward_id", 0)
+    if not getattr(tls, "prefill", False) or fwd <= 0 or fwd > MAX_FORWARD:
+        return
+    if time.time() > getattr(tls, "deadline", 0.0):
+        return
+    remaining = getattr(tls, "remaining", 0)
+    if remaining <= 0:
+        return
+    tls.remaining = remaining - 1
+    counts = getattr(tls, "counts", None)
+    if counts is None:
+        counts = tls.counts = {}
+    key = (fwd, cls, "external")
+    call = counts.get(key, 0)
+    if call >= 64:
+        return
+    counts[key] = call + 1
+    # Router 不持有 layer_id；同一 forward 内按 MoE 层顺序调用，call 即层号。
+    if layer is None and cls == "RouterFused":
+        layer = call
+    with _LOCK:
+        if _FILE_N >= MAX_FILES:
+            return
+        _FILE_N += 1
+        layer_tag = f"L{layer:02d}" if isinstance(layer, int) else "Lna"
+        rel = os.path.join(
+            "infer", f"rank{_rank()}", f"pid{_PID}", f"fwd{fwd:02d}", layer_tag,
+            f"{cls}_{call}.pt",
+        )
+        path = os.path.join(DUMP_DIR, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        rec = {
+            "role": "infer", "rank": _rank(), "pid": _PID, "forward": fwd,
+            "cls": cls, "layer": layer, "call": call, "path": rel,
+            "module_module": "external", "module_class": cls,
+            "args_shapes": [list(a.shape) if isinstance(a, torch.Tensor) else None for a in args[:8]],
+            "out_shapes": _shape_tree(out),
+        }
+        try:
+            torch.save(
+                {
+                    "meta": rec,
+                    "args": _serialize(args),
+                    "kwargs": _serialize(kwargs),
+                    "output": _serialize(out),
+                },
+                path,
+            )
+            _write_index(rec)
+        except Exception:
+            print(f"[MY_DEBUG_LOG opdump] external save failed {path}", file=sys.stderr, flush=True)
+            traceback.print_exc()
+
+
+def _patch_router(cls):
+    if cls is None:
+        return
+    orig = getattr(cls, "_compute_routing", None)
+    if orig is None or getattr(orig, "_my_env_opdump", False):
+        return
+
+    def _wrapped(self, hidden_states, router_logits, indices_type, *, input_ids=None):
+        out = orig(self, hidden_states, router_logits, indices_type, input_ids=input_ids)
+        try:
+            _external("RouterFused", None, (hidden_states, router_logits, input_ids), {}, out)
+        except Exception:
+            print("[MY_DEBUG_LOG opdump] router dump failed", file=sys.stderr, flush=True)
+            traceback.print_exc()
+        return out
+
+    _wrapped._my_env_opdump = True
+    cls._compute_routing = _wrapped
+
+
+def _patch_head(cls):
+    if cls is None:
+        return
+    orig = getattr(cls, "_apply_head", None)
+    if orig is None or getattr(orig, "_my_env_opdump", False):
+        return
+
+    def _wrapped(self, lm_head, hidden_states, embedding_bias):
+        out = orig(self, lm_head, hidden_states, embedding_bias)
+        try:
+            _external("LMHeadGEMM", None, (hidden_states,), {"embedding_bias": embedding_bias}, out)
+        except Exception:
+            print("[MY_DEBUG_LOG opdump] lm_head dump failed", file=sys.stderr, flush=True)
+            traceback.print_exc()
+        return out
+
+    _wrapped._my_env_opdump = True
+    cls._apply_head = _wrapped
+
+
+def _patch_indexer(cls):
+    if cls is None:
+        return
+    orig = getattr(cls, "select_projected", None)
+    if orig is None or getattr(orig, "_my_env_opdump", False):
+        return
+
+    def _wrapped(self, *args, **kwargs):
+        out = orig(self, *args, **kwargs)
+        try:
+            layer = None
+            wq = getattr(self, "wq_b", None)
+            m = re.search(r"layers\.(\d+)\.", getattr(wq, "prefix", "") or "")
+            if m:
+                layer = int(m.group(1))
+            # 只保留 query / weights 两个输入，其余是 paged-cache 元数据。
+            _external("IndexerSelect", layer, args[:2], {}, out)
+        except Exception:
+            print("[MY_DEBUG_LOG opdump] indexer dump failed", file=sys.stderr, flush=True)
+            traceback.print_exc()
+        return out
+
+    _wrapped._my_env_opdump = True
+    cls.select_projected = _wrapped
+
+
+def on_module_loaded(name, module):
+    """由 sitecustomize 在每个 import 完成后调用，给融合算子打补丁。"""
+    if os.environ.get("MY_ENV_OP_DUMP") != "1" or module is None:
+        return
+    try:
+        if name == "vllm.model_executor.layers.logits_processor":
+            _patch_head(getattr(module, "LogitsProcessor", None))
+        elif name == "vllm_ascend.ops.fused_moe.router.fused_topk_router":
+            _patch_router(getattr(module, "AscendFusedTopKRouter", None))
+            _patch_router(getattr(module, "AscendFusedMoERouter", None))
+        elif name == "vllm.model_executor.layers.fused_moe.router.fused_topk_router":
+            _patch_router(getattr(module, "FusedTopKRouter", None))
+        elif name == "vllm_ascend.ops.fused_moe.router.grouped_topk_router":
+            _patch_router(getattr(module, "AscendGroupedTopKRouter", None))
+        elif name == "vllm_ascend.models.deepseek_v41.indexer":
+            _patch_indexer(getattr(module, "DeepseekV41Indexer", None))
+    except Exception:
+        print("[MY_DEBUG_LOG opdump] patch failed", file=sys.stderr, flush=True)
+        traceback.print_exc()
 
 
 def _wrapped_call(self, *args, **kwargs):

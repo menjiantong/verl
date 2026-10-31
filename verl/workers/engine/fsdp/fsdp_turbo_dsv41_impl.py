@@ -990,7 +990,14 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
             # [1030 rebase] 新 FSDPTurbo 的 host-offload engram 表默认在 meta 上构造，
             # 原 engram_meta_init 形参已移除，保留会 TypeError。
             engram_storage_backend="host_offload",
-            use_sparse_flash_attn=False,
+            # [1031 融合算子 A/B] 视觉塔是 train/infer 漂移的起点：L0 文本 token
+            # 的 block 输入逐位相同，图像 token 特征却有 ~1.6% 随机误差。推理视觉
+            # attention 用 FIA；训练默认 SDPA 与 FIA 单算子差 0.244%，训练融合
+            # FlashAttentionScore 只差 0.158%，故用 MY_ENV_TRAIN_FUSED_VISION_ATTN=1
+            # 启用视觉融合注意力。LM 稀疏注意力同理保留开关；两者默认 0，
+            # 不改变现有生产启动行为。
+            use_sparse_flash_attn=os.environ.get("MY_ENV_TRAIN_SPARSE_FLASH_ATTN", "0") == "1",
+            use_fused_vision_flash_attn=os.environ.get("MY_ENV_TRAIN_FUSED_VISION_ATTN", "0") == "1",
             # The routed experts stay on meta until the checkpoint loader
             # materializes each rank's shard.
             experts_meta_init=True,

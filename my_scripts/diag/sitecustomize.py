@@ -12,15 +12,17 @@ import sys
 if os.environ.get("MY_ENV_OP_DUMP") == "1":
     _orig_import = builtins.__import__
     _installed = False
+    _hook = None
 
     def _install_once():
-        global _installed
+        global _installed, _hook
         if _installed:
             return
         _installed = True
         try:
             import my_op_dump_hook
 
+            _hook = my_op_dump_hook
             my_op_dump_hook.install()
         except Exception:  # noqa: BLE001 - never break the worker on a debug hook
             import traceback
@@ -40,6 +42,12 @@ if os.environ.get("MY_ENV_OP_DUMP") == "1":
             # wait until the top-level module is complete.
             if torch_mod is not None and hasattr(torch_mod, "Tensor") and hasattr(torch_mod, "nn"):
                 _install_once()
+        # 融合 router / lm_head 是普通方法调用，需在模块导入后单独打补丁。
+        if _installed and _hook is not None and level == 0:
+            try:
+                _hook.on_module_loaded(name, module)
+            except Exception:  # noqa: BLE001
+                pass
         return module
 
     builtins.__import__ = _import_hook
