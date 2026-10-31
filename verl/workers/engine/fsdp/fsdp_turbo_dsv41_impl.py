@@ -998,6 +998,13 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
             # 不改变现有生产启动行为。
             use_sparse_flash_attn=os.environ.get("MY_ENV_TRAIN_SPARSE_FLASH_ATTN", "0") == "1",
             use_fused_vision_flash_attn=os.environ.get("MY_ENV_TRAIN_FUSED_VISION_ATTN", "0") == "1",
+            # [1031 融合算子 A/B] 其余训练侧融合开关，默认 0 保持生产行为；
+            # 逐项置 1 可对比其与推理侧融合实现的数值差异。
+            use_fused_mhc=os.environ.get("MY_ENV_TRAIN_FUSED_MHC", "0") == "1",
+            use_fused_compressor=os.environ.get("MY_ENV_TRAIN_FUSED_COMPRESSOR", "0") == "1",
+            use_fused_clipped_swiglu=os.environ.get("MY_ENV_TRAIN_FUSED_CLIPPED_SWIGLU", "0") == "1",
+            use_triton_inplace_rope=os.environ.get("MY_ENV_TRAIN_TRITON_INPLACE_ROPE", "0") == "1",
+            use_fused_lightning_indexer=os.environ.get("MY_ENV_TRAIN_FUSED_LIGHTNING_INDEXER", "0") == "1",
             # The routed experts stay on meta until the checkpoint loader
             # materializes each rank's shard.
             experts_meta_init=True,

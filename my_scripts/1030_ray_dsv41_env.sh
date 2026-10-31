@@ -64,6 +64,10 @@ export VERL_DSV41_OFFLOAD_PIN_MEMORY=0
 export VERL_DSV41_DIRECT_SHARD_LOAD=1    # 每个 rank 直接读自己的 checkpoint 分片
 export VERL_DSV41_LOCAL_EXPERT_EXPORT=1  # weight sync 只导出本 rank 专家
 export VERL_DSV41_VISION=1               # countbenchqa 带图；同时冻结 vision tower
+# [1031 A/B 已验证] 视觉塔是 train/infer 漂移起点：训练 SDPA 与推理 FIA 单算子
+# 差 0.244%，训练融合 FlashAttentionScore 只差 0.158%；164 实测图像特征误差
+# 1.589%→1.464%，最终 hidden 7.51%→6.18%，默认启用融合视觉注意力。
+export MY_ENV_TRAIN_FUSED_VISION_ATTN=${MY_ENV_TRAIN_FUSED_VISION_ATTN:-1}
 export VERL_DSV41_EMPTY_CACHE_AFTER_BUILD=1
 export VERL_DSV41_EMPTY_CACHE_BEFORE_OPT=1
 export VERL_DSV41_OPT_STATE_DEBUG=1      # 预建 Adam 状态，规避首步惰性建状态长卡顿
