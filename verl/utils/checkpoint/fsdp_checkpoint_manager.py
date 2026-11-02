@@ -403,7 +403,23 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     log_only_rank_0=True,
                 )
             if self.processing_class is not None:
-                self.processing_class.save_pretrained(hf_config_tokenizer_path)
+                # [2026-11-01 ckpt-fix] DeepSeekV41VLProcessor 是自定义 facade，不是 HF ProcessorMixin：
+                # 只有 .tokenizer，没有 save_pretrained()。优先用 processor 自身，否则回退 tokenizer，
+                # 避免模型分片已写完后在元数据尾部中断整个 checkpoint。
+                if hasattr(self.processing_class, "save_pretrained"):
+                    self.processing_class.save_pretrained(hf_config_tokenizer_path)
+                elif hasattr(self.processing_class, "tokenizer") and hasattr(
+                    self.processing_class.tokenizer, "save_pretrained"
+                ):
+                    self.processing_class.tokenizer.save_pretrained(hf_config_tokenizer_path)
+                else:
+                    log_with_rank(
+                        f"{type(self.processing_class).__name__} has no save_pretrained; "
+                        "skipping HF tokenizer save",
+                        rank=self.rank,
+                        logger=logger,
+                        log_only_rank_0=True,
+                    )
             log_with_rank(
                 f"Saved model config and tokenizer class to {os.path.abspath(hf_config_tokenizer_path)}",
                 rank=self.rank,
