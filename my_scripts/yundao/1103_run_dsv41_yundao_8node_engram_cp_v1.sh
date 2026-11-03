@@ -76,6 +76,11 @@ export MY_ENV_DSV41_VAL_BEFORE_TRAIN=True
 # 末尾的 load_format=auto 覆盖掉它。
 export MY_ENV_DSV41_LOAD_FORMAT=safetensors
 export MY_ENV_DSV41_ENGRAM_DP_SHARED=1
+# [1103] vLLM 的 engram 拓扑日志是 INFO 级，verl 的 PPO_RAY_RUNTIME_ENV 默认锁 WARN。
+# 排查阶段放开到 INFO：下次运行检查日志里是否出现
+# "Engram node-local DP group size: 2 (TP=8)" 与每 rank 的 "Engram table offloaded ... GiB"，
+# 用来确认共享表是否真的生效（不出现即每副本一份 = 393 GB 翻倍成 786 GB）。
+export MY_ENV_VLLM_LOGGING_LEVEL=${MY_ENV_VLLM_LOGGING_LEVEL:-INFO}
 
 # CP：example 读 CP_SIZE；三个 MY_ENV_ 由 verl/FSDPTurbo 内部消费。
 export MY_ENV_DSV41_CP_SIZE="$CP_SIZE"
@@ -143,7 +148,7 @@ if [ "$SAVE_FREQ" -ge 0 ]; then
   fi
 fi
 
-echo "[engram-cp] MY_DEBUG_LOG engram_cp_config steps=${STEPS} save_freq=${SAVE_FREQ} test_freq=${TEST_FREQ} cp=${CP_SIZE} model=${ENGRAM_MODEL} dp_shared=1 load_format=safetensors"
+echo "[engram-cp] MY_DEBUG_LOG engram_cp_config steps=${STEPS} save_freq=${SAVE_FREQ} test_freq=${TEST_FREQ} cp=${CP_SIZE} model=${ENGRAM_MODEL} dp_shared=${MY_ENV_DSV41_ENGRAM_DP_SHARED} load_format=safetensors"
 
 # -----------------------------------------------------------------------------
 # 4. 交给基线脚本（Ray 启动 / ModelArts 节点角色 / 训练参数全部在基线里）

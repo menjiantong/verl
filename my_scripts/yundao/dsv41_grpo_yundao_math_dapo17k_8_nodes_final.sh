@@ -182,7 +182,11 @@ export VERL_DSV41_MOE_BF16=0
 export ALIGN_NOBI=0
 export LOCAL_EXPERT_EXPORT=1
 export VERL_DSV41_ENGINE_LEGACY=0
-export VLLM_ENGRAM_DP_SHARED_MEMORY=0
+# [1103] 这里原先硬编码 export VLLM_ENGRAM_DP_SHARED_MEMORY=0，会覆盖第 83 行由
+# MY_ENV_DSV41_ENGRAM_DP_SHARED 算出来的值——1103 20:31 的 Engram+CP 运行日志第 10 行
+# 就是 "CP=2 engram_dp_shared=0"（外层要求 1，被这里改回 0），example 因此没有追加
+# engram_config.cpu_offload / dp_shared_memory 与多线程懒加载参数。
+# 第 152 行已经 export 过该变量，这里不再重复赋值。
 
 # vLLM / Ascend 引擎
 export VLLM_VERSION=0.30.0

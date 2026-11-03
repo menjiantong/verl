@@ -86,7 +86,11 @@ PPO_RAY_RUNTIME_ENV = {
     "env_vars": {
         "TOKENIZERS_PARALLELISM": "true",
         "NCCL_DEBUG": "WARN",
-        "VLLM_LOGGING_LEVEL": "WARN",
+        # [1103] 云道 8 机 Engram+CP 排查：vLLM 侧 engram 拓扑
+        # （"Engram node-local DP group size"、"Engram table offloaded ... GiB per rank"、
+        # "Resolved Engram configuration"）都是 INFO 级，固定 WARN 会全部吞掉，
+        # 无法判断 engram 表是节点内共享还是每副本一份。默认仍 WARN，行为不变。
+        "VLLM_LOGGING_LEVEL": os.environ.get("MY_ENV_VLLM_LOGGING_LEVEL", "WARN"),
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
         # TODO: disable compile cache due to cache corruption issue
         # https://github.com/vllm-project/vllm/issues/31199
