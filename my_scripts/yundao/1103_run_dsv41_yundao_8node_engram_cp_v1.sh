@@ -81,6 +81,10 @@ export MY_ENV_DSV41_ENGRAM_DP_SHARED=1
 # "Engram node-local DP group size: 2 (TP=8)" 与每 rank 的 "Engram table offloaded ... GiB"，
 # 用来确认共享表是否真的生效（不出现即每副本一份 = 393 GB 翻倍成 786 GB）。
 export MY_ENV_VLLM_LOGGING_LEVEL=${MY_ENV_VLLM_LOGGING_LEVEL:-INFO}
+# [1103] sleep 看门狗：sleep 卡住 10 min 后，每 10 min 打印一次该进程所有线程的
+# Python 栈（vllm-ascend/worker/worker.py 的 sleep 补丁读取）。下次再卡就能直接
+# 看到卡在 camem 备份的哪一步，0=关闭。
+export MY_ENV_VLLM_FAULTHANDLER_TIMEOUT_S=${MY_ENV_VLLM_FAULTHANDLER_TIMEOUT_S:-600}
 
 # CP：example 读 CP_SIZE；三个 MY_ENV_ 由 verl/FSDPTurbo 内部消费。
 export MY_ENV_DSV41_CP_SIZE="$CP_SIZE"
