@@ -27,9 +27,47 @@ done
 export PATH=/usr/local/python3.11.15/bin:$PATH
 # vllm/vllm-ascend/FSDPTurbo/verl 全部用 rebase 仓库内 checkout，且必须排在最前，
 # 避免命中镜像里的同名包。
-export PYTHONPATH="$MIRROR_ROOT/vllm:$MIRROR_ROOT/vllm-ascend:$MIRROR_ROOT/FSDPTurbo:$MIRROR_ROOT/verl:${PYTHONPATH:-}"
+# [1101 180] envcompat 目录里有 sitecustomize.py：TMPDIR 放 NFS 时，Triton 在
+# 临时目录里 dlopen 的 libkernel.so 会留下 `.nfsXXXX` 残留，导致
+# TemporaryDirectory 清理抛 ENOTEMPTY；补丁把清理失败降级为忽略。
+export MY_ENV_COMPAT_ROOT=/mnt/share/m00899630/envcompat
+export PYTHONPATH="$MY_ENV_COMPAT_ROOT:$MIRROR_ROOT/vllm:$MIRROR_ROOT/vllm-ascend:$MIRROR_ROOT/FSDPTurbo:$MIRROR_ROOT/verl:${PYTHONPATH:-}"
 # ssh 非交互 shell 默认 ulimit -n=1024，Ray gRPC 会 "Too many open files"。
 ulimit -n 1048576 2>/dev/null || ulimit -n 655350 2>/dev/null || true
+
+# ---------- 缓存/临时目录（180 根盘 100% 满） ----------
+# [1101 180] 容器 overlay 根盘可用 0：datasets.load_dataset 直接报
+# "OSError: Not enough disk space"，Ray 也报 /tmp/ray over 95% full。
+# 统一把 HF/datasets/torch 扩展/Ray 会话/TMPDIR 落到共享盘，避免写根盘。
+export MY_ENV_CACHE_ROOT=${MY_ENV_CACHE_ROOT:-/mnt/share/m00899630/cache}
+export HF_HOME=${HF_HOME:-$MY_ENV_CACHE_ROOT/huggingface}
+export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$HF_HOME/datasets}
+export HF_HUB_CACHE=${HF_HUB_CACHE:-$HF_HOME/hub}
+export TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-$HF_HOME/transformers}
+export TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-$MY_ENV_CACHE_ROOT/torch_extensions}
+# 其余常见缓存（triton/torchinductor/vllm/XDG）也一并迁走，避免运行期再写根盘。
+export XDG_CACHE_HOME=${XDG_CACHE_HOME:-$MY_ENV_CACHE_ROOT/xdg}
+# Triton kernel 缓存必须可执行（dlopen .so），放 NFS；/dev/shm 是 noexec 会报
+# "failed to map segment from shared object"。
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$MY_ENV_CACHE_ROOT/triton}
+export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-$MY_ENV_CACHE_ROOT/torchinductor}
+export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-$MY_ENV_CACHE_ROOT/vllm}
+# [1101 180] 临时目录的最终方案（三次实测教训）：
+#  1) /dev/shm 是 noexec：Triton 会在 TMPDIR 里生成并 dlopen `libkernel.so`，
+#     报 "failed to map segment from shared object"；
+#  2) /dev 有 64M 且可执行，但 batch-invariant matmul 的 Triton 编译会按 M 的形状
+#     反复触发新 kernel，8 个 worker 并发编译时 64M 被打爆，bisheng 报
+#     "IO failure on output stream: No space left on device"，EngineCore 直接挂掉；
+#  3) TMPDIR 放回 NFS 空间充足，但 rmtree 会撞 `.nfsXXXX` 报 ENOTEMPTY；
+#     已由 PYTHONPATH 里的 sitecustomize.py 把 TemporaryDirectory 清理失败降级为忽略。
+#  Ray 会话目录不需要 exec，仍放 /dev/shm（256G），避免 Ray 对 98% 满 NFS 报警。
+export MY_ENV_LOCAL_TMP=/dev/shm/m00899630
+export TMPDIR=${TMPDIR:-/mnt/share/m00899630/tmp}
+# Ray 会话/对象溢出目录；必须在 ray start 之前导出。
+export RAY_TMPDIR=${RAY_TMPDIR:-$MY_ENV_LOCAL_TMP/ray_tmp}
+mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$TMPDIR" "$RAY_TMPDIR" \
+         "$TORCH_EXTENSIONS_DIR" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR" \
+         "$TORCHINDUCTOR_CACHE_DIR" "$VLLM_CACHE_ROOT" 2>/dev/null || true
 
 # ---------- 网络 ----------
 # hostname -I 首地址可能是 172.x（容器网），必须显式取 80.5.x 业务网。
@@ -68,6 +106,12 @@ export VERL_DSV41_VISION=1               # countbenchqa 带图；同时冻结 vi
 # 差 0.244%，训练融合 FlashAttentionScore 只差 0.158%；164 实测图像特征误差
 # 1.589%→1.464%，最终 hidden 7.51%→6.18%，默认启用融合视觉注意力。
 export MY_ENV_TRAIN_FUSED_VISION_ATTN=${MY_ENV_TRAIN_FUSED_VISION_ATTN:-1}
+# [1031 视觉算子 A/B] 推理侧视觉注意力改用与训练相同的 FlashAttentionScore
+# (npu_fusion_attention)。同一权重/输入下，视觉塔 32 层输出与训练逐 bit 一致；
+# 默认 FIA(TND) 单算子相对误差约 5e-5，经 32 层放大后视觉特征约 0.8%。
+# 需 enforce_eager=True（run_deepseek_v41_top64_grpo_fsdp_turbo_npu.sh 已设置）；
+# 设为 fia 可回退 vllm-ascend 默认路径。
+export MY_ENV_VLLM_VIT_ATTN_OP=${MY_ENV_VLLM_VIT_ATTN_OP:-fa}
 export VERL_DSV41_EMPTY_CACHE_AFTER_BUILD=1
 export VERL_DSV41_EMPTY_CACHE_BEFORE_OPT=1
 export VERL_DSV41_OPT_STATE_DEBUG=1      # 预建 Adam 状态，规避首步惰性建状态长卡顿
