@@ -103,7 +103,12 @@ REF_PARAM_OFFLOAD=${PARAM_OFFLOAD}
 # [1103] 步数/保存频率可被外层脚本覆盖（验证短跑用 10/-1），默认保持长跑 500/110。
 STEPS=${MY_ENV_DSV41_STEPS:-500}
 SAVE_FREQ=${MY_ENV_DSV41_SAVE_FREQ:-110}
-MAX_CKPT_KEEP=3
+MAX_CKPT_KEEP=${MY_ENV_DSV41_MAX_CKPT_KEEP:-3}
+# [1103] eval：TEST_FREQ>0 时每 N 步在 data.val_files 上评一次；
+# VAL_BEFORE_TRAIN=True 在 step0 先评一次基线（25.x 长跑同款）。默认关闭，
+# 与基线行为一致。
+TEST_FREQ=${MY_ENV_DSV41_TEST_FREQ:--1}
+VAL_BEFORE_TRAIN=${MY_ENV_DSV41_VAL_BEFORE_TRAIN:-False}
 SAVE_CONTENTS="['model']"
 LOAD_CONTENTS="['model']"
 ROLLOUT_IS=null
@@ -145,6 +150,7 @@ export FSDP_SIZE TP_SIZE EP_SIZE EFSDP_SIZE
 export GEN_TP GEN_DP GEN_EP
 export INFER_BACKEND ROLLOUT_GPU_MEM_UTIL FREE_CACHE_ENGINE
 export CP_SIZE VLLM_ENGRAM_DP_SHARED_MEMORY
+export TEST_FREQ VAL_BEFORE_TRAIN MAX_CKPT_KEEP
 export BATCH_INVARIANT LOAD_FORMAT AGENT_LOOP
 export PARAM_OFFLOAD OPTIMIZER_OFFLOAD OFFLOAD_POLICY REF_PARAM_OFFLOAD
 
@@ -312,6 +318,7 @@ echo "[=====info=====] Rollout: TP=${GEN_TP} DP=${GEN_DP} EP=${GEN_EP}"
 echo "[=====info=====] CP=${CP_SIZE} engram_dp_shared=${VLLM_ENGRAM_DP_SHARED_MEMORY} model=${MODEL_PATH}"
 echo "[=====info=====] Data: prompt=${MAX_PROMPT_LEN} response=${MAX_RESPONSE_LEN} max_model_len=${MAX_MODEL_LEN}"
 echo "[=====info=====] Save: every ${SAVE_FREQ} steps, keep=${MAX_CKPT_KEEP}, steps=${STEPS}"
+echo "[=====info=====] Eval: val_before_train=${VAL_BEFORE_TRAIN}, test_freq=${TEST_FREQ}, val_bsz=${VAL_BSZ}, val_file=${TEST_FILE}"
 echo "[=====info=====] CKPTS_DIR=${CKPTS_DIR}"
 
 AVAIL_T=$(df -Pk /efs_rl | awk 'NR==2 {printf "%.1f", $4/1024/1024/1024}')
@@ -346,7 +353,8 @@ ray status
 if [ "$NODE_RANK" -eq 0 ]; then
   echo "[=====info=====] code: verl=$(git -C "${MIRROR_ROOT}/verl" rev-parse --short HEAD 2>/dev/null) vllm=$(git -C "${MIRROR_ROOT}/vllm" rev-parse --short HEAD 2>/dev/null) vllm-ascend=$(git -C "${MIRROR_ROOT}/vllm-ascend" rev-parse --short HEAD 2>/dev/null) FSDPTurbo=$(git -C "${MIRROR_ROOT}/FSDPTurbo" rev-parse --short HEAD 2>/dev/null)"
 
-  RUN_TAG="dsv41-8node-math-dapo17k-p384-rebase-s${SAVE_FREQ}-k${MAX_CKPT_KEEP}"
+  # [1103] 日志目录名可被外层脚本标记（Engram+CP 版用 engram-cp2-math-dapo17k）。
+  RUN_TAG="dsv41-8node-${MY_ENV_DSV41_RUN_TAG:-math-dapo17k}-p384-rebase-s${SAVE_FREQ}-k${MAX_CKPT_KEEP}"
   RUN_ID="${RUN_TAG}-$(date +%Y%m%d_%H%M%S)-$$"
   RUN_DIR="${LOG_BASE}/${RUN_ID}"
   mkdir -p "$RUN_DIR"
@@ -366,6 +374,8 @@ if [ "$NODE_RANK" -eq 0 ]; then
 
   bash "$EXAMPLE" \
     "trainer.total_training_steps=${STEPS}" \
+    "trainer.val_before_train=${VAL_BEFORE_TRAIN}" \
+    "trainer.test_freq=${TEST_FREQ}" \
     "trainer.save_freq=${SAVE_FREQ}" \
     "trainer.max_actor_ckpt_to_keep=${MAX_CKPT_KEEP}" \
     "actor_rollout_ref.actor.checkpoint.save_contents=${SAVE_CONTENTS}" \
