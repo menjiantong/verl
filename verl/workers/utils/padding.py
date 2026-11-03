@@ -125,8 +125,30 @@ def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor
         max_response_len = response_ids.shape[1]
 
     sequence_lens = prompt_lens + response_lens
-    sequence_offsets = sequence_lens.cumsum(dim=0)
-    assert sequence_offsets[-1].item() == values.shape[0]
+    # [1102 CP] CP 对齐会在每条样本末尾补 pad_token（见 transformer_impl.prepare_model_inputs
+    # 的 MY_ENV_DSV41_CP_PAD_MULTIPLE）。values 按“补齐后”的布局排列，但响应后面
+    # 还跟着 pad，因此响应不在样本尾部：切片末端必须是真实内容末端
+    # P_i+prompt_i+response_i，而不是 P_i+padded_i（后者会切到 pad 区，g1-9 单测
+    # my_scripts/1103_test_cp_padding_offsets_v1.py 已复现逐元素偏差）。
+    # 末尾 pad 只影响 values 总长，故用 sequence_offsets[-1]+pad_last 校验总长。
+    # 未开启补齐时 pad_lens 全 0，结果与改动前完全一致。
+    input_ids = data.get("input_ids")
+    if input_ids is not None and input_ids.is_nested:
+        padded_lens = input_ids.offsets().diff()
+        pad_lens = padded_lens - sequence_lens
+        sequence_offsets = sequence_lens.cumsum(dim=0) + pad_lens.cumsum(dim=0) - pad_lens
+        expected_total = sequence_offsets[-1].item() + pad_lens[-1].item()
+    else:
+        padded_lens = None
+        pad_lens = None
+        sequence_offsets = sequence_lens.cumsum(dim=0)
+        expected_total = sequence_offsets[-1].item()
+    assert expected_total == values.shape[0], (
+        f"[1102 CP] padding offsets mismatch: expected_total={expected_total} "
+        f"values={tuple(values.shape)} sequence_lens={sequence_lens.tolist()} "
+        f"padded_lens={padded_lens.tolist() if padded_lens is not None else None} "
+        f"pad_lens={pad_lens.tolist() if pad_lens is not None else None}"
+    )
     assert not prompt_lens.eq(0).any(), f"seq_offset - resp_len - 1 assumes prompt_len > 0. Got {prompt_lens}"
 
     response_list = []
@@ -191,20 +213,35 @@ def embeds_padding_2_no_padding(data: TensorDict) -> TensorDict:
     return data
 
 
-def response_from_nested(tensor: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+def response_from_nested(
+    tensor: torch.Tensor, response_mask: torch.Tensor, prompts: torch.Tensor | None = None
+) -> torch.Tensor:
     """Extract response from nested model output.
 
     Args:
-        tensor: a nested tensor with shape (bsz, prompt_len + response_len)
+        tensor: a nested tensor with shape (bsz, prompt_len + response_len [ + cp_pad])
         response_mask: a nested tensor with shape (bsz, response_len)
+        prompts: optional nested prompts; when given, strips the CP tail padding
+            (see transformer_impl._cp_pad_jagged) before slicing.
 
     Returns:
         tensor: a nested tensor with shape (bsz, response_len)
     """
     values, offsets = tensor.values(), tensor.offsets()
     response_lens = response_mask.offsets().diff()
+    # [1103 CP] CP 对齐会在每条样本末尾补 pad_token（transformer_impl:_cp_pad_jagged），
+    # 因此 tensor 的 offsets 含 pad；真实内容末端 = 累计(prompt+resp) + 累计(pad) - pad。
+    # 未开启补齐（pad 全 0）时与旧行为完全一致。
+    if prompts is not None and prompts.is_nested:
+        prompt_lens = prompts.offsets().diff().to(response_lens.device)
+        seq_lens = prompt_lens + response_lens
+        pad_lens = offsets.diff() - seq_lens
+        assert pad_lens.min().item() >= 0, f"[1103 CP] negative pad: {pad_lens.tolist()}"
+        content_ends = seq_lens.cumsum(0) + pad_lens.cumsum(0) - pad_lens
+    else:
+        content_ends = offsets[1:]
     response_list = []
-    for resp_len, seq_offset in zip(response_lens, offsets[1:], strict=True):
+    for resp_len, seq_offset in zip(response_lens, content_ends, strict=True):
         # left-shift model output by one token for log_probs/values
         response_list.append(values[seq_offset - resp_len - 1 : seq_offset - 1])
     return torch.nested.as_nested_tensor(response_list, layout=torch.jagged)

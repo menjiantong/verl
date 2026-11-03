@@ -100,6 +100,13 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
             is_collect = self._parallel_state.get_ulysses_rank() == 0
         else:
             is_collect = True
+        # [1102 CP] KV-AllGather CP 下，CP 组内每个 rank 拿同一份 micro-batch
+        # （dispatch 的 dp_rank 相同），且模型侧已把输出拼回整条序列，所以
+        # collect 只能保留 CP rank 0，否则 16 个 worker 的输出会在
+        # BatchData.concat 里拼出重复样本，KVBatchMeta 报 "Got duplicated keys"
+        # （g1-5 实测：transferqueue_utils.py:333）。
+        if self._parallel_state.is_group_enable("kvallgather"):
+            is_collect = is_collect and self._parallel_state.get_kvallgather_rank() == 0
         return is_collect
 
     def optimizer_step(self):

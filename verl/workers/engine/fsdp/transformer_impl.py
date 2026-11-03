@@ -1305,6 +1305,40 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 input_ids = micro_batch["input_ids"]
                 position_ids = micro_batch["position_ids"]
                 pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
+
+                # [1102 CP] CP 的 KV-AllGather 把序列切成 cp_size 段连续等长碎片，每段各自
+                # 过 compress_ratio 的块压缩，段边界必须落在压缩块边界上（context_parallel.py:30
+                # 校验 total%cp_size==0 且 (total//cp_size)%ratio==0）。本模型 max ratio=2，
+                # cp=2 时稠密总长必须是 4 的倍数，而这里的总长是批内最大有效长度，数据相关。
+                # 做法：把每条样本的有效长度向上补齐到该倍数（补 pad_token），于是
+                # max_seq_len 天然是倍数；pad 位被 attention_mask 屏蔽、被 labels=-100 忽略。
+                # 不改稠密长度本身，避免破坏 prepare_model_outputs 里
+                # torch.nested.narrow/unbind 对行长度的假设。默认 1 = 关闭，行为不变。
+                _cp_pad_multiple = int(os.getenv("MY_ENV_DSV41_CP_PAD_MULTIPLE", "1") or "1")
+
+                def _cp_pad_jagged(t, multiple, pad_value):
+                    off = t.offsets()
+                    lens = off.diff()
+                    new_lens = (lens + multiple - 1) // multiple * multiple
+                    if torch.equal(new_lens, lens):
+                        return t
+                    vals = t.values()
+                    chunks = []
+                    for s0, l, nl in zip(off[:-1].tolist(), lens.tolist(), new_lens.tolist()):
+                        chunks.append(vals[s0:s0 + l])
+                        if nl > l:
+                            chunks.append(vals.new_full((nl - l,) + tuple(vals.shape[1:]), pad_value))
+                    new_off = torch.cat([
+                        off.new_zeros(1),
+                        torch.cumsum(torch.tensor(new_lens, dtype=off.dtype, device=off.device), 0),
+                    ])
+                    return torch.nested.nested_tensor_from_jagged(torch.cat(chunks), new_off)
+
+                if _cp_pad_multiple > 1:
+                    input_ids = _cp_pad_jagged(input_ids, _cp_pad_multiple, pad_token_id)
+                    position_ids = _cp_pad_jagged(position_ids, _cp_pad_multiple, 0)
+                    micro_batch["input_ids"] = input_ids
+                    micro_batch["position_ids"] = position_ids
                 batch_size = micro_batch.batch_size[0]
                 seq_len_effective = input_ids.offsets().diff()
                 max_seq_len = int(seq_len_effective.max().item())

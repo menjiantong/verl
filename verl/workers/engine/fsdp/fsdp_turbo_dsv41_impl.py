@@ -844,6 +844,28 @@ def refresh_dsv41_expert_metadata(module, device) -> None:
     refresh_expert_parallel_metadata(module, device=device)
 
 
+class _KeepTrainFlagEvalCtx:
+    """[1102 CP] 包一层 eval 上下文，只把 module 的 training 标志改回 True。
+
+    FSDPTurbo 的 CP 前向当前只实现训练路径（context_parallel.py:96 硬性
+    raise "KV-AllGather currently supports training mode only"），而 verl 的
+    compute_log_prob 走 engine.eval_mode() 会把整模型切到 eval。这里保留 eval
+    上下文其余全部行为（参数/激活 offload 的进入退出），仅覆盖 training 标志；
+    调用方本身已包在 torch.no_grad() 里，不会产生梯度。
+    """
+
+    def __init__(self, inner, module):
+        self._inner, self._module = inner, module
+
+    def __enter__(self):
+        ret = self._inner.__enter__()
+        self._module.train()
+        return ret
+
+    def __exit__(self, *exc):
+        return self._inner.__exit__(*exc)
+
+
 @EngineRegistry.register(
     model_type="language_model",
     backend="fsdp_turbo_dsv41",
@@ -852,6 +874,14 @@ def refresh_dsv41_expert_metadata(module, device) -> None:
 class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
     # Fused expert parameters, packed over the global expert dimension.
     _FUSED_EXPERT_SUFFIXES = (".ffn.experts.gate_up_proj", ".ffn.experts.down_proj")
+
+    def eval_mode(self, **kwargs):
+        # [1102 CP] 仅在显式开启时覆盖 eval 标志；默认关闭，行为与改动前一致。
+        # 该开关只影响 compute_log_prob 的前向走训练路径，CP=1 时不需要打开。
+        inner = super().eval_mode(**kwargs)
+        if os.getenv("MY_ENV_DSV41_CP_KEEP_TRAIN_MODE", "0") == "1":
+            return _KeepTrainFlagEvalCtx(inner, self.module)
+        return inner
 
     def _export_param(self, name, param):
         """Stream fused expert parameters one EP shard at a time.

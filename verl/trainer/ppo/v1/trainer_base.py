@@ -1631,14 +1631,14 @@ class PPOTrainer(ABC):
         output: KVBatchMeta = self.actor_rollout_wg.compute_log_prob(batch)
         assert len(output) == len(batch)
 
-        fields = ["entropy", "log_probs", "response_mask"]
+        fields = ["entropy", "log_probs", "response_mask", "prompts"]
         if self.config.actor_rollout_ref.rollout.calculate_log_probs:
             fields.extend(["responses", "rollout_log_probs"])
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
         # 2. write old_log_probs and entropy back to TransferQueue
-        data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
-        data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
+        data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"], data.get("prompts"))
+        data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"], data.get("prompts"))
         batch = tq.kv_batch_put(
             keys=batch.keys, partition_id=batch.partition_id, fields=data.select("old_log_probs", "entropy")
         )
@@ -1684,9 +1684,9 @@ class PPOTrainer(ABC):
 
         # 2. write ref_log_prob and entropy back to TransferQueue
         data = tq.kv_batch_get(
-            keys=batch.keys, partition_id=batch.partition_id, select_fields=["log_probs", "response_mask"]
+            keys=batch.keys, partition_id=batch.partition_id, select_fields=["log_probs", "response_mask", "prompts"]
         )
-        data["ref_log_prob"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
+        data["ref_log_prob"] = response_from_nested(data.pop("log_probs"), data["response_mask"], data.get("prompts"))
         tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select("ref_log_prob"))
 
         return batch
@@ -1706,9 +1706,9 @@ class PPOTrainer(ABC):
 
         # 2. write value back to TransferQueue
         data = tq.kv_batch_get(
-            keys=batch.keys, partition_id=batch.partition_id, select_fields=["values", "response_mask"]
+            keys=batch.keys, partition_id=batch.partition_id, select_fields=["values", "response_mask", "prompts"]
         )
-        data["values"] = response_from_nested(data.pop("values"), data["response_mask"])
+        data["values"] = response_from_nested(data.pop("values"), data["response_mask"], data.get("prompts"))
         tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select("values"))
 
         return batch

@@ -47,6 +47,10 @@ FSDP_SIZE=${FSDP_SIZE:-16}
 TP_SIZE=${TP_SIZE:-1}
 EP_SIZE=${EP_SIZE:-8}
 EFSDP_SIZE=${EFSDP_SIZE:-1}
+# [1102 CP] KV-AllGather 上下文并行大小：1=关闭（默认，行为不变），2=序列两段切分。
+# 注意：>1 时数据侧必须把稠密序列长度补齐到 cp_size*max(compress_ratio) 的倍数，
+# 由环境变量 MY_ENV_DSV41_CP_PAD_MULTIPLE 控制（见 my_scripts/1102_run_dsv41_cp_validate_v1.sh）。
+CP_SIZE=${CP_SIZE:-1}
 ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.6}
 
 # 默认用 SFT 热启动权重；top64-bf16 原始权重会 never-EOS（F-31）勿直接 RL
@@ -276,6 +280,8 @@ ACTOR=(
     "${ACTOR_TURBO}.distributed.expert_parallel_size=${EP_SIZE}"
     "${ACTOR_TURBO}.distributed.expert_fully_shard_parallel_size=${EFSDP_SIZE}"
     "${ACTOR_TURBO}.distributed.ulysses_parallel_size=1"
+    # + 前缀：kv_allgather_parallel_size 不在 Hydra struct 里，必须用 + 追加（实测）
+    "+${ACTOR_TURBO}.distributed.kv_allgather_parallel_size=${CP_SIZE}"
     "+${ACTOR_TURBO}.distributed.fsdp_plan.apply_modules=${FSDP_APPLY_MODULES}"
     "+${ACTOR_TURBO}.distributed.fsdp_plan.hook_modules=${HOOK_MODULES}"
     "+${ACTOR_TURBO}.distributed.fsdp_plan.cast_forward_inputs=False"
