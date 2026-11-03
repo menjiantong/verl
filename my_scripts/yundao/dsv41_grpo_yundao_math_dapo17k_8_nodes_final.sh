@@ -22,14 +22,18 @@ set -eo pipefail
 
 # ------------------------------ 路径 ----------------------------------------
 MIRROR_ROOT=/efs_rl/m00899630/workspace/dsv41-verl
-MODEL_PATH=/efs_rl/weights/DeepSeek-V4.1-Flash-bf16-noengram
+# [1103] 允许外层脚本覆盖权重（Engram+CP 版用带 engram 表的
+# DeepSeek-V4.1-Flash-bf16）；不设置时保持 8 机 noengram 基线，行为不变。
+MODEL_PATH=${MY_ENV_DSV41_MODEL_PATH:-/efs_rl/weights/DeepSeek-V4.1-Flash-bf16-noengram}
 TOKENIZER_PATH=/efs_rl/m00899630/dsv41/rl_tokenizer
 TRAIN_FILE=/efs_rl/m00899630/dsv41/rl_data/dapo_math_17k/dapo-math-17k.parquet
 TEST_FILE=/efs_rl/m00899630/dsv41/rl_data/dapo_math_val_64.parquet
 
 PROJECT_NAME=GRPO-DeepSeekV41
 RUN_STAMP=$(date +%m%d-%H%M%S)
-EXPERIMENT_NAME="GRPO-DSV41-MathDAPO17k-8node-${RUN_STAMP}"
+# [1103] 实验名后缀可被外层脚本覆盖（Engram+CP 版用 engram-cp2），
+# 默认保持 MathDAPO17k-8node。
+EXPERIMENT_NAME="GRPO-DSV41-${MY_ENV_DSV41_EXPERIMENT_TAG:-MathDAPO17k-8node}-${RUN_STAMP}"
 CKPTS_DIR="/efs_rl/m00899630/dsv41/ckpts/${PROJECT_NAME}/${EXPERIMENT_NAME}"
 
 WORKING_DIR="${MIRROR_ROOT}/verl"
@@ -71,12 +75,21 @@ GEN_TP=8
 GEN_DP=16
 GEN_EP=128
 
+# ------------------------------ CP / Engram ---------------------------------
+# [1103] CP（KV-AllGather）：1=关，2=开。example 第 284 行会追加
+# +...distributed.kv_allgather_parallel_size=${CP_SIZE}。
+CP_SIZE=${MY_ENV_DSV41_CP_SIZE:-1}
+# [1103] vLLM 侧 Engram 表节点内 DP 共享：1=开（每节点一份 393 GB TP 分片表）。
+VLLM_ENGRAM_DP_SHARED_MEMORY=${MY_ENV_DSV41_ENGRAM_DP_SHARED:-0}
+
 # ------------------------------ rollout / offload ---------------------------
 INFER_BACKEND=vllm
 ROLLOUT_GPU_MEM_UTIL=0.5
 FREE_CACHE_ENGINE=True
 BATCH_INVARIANT=true
-LOAD_FORMAT=auto
+# [1103] Engram DP 共享表要求真正从 checkpoint 读权重（dummy 会让表留空），
+# 外层脚本覆盖为 safetensors；默认 auto 保持基线行为。
+LOAD_FORMAT=${MY_ENV_DSV41_LOAD_FORMAT:-auto}
 AGENT_LOOP=deepseek_v41_vl_single_turn
 PARAM_OFFLOAD=True
 OPTIMIZER_OFFLOAD=True
@@ -87,8 +100,9 @@ REF_PARAM_OFFLOAD=${PARAM_OFFLOAD}
 # 110 步保存一次；500 步末步也会保存一份。
 # 当前 /efs_rl 约 4.8T，每份全模型约 1.2T，keep=3 约 3.6T，安全。
 # 若把共享盘清到 >6.5T，可改成 5，保留 110/220/330/440/500 五份。
-STEPS=500
-SAVE_FREQ=110
+# [1103] 步数/保存频率可被外层脚本覆盖（验证短跑用 10/-1），默认保持长跑 500/110。
+STEPS=${MY_ENV_DSV41_STEPS:-500}
+SAVE_FREQ=${MY_ENV_DSV41_SAVE_FREQ:-110}
 MAX_CKPT_KEEP=3
 SAVE_CONTENTS="['model']"
 LOAD_CONTENTS="['model']"
@@ -130,6 +144,7 @@ export NNODES NDEVICES_PER_NODE
 export FSDP_SIZE TP_SIZE EP_SIZE EFSDP_SIZE
 export GEN_TP GEN_DP GEN_EP
 export INFER_BACKEND ROLLOUT_GPU_MEM_UTIL FREE_CACHE_ENGINE
+export CP_SIZE VLLM_ENGRAM_DP_SHARED_MEMORY
 export BATCH_INVARIANT LOAD_FORMAT AGENT_LOOP
 export PARAM_OFFLOAD OPTIMIZER_OFFLOAD OFFLOAD_POLICY REF_PARAM_OFFLOAD
 
@@ -294,15 +309,20 @@ echo "[=====info=====] Net: MY_IP=${MY_IP} NIC=${NIC} GLOO=${GLOO_SOCKET_IFNAME}
 echo "[=====info=====] Deps: ${DEPS_DIR} (transformers 5.21.0, tokenizers 0.23.3)"
 echo "[=====info=====] Topology: world=$((NNODES * NDEVICES_PER_NODE)) FSDP=${FSDP_SIZE} EP=${EP_SIZE} EFSDP=${EFSDP_SIZE}"
 echo "[=====info=====] Rollout: TP=${GEN_TP} DP=${GEN_DP} EP=${GEN_EP}"
+echo "[=====info=====] CP=${CP_SIZE} engram_dp_shared=${VLLM_ENGRAM_DP_SHARED_MEMORY} model=${MODEL_PATH}"
 echo "[=====info=====] Data: prompt=${MAX_PROMPT_LEN} response=${MAX_RESPONSE_LEN} max_model_len=${MAX_MODEL_LEN}"
 echo "[=====info=====] Save: every ${SAVE_FREQ} steps, keep=${MAX_CKPT_KEEP}, steps=${STEPS}"
 echo "[=====info=====] CKPTS_DIR=${CKPTS_DIR}"
 
 AVAIL_T=$(df -Pk /efs_rl | awk 'NR==2 {printf "%.1f", $4/1024/1024/1024}')
 NEED_T=$(awk -v k="$MAX_CKPT_KEEP" 'BEGIN{printf "%.1f", k*1.2}')
-echo "[=====info=====] Disk: /efs_rl avail=${AVAIL_T}T, ${MAX_CKPT_KEEP} checkpoints ~${NEED_T}T"
-if awk -v a="$AVAIL_T" -v n="$NEED_T" 'BEGIN{exit !(a < n + 0.5)}'; then
-  echo "[WARN] /efs_rl free space may be insufficient for ${MAX_CKPT_KEEP} checkpoints" >&2
+if [ "$SAVE_FREQ" -ge 0 ]; then
+  echo "[=====info=====] Disk: /efs_rl avail=${AVAIL_T}T, ${MAX_CKPT_KEEP} checkpoints ~${NEED_T}T"
+  if awk -v a="$AVAIL_T" -v n="$NEED_T" 'BEGIN{exit !(a < n + 0.5)}'; then
+    echo "[WARN] /efs_rl free space may be insufficient for ${MAX_CKPT_KEEP} checkpoints" >&2
+  fi
+else
+  echo "[=====info=====] Disk: SAVE_FREQ=${SAVE_FREQ}, checkpoint disabled; /efs_rl avail=${AVAIL_T}T"
 fi
 
 # =============================================================================
