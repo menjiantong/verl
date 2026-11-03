@@ -372,14 +372,23 @@ if [ "$NODE_RANK" -eq 0 ]; then
     "trainer.v1.sampler.sync_refill_failed_groups=${SYNC_REFILL}"
   )
 
+  # [1103] SAVE_FREQ<0 时完全不传 checkpoint 内容键：trainer_base.py:467 只在
+  # save_freq>0 时保存（含最后一步也不落盘），验证/不存权重时避免误写。
+  CKPT_ARGS=()
+  if [ "$SAVE_FREQ" -ge 0 ]; then
+    CKPT_ARGS=(
+      "actor_rollout_ref.actor.checkpoint.save_contents=${SAVE_CONTENTS}"
+      "actor_rollout_ref.actor.checkpoint.load_contents=${LOAD_CONTENTS}"
+    )
+  fi
+
   bash "$EXAMPLE" \
     "trainer.total_training_steps=${STEPS}" \
     "trainer.val_before_train=${VAL_BEFORE_TRAIN}" \
     "trainer.test_freq=${TEST_FREQ}" \
     "trainer.save_freq=${SAVE_FREQ}" \
     "trainer.max_actor_ckpt_to_keep=${MAX_CKPT_KEEP}" \
-    "actor_rollout_ref.actor.checkpoint.save_contents=${SAVE_CONTENTS}" \
-    "actor_rollout_ref.actor.checkpoint.load_contents=${LOAD_CONTENTS}" \
+    "${CKPT_ARGS[@]}" \
     "++actor_rollout_ref.actor.fsdp_config.turbo_config.memory.recompute=true" \
     "++actor_rollout_ref.actor.fsdp_config.turbo_config.memory.recompute_plan=${RECOMPUTE_PLAN}" \
     "algorithm.rollout_correction.rollout_is=${ROLLOUT_IS}" \

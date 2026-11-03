@@ -24,7 +24,10 @@
 #      （engram 共享表常驻后 rtMallocHost 会报 207001）。
 #   5. eval：step0 先评一次基线，之后每 50 步评一次
 #      （val_before_train=True / test_freq=50，val 集 dapo_math_val_64）。
-#   6. 200 步，每 100 步存一次，保留 2 份（全模型含 engram 单份约 1.4 TB）。
+#   6. 不存权重：SAVE_FREQ=-1。verl 的 v1 trainer 只在 save_freq>0 时保存
+#      （trainer_base.py:467，含最后一步也不落盘），基线脚本在 SAVE_FREQ<0 时
+#      连 checkpoint 内容键都不传；全模型含 engram 单份 ckpt 约 1.4 TB，验证阶段
+#      不写盘，避免长时间占用 /efs_rl。
 #
 # 前置代码（已核对，2026-11-03 用户更新后）：
 #   FSDPTurbo CP d84d257/03c3c1d/8703d04；verl CP 响应切片（padding.py
@@ -37,7 +40,7 @@
 #
 # 可用环境变量覆盖（不设置则用下面的默认值）：
 #   MY_ENV_DSV41_STEPS        训练步数，默认 200
-#   MY_ENV_DSV41_SAVE_FREQ    保存频率，默认 100（-1=不存）
+#   MY_ENV_DSV41_SAVE_FREQ    保存频率，默认 -1（不存权重）
 #   MY_ENV_DSV41_TEST_FREQ    eval 频率，默认 50（-1=不评）
 #   MY_ENV_DSV41_CP_SIZE      CP 大小，默认 2（1=关）
 #   MY_ENV_DSV41_MIN_MEM_GB   单节点最低 MemAvailable，默认 1600
@@ -48,7 +51,7 @@ BASE=/efs_rl/m00899630/workspace/dsv41-verl/verl/my_scripts/yundao/dsv41_grpo_yu
 ENGRAM_MODEL=/efs_rl/weights/DeepSeek-V4.1-Flash-bf16
 
 STEPS=${MY_ENV_DSV41_STEPS:-200}
-SAVE_FREQ=${MY_ENV_DSV41_SAVE_FREQ:-100}
+SAVE_FREQ=${MY_ENV_DSV41_SAVE_FREQ:--1}
 MAX_CKPT_KEEP=${MY_ENV_DSV41_MAX_CKPT_KEEP:-2}
 TEST_FREQ=${MY_ENV_DSV41_TEST_FREQ:-50}
 CP_SIZE=${MY_ENV_DSV41_CP_SIZE:-2}
@@ -140,7 +143,7 @@ if [ "$SAVE_FREQ" -ge 0 ]; then
   fi
 fi
 
-echo "[engram-cp] MY_DEBUG_LOG engram_cp_config steps=${STEPS} save_freq=${SAVE_FREQ} keep=${MAX_CKPT_KEEP} test_freq=${TEST_FREQ} cp=${CP_SIZE} model=${ENGRAM_MODEL} dp_shared=1 load_format=safetensors"
+echo "[engram-cp] MY_DEBUG_LOG engram_cp_config steps=${STEPS} save_freq=${SAVE_FREQ} test_freq=${TEST_FREQ} cp=${CP_SIZE} model=${ENGRAM_MODEL} dp_shared=1 load_format=safetensors"
 
 # -----------------------------------------------------------------------------
 # 4. 交给基线脚本（Ray 启动 / ModelArts 节点角色 / 训练参数全部在基线里）
