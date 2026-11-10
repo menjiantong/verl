@@ -1306,6 +1306,11 @@ class vLLMHttpServer:
             and getattr(mtp_config, "enable", False)
             and getattr(mtp_config, "enable_rollout", False)
         )
+        # [1110] 显式覆盖 sleep level（默认保持原行为）。level=2 会丢弃整个权重池，
+        # 训练期间把推理 HBM 让给 FSDP；wake_up(weights) 时由保存参数 + 下次 weight sync 恢复。
+        override = os.getenv("MY_ENV_DSV41_SLEEP_LEVEL", "").strip()
+        if override in ("1", "2") and not mtp_rollout_enabled and not self.lora_as_adapter:
+            return int(override)
         if mtp_rollout_enabled or self.lora_as_adapter or is_torch_npu_available(check_device=False):
             return 1
         return 2

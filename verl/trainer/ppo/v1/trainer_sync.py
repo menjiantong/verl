@@ -30,12 +30,32 @@ class PPOTrainerSync(PPOTrainer):
 
     def on_init_end(self):
         # update weights after loading checkpoint
+        # [MY_ENV_DSV41_GATE_BIAS_DEBUG] 记录 init 同步阶段：证明首次 rollout 前是否会覆盖本地权重。
+        _gbd = None
+        if os.environ.get("MY_ENV_DSV41_GATE_BIAS_DEBUG") == "1":
+            try:
+                import gate_bias_debug as _gbd
+                _gbd.sync_phase("init_begin", self.global_steps)
+            except ImportError:
+                _gbd = None
         self.checkpoint_manager.update_weights(self.global_steps)
+        if _gbd is not None:
+            _gbd.sync_phase("init_end", self.global_steps)
 
     def on_step_end(self):
         with marked_timer("update_weights", self.timing_raw, color="red"):
+            # [MY_ENV_DSV41_GATE_BIAS_DEBUG] 记录每个 step 的同步阶段。
+            _gbd = None
+            if os.environ.get("MY_ENV_DSV41_GATE_BIAS_DEBUG") == "1":
+                try:
+                    import gate_bias_debug as _gbd
+                    _gbd.sync_phase("step_end_begin", self.global_steps)
+                except ImportError:
+                    _gbd = None
             # wake up all replicas to update weights
             self.checkpoint_manager.update_weights(self.global_steps)
+            if _gbd is not None:
+                _gbd.sync_phase("step_end_end", self.global_steps)
 
     def on_sample_end(self):
         # sleep all replicas to discard weights and kv cache

@@ -846,7 +846,20 @@ class FSDPEngine(BaseEngine):
                 print(f"WARN: grad_norm is not finite: {grad_norm}")
                 self.optimizer.zero_grad()
             else:
+                # [MY_ENV_DSV41_GATE_BIAS_DEBUG] 记录 optimizer.step 前后 gate bias 的 hash。
+                if os.environ.get("MY_ENV_DSV41_GATE_BIAS_DEBUG") == "1":
+                    try:
+                        import gate_bias_debug as _gbd
+                        _gbd.optimizer_log(self.module, self.optimizer, "before")
+                    except ImportError:
+                        pass
                 self.optimizer.step()
+                if os.environ.get("MY_ENV_DSV41_GATE_BIAS_DEBUG") == "1":
+                    try:
+                        import gate_bias_debug as _gbd
+                        _gbd.optimizer_log(self.module, self.optimizer, "after")
+                    except ImportError:
+                        pass
 
         if self._qat_enabled:
             from verl.utils.qat.core import invalidate_all_scales

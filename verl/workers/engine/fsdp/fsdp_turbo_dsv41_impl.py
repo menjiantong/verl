@@ -911,6 +911,17 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
 
         from .utils import split_fused_expert_tensor
 
+        # [MY_ENV_DSV41_GATE_BIAS_DEBUG] 权重同步导出时记录 gate bias 的 dtype/hash。
+        if os.environ.get("MY_ENV_DSV41_GATE_BIAS_DEBUG") == "1" and ("gate.bias" in name or "e_score_correction_bias" in name):
+            try:
+                import gate_bias_debug as _gbd
+                for _n, _t in super()._export_param(name, param):
+                    _gbd.export_log(_n, _t)
+                    yield _n, _t
+                return
+            except ImportError:
+                pass
+
         if _is_host_engram_param(name, param):
             # Host-offload Engram tables: frozen (the rollout engine also keeps them
             # requires_grad=False) and host-resident. Streaming them would move
@@ -1248,6 +1259,14 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
                 "Check that the checkpoint covers every parameter.".format(still_meta[:5])
             )
 
+        # [MY_ENV_DSV41_GATE_BIAS_DEBUG] checkpoint 加载完成后记录 bias dtype/hash。
+        if os.environ.get("MY_ENV_DSV41_GATE_BIAS_DEBUG") == "1":
+            try:
+                import gate_bias_debug as _gbd
+                _gbd.loaded_log(module)
+            except ImportError:
+                pass
+
     def _load_dsv41_parameters_directly(
         self, module, checkpoint_dir, param_meta, buffer_meta, offload_policy, engram_tables, started
     ) -> bool:
@@ -1327,7 +1346,23 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
         started = time.time()
         layout: list[tuple[str, int, int]] = []
         total_bytes = 0
+        shared_tables = 0
         for checkpoint_name, table in engram_tables:
+            # [1107 P0] actor 复用了 ref 的物理表：checkpoint 行已经在 ref 的加载里回填，
+            # 这里只登记 layout 供下面的 tiling 校验，不再 copy_、也不再 materialize 临时行
+            # （那一步是 183 GiB 级别的匿名分配 + 页缓存读取，是 MemAvailable 的主要压力源）。
+            if getattr(table, "_shared_hit", False):
+                start = table.row_start
+                end = min(start + table.local_rows, table.logical_num_embeddings)
+                layout.append((checkpoint_name, start, end))
+                total_bytes += (end - start) * table.embedding_dim * table.weight.element_size()
+                shared_tables += 1
+                print(
+                    f"[1107 P0] reusing shared Engram table {checkpoint_name}: "
+                    f"checkpoint rows [{start}, {end}) already loaded by the ref engine",
+                    flush=True,
+                )
+                continue
             if table.weight.is_meta or table.mesh is None:
                 raise RuntimeError(
                     f"Engram table {checkpoint_name} was not EP-sharded by FSDP-Turbo before the load "
@@ -1408,6 +1443,12 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
                 total_bytes / 1024**3,
                 time.time() - started,
             )
+            if shared_tables:
+                _log_rank0(
+                    "[1107 P0] %d of %d engram table(s) reused from the ref engine; no second host copy",
+                    shared_tables,
+                    len(engram_tables),
+                )
 
     def _dsv41_model_path(self) -> str:
         """Directory of the rollout checkpoint: config.json + tokenizer + safetensors."""
