@@ -191,6 +191,12 @@ class Worker(WorkerHelper):
 
         self._setup_env_cuda_visible_devices()
 
+        # [1110] 主机 NUMA/THP 策略必须在任何 engram 大表分配之前生效。
+        # 默认两个开关都关闭时此调用只返回，不改变任何行为。
+        from verl.utils.host_numa import apply_host_numa_env
+
+        apply_host_numa_env()
+
         world_size = int(os.environ["WORLD_SIZE"])
         rank = int(os.environ["RANK"])
         self._rank = rank

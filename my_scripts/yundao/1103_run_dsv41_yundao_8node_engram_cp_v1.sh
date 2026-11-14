@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# [验证结果] ⚠️ 部分：作为 1105/1106 链路的一环已跑通 8 机 2 步；但直接按默认 CP=2 跑（11/03 23:51、11/04 10:22）未跑通（校验阶段报错 / 卡在 AdamW 状态创建后被 keepalive 判死）。
 # =============================================================================
 # 1103 DSV4.1 云道 8 机 全尺寸（384 专家）Engram + CP 启动器 v1
 #
@@ -44,11 +45,20 @@
 #   MY_ENV_DSV41_TEST_FREQ    eval 频率，默认 50（-1=不评）
 #   MY_ENV_DSV41_CP_SIZE      CP 大小，默认 2（1=关）
 #   MY_ENV_DSV41_MIN_MEM_GB   单节点最低 MemAvailable，默认 1600
+#   MY_ENV_DSV41_MODEL_OVERRIDE   [1106] 换权重做对照用，默认带 engram 的全尺寸基座
+#   MY_ENV_DSV41_REQUIRE_ENGRAM   [1106] 1=权重必须含 engram 表且 /dev/shm≥450 GiB（默认）；
+#                                        0=跳过这两项检查（noengram 对照组用）
+#   MY_ENV_DSV41_ENGRAM_DP_SHARED [1106] vLLM 侧 engram DP 共享表，默认 1
+# 上面三个变量不设置时行为与 11/03 完全一致（默认值不变）。
 # =============================================================================
 set -eo pipefail
 
 BASE=/efs_rl/m00899630/workspace/dsv41-verl/verl/my_scripts/yundao/dsv41_grpo_yundao_math_dapo17k_8_nodes_final.sh
-ENGRAM_MODEL=/efs_rl/weights/DeepSeek-V4.1-Flash-bf16
+# [1106] 默认仍是带 engram 的全尺寸基座；外层脚本可用 MY_ENV_DSV41_MODEL_OVERRIDE
+# 换成 /efs_rl/weights/DeepSeek-V4.1-Flash-bf16-noengram 做对照。
+ENGRAM_MODEL=${MY_ENV_DSV41_MODEL_OVERRIDE:-/efs_rl/weights/DeepSeek-V4.1-Flash-bf16}
+# [1106] 1=要求权重必须含 engram 表（默认，行为不变）；0=对照组的 noengram 权重。
+REQUIRE_ENGRAM=${MY_ENV_DSV41_REQUIRE_ENGRAM:-1}
 
 STEPS=${MY_ENV_DSV41_STEPS:-200}
 SAVE_FREQ=${MY_ENV_DSV41_SAVE_FREQ:--1}
@@ -61,21 +71,25 @@ MIN_MEM_GB=${MY_ENV_DSV41_MIN_MEM_GB:-1600}
 # 1. 传给基线的差异（rule 7.1：全部写在本脚本内，不在命令行 export）
 # -----------------------------------------------------------------------------
 export MY_ENV_DSV41_MODEL_PATH="$ENGRAM_MODEL"
-export MY_ENV_DSV41_EXPERIMENT_TAG="engram-cp${CP_SIZE}"
+export MY_ENV_DSV41_EXPERIMENT_TAG="${MY_ENV_DSV41_EXPERIMENT_TAG:-engram-cp${CP_SIZE}}"
 # 日志目录标记，便于在 logs/ 下区分本实验（基线默认 math-dapo17k）。
-export MY_ENV_DSV41_RUN_TAG="engram-cp${CP_SIZE}-math-dapo17k"
+export MY_ENV_DSV41_RUN_TAG="${MY_ENV_DSV41_RUN_TAG:-engram-cp${CP_SIZE}-math-dapo17k}"
 export MY_ENV_DSV41_STEPS="$STEPS"
 export MY_ENV_DSV41_SAVE_FREQ="$SAVE_FREQ"
 export MY_ENV_DSV41_MAX_CKPT_KEEP="$MAX_CKPT_KEEP"
 # eval：step0 基线 + 每 TEST_FREQ 步一次。
 export MY_ENV_DSV41_TEST_FREQ="$TEST_FREQ"
-export MY_ENV_DSV41_VAL_BEFORE_TRAIN=True
+# [1104] 允许外层脚本关掉 step0 验证（快速验证 update 用）。不设该变量时仍然是 True，
+# 行为与 11/04 10:22 那次一致。
+export MY_ENV_DSV41_VAL_BEFORE_TRAIN=${MY_ENV_DSV41_VAL_BEFORE_TRAIN:-True}
 # Engram DP 共享表要求真正从 checkpoint 读权重；example 在
 # VLLM_ENGRAM_DP_SHARED_MEMORY=1 时会追加 load_format=safetensors 与
 # 多线程 lazy 读盘（example 第 207-225 行），这里显式对齐，避免基线
 # 末尾的 load_format=auto 覆盖掉它。
 export MY_ENV_DSV41_LOAD_FORMAT=safetensors
-export MY_ENV_DSV41_ENGRAM_DP_SHARED=1
+# [1106] 默认 1（共享表）；noengram 对照组由外层设为 0，避免 vLLM 仍按 engram
+# 拓扑找共享表（没有表时该开关无意义，且会多走 safetensors 多线程加载分支）。
+export MY_ENV_DSV41_ENGRAM_DP_SHARED=${MY_ENV_DSV41_ENGRAM_DP_SHARED:-1}
 # [1103] vLLM 的 engram 拓扑日志是 INFO 级，verl 的 PPO_RAY_RUNTIME_ENV 默认锁 WARN。
 # 排查阶段放开到 INFO：下次运行检查日志里是否出现
 # "Engram node-local DP group size: 2 (TP=8)" 与每 rank 的 "Engram table offloaded ... GiB"，
@@ -103,23 +117,33 @@ export MY_ENV_VLLM_SLEEP_PIN_MEMORY=0
 
 # -----------------------------------------------------------------------------
 # 2. 权重预检：必须是带 engram 表的全尺寸基座（rule 4.1：结论有证据）
+#    [1106] REQUIRE_ENGRAM=0 时跳过"必须有 engram 表"的断言，只保留 384 专家检查
+#    （noengram 对照组的 config.json 是 engram_layer_ids=[]，其余完全相同，
+#      268 个 safetensors 分片是指向同一份文件的软链，见 11/05 工作日志）。
 # -----------------------------------------------------------------------------
-python3 - "$ENGRAM_MODEL" <<'PY'
+python3 - "$ENGRAM_MODEL" "$REQUIRE_ENGRAM" <<'PY'
 import json, sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
+require_engram = sys.argv[2] == "1"
 cfg = json.loads((root / "config.json").read_text())
 text = cfg.get("text_config", cfg)
 ids = text.get("engram_layer_ids") or []
 nexp = text.get("n_routed_experts")
-assert ids, f"{root}: engram_layer_ids empty, not an engram checkpoint"
-assert nexp == 384, f"{root}: n_routed_experts={nexp}, need the full 384-expert checkpoint"
+# [1106-单机] 专家数可配：单机对照 124 用 top32（32 专家），默认仍是 384。
+# 不设环境变量时与原来逐字等价；断言消息与日志都会打印实际值，避免误用权重被静默放过。
+import os
+_EXPECT_EXPERTS = int(os.environ.get("MY_ENV_DSV41_EXPECT_EXPERTS", "384"))
+assert nexp == _EXPECT_EXPERTS, (
+    f"{root}: n_routed_experts={nexp}, need the full {_EXPECT_EXPERTS}-expert checkpoint")
 w = json.loads((root / "model.safetensors.index.json").read_text())["weight_map"]
 tables = [k for k in w if "engram" in k and k.endswith("embed.weight")]
-assert len(tables) == len(ids), f"{root}: engram tables {tables} vs ids {ids}"
+if require_engram:
+    assert ids, f"{root}: engram_layer_ids empty, not an engram checkpoint"
+    assert len(tables) == len(ids), f"{root}: engram tables {tables} vs ids {ids}"
 print(f"[engram-cp] MY_DEBUG_LOG model_check_ok root={root} layers={text.get('num_hidden_layers')} "
-      f"experts={nexp} engram_layers={ids} engram_tables={len(tables)}")
+      f"experts={nexp} engram_layers={ids} engram_tables={len(tables)} require_engram={int(require_engram)}")
 PY
 
 # -----------------------------------------------------------------------------
@@ -136,7 +160,8 @@ if [ "$AVAIL_GB" -lt "$MIN_MEM_GB" ]; then
   exit 3
 fi
 # 单份共享表 393 GB，留 15% 余量。
-if [ "$SHM_AVAIL_GB" -lt 450 ]; then
+# [1106] 该门槛只对 engram 共享表有意义；REQUIRE_ENGRAM=0 时跳过。
+if [ "$REQUIRE_ENGRAM" = "1" ] && [ "$SHM_AVAIL_GB" -lt 450 ]; then
   echo "[engram-cp] ABORT: /dev/shm avail=${SHM_AVAIL_GB}GiB < 450GiB (engram shared table needs ~393GiB)" >&2
   exit 3
 fi

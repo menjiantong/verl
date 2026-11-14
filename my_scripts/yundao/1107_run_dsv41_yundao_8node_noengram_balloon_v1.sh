@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# [验证结果] ⏳ 待验证：2026-11-07 E2 内存气球对照脚本，尚未实跑。
+# =============================================================================
+# 1107 DSV4.1 云道 8 机：**无 Engram + 人造主机内存气球**（E2）
+#
+# 基线（rule 7.3/7.4：本脚本只写差异）：
+#   my_scripts/yundao/1106_run_dsv41_yundao_8node_noengram_cp1_fadvise_v1.sh
+#     → 1105_..._cp1_fadvise_v3.sh → … → 1103_..._engram_cp_v1.sh
+#       → 基线 dsv41_grpo_yundao_math_dapo17k_8_nodes_final.sh
+#
+# -----------------------------------------------------------------------------
+# 一、E2 要回答的问题
+# -----------------------------------------------------------------------------
+#   1106 已经证明：去掉 Engram，step2 update_actor 1428.9 s → 49.06 s（29×）。
+#   但"去掉 Engram"同时去掉了 **三样东西**：
+#     (a) engram 的代码路径（_TorchHostFetch：all_to_all + D2H + CPU gather）
+#     (b) 366 GiB /dev/shm tmpfs（vLLM 共享表，不可回收）
+#     (c)  46 GiB pinned 匿名内存（训练侧 EP128 分片表）
+#   1106 无法区分是 (a) 还是 (b)+(c) 造成的。E2 就是补这个对照：
+#   **代码路径保持 noengram，只把 (b)+(c) 的内存占用按原样加回去。**
+#
+#   判读：
+#     A) update_actor 仍 ~50 s（≤100 s）
+#        → 主机内存压力**不是**原因，(a) engram 代码路径本身就是元凶。
+#          下一步只在代码路径上做优化（表放 NPU / 去掉 D2H 同步 / 换 kernel）。
+#     B) update_actor 回到 ~1400 s
+#        → 元凶是**主机内存压力**（tmpfs + pinned anon 把可用内存压到阈值以下，
+#          导致 rtMallocHost / 页回收 / NUMA 分配退化），与 engram 代码无关。
+#          下一步做结构性方案：engram 表放 NPU 或换存储介质。
+#     C) 中间值 → 两部分各占一部分，按 E1 的分段数据再拆。
+#
+# -----------------------------------------------------------------------------
+# 二、气球怎么造（每节点，脚本启动时一次性，训练开始前就位）
+# -----------------------------------------------------------------------------
+#   /dev/shm 上 366 GiB tmpfs 文件（POSIX shmem，**不可回收**，与 engram 共享表同性质）
+#   + 46 GiB 普通匿名页（mmap + 逐页 touch 常驻，对应训练侧 pinned 表）
+#   = 412 GiB/节点，与 11/05 14:29 engram 版多出来的主机占用同量级
+#     （实测 cpu_memory 1589.4 GiB vs noengram 1080.0 GiB，差 509 GiB）。
+#
+#   气球由本脚本 fork 的一个 python 进程持有，训练期间常驻；
+#   作业容器结束 → 进程与 /dev/shm 一起随容器销毁，不写任何用户目录、不删任何用户文件。
+#
+#   开关（全部 MY_ENV_ 前缀，默认值与 engram 实测占用对齐）：
+#     MY_ENV_DSV41_BALLOON_ENABLE=1     1=开（默认），0=退化成纯 1106 对照组
+#     MY_ENV_DSV41_BALLOON_SHM_GIB=366  /dev/shm tmpfs 部分
+#     MY_ENV_DSV41_BALLOON_ANON_GIB=46  匿名页部分
+#     MY_ENV_DSV41_BALLOON_WAIT_S=600   等待气球就位的上限
+#
+#   预检（失败即 ABORT，绝不在气球没就位的情况下静默开跑）：
+#     /dev/shm 可用 ≥ SHM+10 GiB；MemAvailable ≥ SHM+ANON+1100 GiB
+#     （noengram 训练本身要 ~1080 GiB，1103 的 MIN_MEM_GB=1200 会在气球之后复核）
+#
+# -----------------------------------------------------------------------------
+# 三、与 1106 的唯一差异
+# -----------------------------------------------------------------------------
+#   1106 的 4 个 export 全部保留（noengram 权重 / 跳过 engram 预检 / 关 dp_shared /
+#   门槛 1200 GiB），额外只加：气球 + 标签。训练配置一个都没动。
+#
+# 用法（云道"启动命令"只填这一行，8 机作业，每节点都会执行）：
+#   bash /efs_rl/m00899630/workspace/dsv41-verl/verl/my_scripts/yundao/1107_run_dsv41_yundao_8node_noengram_balloon_v1.sh \
+#     |& tee /efs_rl/m00899630/workspace/dsv41-verl/verl/logs/dsv4-yundao_dapo_noengram_balloon_$(date -u -d '+8 hours' +'%Y%m%d_%H%M%S').log
+#
+# 回滚：跑 1106_..._noengram_cp1_fadvise_v1.sh（本脚本只多一个内存气球进程）。
+# =============================================================================
+
+set -euo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+BASE="${HERE}/1106_run_dsv41_yundao_8node_noengram_cp1_fadvise_v1.sh"
+
+if [ ! -f "$BASE" ]; then
+  echo "[balloon] ABORT: base wrapper not found: $BASE" >&2
+  exit 3
+fi
+
+MY_ENV_DSV41_BALLOON_ENABLE=${MY_ENV_DSV41_BALLOON_ENABLE:-1}
+MY_ENV_DSV41_BALLOON_SHM_GIB=${MY_ENV_DSV41_BALLOON_SHM_GIB:-366}
+MY_ENV_DSV41_BALLOON_ANON_GIB=${MY_ENV_DSV41_BALLOON_ANON_GIB:-46}
+MY_ENV_DSV41_BALLOON_WAIT_S=${MY_ENV_DSV41_BALLOON_WAIT_S:-600}
+
+BALLOON_DIR=/dev/shm
+BALLOON_STAMP=$(date -u -d '+8 hours' +%Y%m%d_%H%M%S)
+BALLOON_LOG="/tmp/dsv41_balloon_${BALLOON_STAMP}_$$.log"
+
+if [ "$MY_ENV_DSV41_BALLOON_ENABLE" = "1" ]; then
+  SHM_AVAIL_GIB=$(( $(df -Pk /dev/shm | awk 'NR==2{print $4}') / 1048576 ))
+  MEM_AVAIL_GIB=$(( $(awk '/^MemAvailable:/{print $2}' /proc/meminfo) / 1048576 ))
+  NEED_SHM=$(( MY_ENV_DSV41_BALLOON_SHM_GIB + 10 ))
+  NEED_MEM=$(( MY_ENV_DSV41_BALLOON_SHM_GIB + MY_ENV_DSV41_BALLOON_ANON_GIB + 1200 ))
+
+  echo "[balloon] MY_DEBUG_LOG precheck host=$(hostname 2>/dev/null || echo unknown) shm_avail=${SHM_AVAIL_GIB}GiB mem_avail=${MEM_AVAIL_GIB}GiB plan_shm=${MY_ENV_DSV41_BALLOON_SHM_GIB}GiB plan_anon=${MY_ENV_DSV41_BALLOON_ANON_GIB}GiB need_shm=${NEED_SHM}GiB need_mem=${NEED_MEM}GiB"
+
+  if [ "$SHM_AVAIL_GIB" -lt "$NEED_SHM" ]; then
+    echo "[balloon] ABORT: /dev/shm avail=${SHM_AVAIL_GIB}GiB < ${NEED_SHM}GiB" >&2
+    exit 3
+  fi
+  if [ "$MEM_AVAIL_GIB" -lt "$NEED_MEM" ]; then
+    echo "[balloon] ABORT: MemAvailable=${MEM_AVAIL_GIB}GiB < ${NEED_MEM}GiB" >&2
+    exit 3
+  fi
+
+  # 气球进程：先 fallocate 出 tmpfs 页，再 mmap 匿名页并逐页 touch，全部就位后打印 READY，
+  # 然后常驻 sleep。stdout/stderr 落到 $BALLOON_LOG，主日志只打印关键行。
+  python3 - "$MY_ENV_DSV41_BALLOON_SHM_GIB" "$MY_ENV_DSV41_BALLOON_ANON_GIB" "$BALLOON_STAMP" "$$" \
+    > "$BALLOON_LOG" 2>&1 <<'PY' &
+# -*- coding: utf-8 -*-
+# 气球持有进程：SHM 部分 = /dev/shm 上的 tmpfs 文件（POSIX shmem，不可回收，
+# 与 vLLM engram 共享表同性质）；ANON 部分 = mmap 匿名页逐页 touch（常驻，
+# 对应训练侧 pinned engram 表）。两者都就位后打印 READY，然后常驻。
+import mmap
+import os
+import sys
+import time
+
+shm_gib = int(sys.argv[1])
+anon_gib = int(sys.argv[2])
+stamp = sys.argv[3]
+ppid = sys.argv[4]
+host = (os.uname().nodename or "unknown").split(".")[0]
+
+
+def meminfo(key):
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith(key + ":"):
+                return int(line.split()[1]) / 1048576.0
+    return 0.0
+
+
+def shm_avail_gib():
+    st = os.statvfs("/dev/shm")
+    return st.f_bavail * st.f_frsize / 2 ** 30
+
+
+print(f"START host={host} shm_gib={shm_gib} anon_gib={anon_gib} stamp={stamp} ppid={ppid}", flush=True)
+
+# ---- 1) tmpfs 部分：fallocate 立即占页；失败则退化为 1 MiB 块顺序写入 ----
+if shm_gib > 0:
+    path = f"/dev/shm/dsv41_balloon_{stamp}_{ppid}.bin"
+    size = shm_gib << 30
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    t0 = time.time()
+    try:
+        os.posix_fallocate(fd, 0, size)
+        how = "fallocate"
+    except OSError as e:
+        print(f"WARN posix_fallocate failed: {e}; fallback=pwrite", flush=True)
+        chunk = b"\0" * (1 << 20)
+        off = 0
+        while off < size:
+            os.pwrite(fd, chunk, off)
+            off += len(chunk)
+        how = "pwrite"
+    os.close(fd)
+    print(f"SHM_OK path={path} size={shm_gib}GiB how={how} took={time.time()-t0:.1f}s "
+          f"shm_avail={shm_avail_gib():.1f}GiB", flush=True)
+
+# ---- 2) 匿名页部分：mmap + 逐页 touch（每页 4 KiB） ----
+_anon_keep = None
+if anon_gib > 0:
+    size = anon_gib << 30
+    t0 = time.time()
+    # [1105 fix] Python 的 mmap.mmap(-1, size) 默认是 MAP_SHARED|MAP_ANONYMOUS，
+    # 内核用 tmpfs 承载，会记进 Shmem（实测 /proc/self/smaps 该 VMA 为 rw-s）。
+    # 训练侧 engram 表是**真正的匿名页**（pinned anon），所以这里显式指定
+    # MAP_PRIVATE|MAP_ANONYMOUS，才能与 engram 表的内存性质一致。
+    m = mmap.mmap(-1, size, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    step = 4096
+    last = -1
+    for off in range(0, size, step):
+        m[off] = 0
+        cur = off >> 30
+        if cur != last and cur % 8 == 0:
+            print(f"ANON_PROGRESS {cur}GiB/{anon_gib}GiB", flush=True)
+        last = cur
+    _anon_keep = m  # 保持引用，防止被回收
+    print(f"ANON_OK size={anon_gib}GiB took={time.time()-t0:.1f}s", flush=True)
+
+print(f"READY host={host} MemAvailable={meminfo('MemAvailable'):.1f}GiB "
+      f"Shmem={meminfo('Shmem'):.1f}GiB", flush=True)
+
+while True:
+    time.sleep(3600)
+PY
+  BALLOON_PID=$!
+
+  # 等就位：READY 出现在气球日志里，或进程死掉（失败），或超时
+  WAITED=0
+  while :; do
+    if grep -q '^READY' "$BALLOON_LOG" 2>/dev/null; then
+      break
+    fi
+    if ! kill -0 "$BALLOON_PID" 2>/dev/null; then
+      echo "[balloon] ABORT: 气球进程提前退出（见 ${BALLOON_LOG}）" >&2
+      sed -n '1,20p' "$BALLOON_LOG" >&2 || true
+      exit 3
+    fi
+    if [ "$WAITED" -ge "$MY_ENV_DSV41_BALLOON_WAIT_S" ]; then
+      echo "[balloon] ABORT: 等待气球就位超时 ${MY_ENV_DSV41_BALLOON_WAIT_S}s（见 ${BALLOON_LOG}）" >&2
+      exit 3
+    fi
+    sleep 2
+    WAITED=$(( WAITED + 2 ))
+  done
+
+  # 就位后复核一次真实占用，写进主日志（这是 E2 有效性最直接的证据行）
+  SHM_USED_GIB=$(( $(df -Pk /dev/shm | awk 'NR==2{print $3}') / 1048576 ))
+  MEM_AVAIL2_GIB=$(( $(awk '/^MemAvailable:/{print $2}' /proc/meminfo) / 1048576 ))
+  SHMEM2_GIB=$(( $(awk '/^Shmem:/{print $2}' /proc/meminfo) / 1048576 ))
+  # [1105 fix] 作业容器是 cgroup v1：memory.stat 里 total_rss 与 total_rss_huge 都会被
+  # /^total_rss/ 命中，算术表达式因此拿到两个数字 → "syntax error in expression"，
+  # ready 证据行整行打印失败（气球本身已就位，只是丢了这行日志）。改为字段精确匹配，
+  # 并用 total_rss + total_cache 近似 cgroup 当前占用；两条路径都取不到时置 -1。
+  CGROUP_GIB=-1
+  if [ -r /sys/fs/cgroup/memory.current ]; then
+    _cg=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || true)
+    [ -n "${_cg:-}" ] && CGROUP_GIB=$(( _cg / 1073741824 ))
+  elif [ -r /sys/fs/cgroup/memory/memory.stat ]; then
+    _cg=$(awk '$1=="total_rss"||$1=="total_cache"{s+=$2} END{print s+0}' /sys/fs/cgroup/memory/memory.stat 2>/dev/null || true)
+    [ -n "${_cg:-}" ] && CGROUP_GIB=$(( _cg / 1073741824 ))
+  fi
+  echo "[balloon] MY_DEBUG_LOG ready pid=${BALLOON_PID} waited=${WAITED}s shm_used=${SHM_USED_GIB}GiB MemAvailable=${MEM_AVAIL2_GIB}GiB Shmem=${SHMEM2_GIB}GiB cgroup_current=${CGROUP_GIB}GiB log=${BALLOON_LOG}"
+else
+  echo "[balloon] MY_DEBUG_LOG disabled balloon_enable=0（退化为纯 1106 对照组）"
+fi
+
+# 实验标签
+export MY_ENV_DSV41_EXPERIMENT_TAG="noengram-balloon-cp1"
+export MY_ENV_DSV41_RUN_TAG="noengram-balloon-cp1-math-dapo17k"
+
+echo "[balloon] MY_DEBUG_LOG E2 启动 shm=${MY_ENV_DSV41_BALLOON_SHM_GIB}GiB anon=${MY_ENV_DSV41_BALLOON_ANON_GIB}GiB base=$(basename "$BASE") host=$(hostname 2>/dev/null || echo unknown) time=$(date '+%Y-%m-%d %H:%M:%S')"
+
+exec bash "$BASE"

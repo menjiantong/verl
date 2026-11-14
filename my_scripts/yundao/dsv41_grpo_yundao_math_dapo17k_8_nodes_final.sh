@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# [验证结果] ✅ 成功：11/01 17:31 长跑多步正常（610-635 s/step，update_actor 67-80 s）；日志因作业停止而截断，未跑满 200 步。
 # =============================================================================
 # DeepSeek-V4.1 · Math DAPO 17k · 云道 8 机 128 卡 · 全量 384 专家
 #
@@ -26,8 +27,10 @@ MIRROR_ROOT=/efs_rl/m00899630/workspace/dsv41-verl
 # DeepSeek-V4.1-Flash-bf16）；不设置时保持 8 机 noengram 基线，行为不变。
 MODEL_PATH=${MY_ENV_DSV41_MODEL_PATH:-/efs_rl/weights/DeepSeek-V4.1-Flash-bf16-noengram}
 TOKENIZER_PATH=/efs_rl/m00899630/dsv41/rl_tokenizer
-TRAIN_FILE=/efs_rl/m00899630/dsv41/rl_data/dapo_math_17k/dapo-math-17k.parquet
-TEST_FILE=/efs_rl/m00899630/dsv41/rl_data/dapo_math_val_64.parquet
+# [1106-单机] 允许外层覆盖数据集：1 机对照 124 的 P1 用 dapo512，与 8 机 E1 的
+# 全量 dapo-math-17k 区分开。不设置时路径与原来逐字相同，行为不变。
+TRAIN_FILE=${MY_ENV_DSV41_TRAIN_FILE:-/efs_rl/m00899630/dsv41/rl_data/dapo_math_17k/dapo-math-17k.parquet}
+TEST_FILE=${MY_ENV_DSV41_TEST_FILE:-/efs_rl/m00899630/dsv41/rl_data/dapo_math_val_64.parquet}
 
 PROJECT_NAME=GRPO-DeepSeekV41
 RUN_STAMP=$(date +%m%d-%H%M%S)
@@ -52,7 +55,7 @@ DEPS_TAR="${DEPS_DIR}/transformers521_tokenizers023_meta.tar.gz"
 MAX_PROMPT_LEN=384
 MAX_RESPONSE_LEN=1536
 MAX_MODEL_LEN=$((MAX_PROMPT_LEN + MAX_RESPONSE_LEN))
-TRAIN_BSZ=16
+TRAIN_BSZ=${MY_ENV_DSV41_TRAIN_BSZ:-16}
 VAL_BSZ=8
 SAMPLE_N=8
 
@@ -65,15 +68,15 @@ SYNC_REFILL=True
 
 # ------------------------------ 并行 ----------------------------------------
 # 8 机 × 16 卡 = 128 rank；384 专家 / EP128 = 3 专家/rank。
-NNODES=8
-NDEVICES_PER_NODE=16
-FSDP_SIZE=128
+NNODES=${MY_ENV_DSV41_NNODES:-8}
+NDEVICES_PER_NODE=${MY_ENV_DSV41_NDEVICES_PER_NODE:-16}
+FSDP_SIZE=${MY_ENV_DSV41_FSDP_SIZE:-128}
 TP_SIZE=1
-EP_SIZE=128
+EP_SIZE=${MY_ENV_DSV41_EP_SIZE:-128}
 EFSDP_SIZE=1
-GEN_TP=8
-GEN_DP=16
-GEN_EP=128
+GEN_TP=${MY_ENV_DSV41_GEN_TP:-8}
+GEN_DP=${MY_ENV_DSV41_GEN_DP:-16}
+GEN_EP=${MY_ENV_DSV41_GEN_EP:-128}
 
 # ------------------------------ CP / Engram ---------------------------------
 # [1103] CP（KV-AllGather）：1=关，2=开。example 第 284 行会追加
@@ -85,7 +88,9 @@ VLLM_ENGRAM_DP_SHARED_MEMORY=${MY_ENV_DSV41_ENGRAM_DP_SHARED:-0}
 # ------------------------------ rollout / offload ---------------------------
 INFER_BACKEND=vllm
 ROLLOUT_GPU_MEM_UTIL=0.5
-FREE_CACHE_ENGINE=True
+# [1106-单机] 做成开关：1 机对照 124 时用 False（vLLM 常驻，绕开 camem.sleep 的
+# rtMallocHost 卡死）；默认 True 不变，8 机行为完全不变。
+FREE_CACHE_ENGINE=${MY_ENV_DSV41_FREE_CACHE_ENGINE:-True}
 BATCH_INVARIANT=true
 # [1103] Engram DP 共享表要求真正从 checkpoint 读权重（dummy 会让表留空），
 # 外层脚本覆盖为 safetensors；默认 auto 保持基线行为。
@@ -123,7 +128,12 @@ ROLLOUT_IS=null
 #   3) 本模型 40 层、64 heads × head_dim 512，单条 1920 token 的 Q / attn 输出
 #      各约 126MiB/层，attn 重计算可回收约 10GiB，正好留出安全余量。
 # 代价：attention 前向重算一次，单步约 +2%~3%。
-RECOMPUTE_PLAN='["model.layers.{*}.ffn","model.layers.{*}.attn"]'
+# [1104] 允许外层脚本用 MY_ENV_DSV41_RECOMPUTE_PLAN 覆盖重计算粒度；不设时保持上面的
+# ffn+attn 不变（行为与 11/01 完全一致）。传 "model.layers.{*}" 时 checkpoint 覆盖整个
+# Block（含 hc_pre_sinkhorn_premix / hc_post / ffn_norm / attn_norm / engram 投影），
+# 把当前留在卡上的 fp32 flat_x [b,s,4*5120] 一并变成重算量。注意整套替换而非追加：
+# ffn/attn 是 Block 的子模块，同时写会嵌套双重 checkpoint。
+RECOMPUTE_PLAN=${MY_ENV_DSV41_RECOMPUTE_PLAN:-'["model.layers.{*}.ffn","model.layers.{*}.attn"]'}
 
 # ------------------------------ 网络覆盖（一般留空） ------------------------
 # 云道容器默认取 hostname -I 的第一个地址（172.16.x / eth0）；
@@ -320,6 +330,7 @@ echo "[=====info=====] Deps: ${DEPS_DIR} (transformers 5.21.0, tokenizers 0.23.3
 echo "[=====info=====] Topology: world=$((NNODES * NDEVICES_PER_NODE)) FSDP=${FSDP_SIZE} EP=${EP_SIZE} EFSDP=${EFSDP_SIZE}"
 echo "[=====info=====] Rollout: TP=${GEN_TP} DP=${GEN_DP} EP=${GEN_EP}"
 echo "[=====info=====] CP=${CP_SIZE} engram_dp_shared=${VLLM_ENGRAM_DP_SHARED_MEMORY} model=${MODEL_PATH}"
+echo "[=====info=====] Recompute: plan=${RECOMPUTE_PLAN}"
 echo "[=====info=====] Data: prompt=${MAX_PROMPT_LEN} response=${MAX_RESPONSE_LEN} max_model_len=${MAX_MODEL_LEN}"
 echo "[=====info=====] Save: every ${SAVE_FREQ} steps, keep=${MAX_CKPT_KEEP}, steps=${STEPS}"
 echo "[=====info=====] Eval: val_before_train=${VAL_BEFORE_TRAIN}, test_freq=${TEST_FREQ}, val_bsz=${VAL_BSZ}, val_file=${TEST_FILE}"
