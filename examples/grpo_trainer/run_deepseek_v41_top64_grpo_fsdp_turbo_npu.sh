@@ -235,6 +235,52 @@ if [ "${VERL_DSV41_OFFLOAD_PIN_MEMORY:-1}" = "0" ]; then
     )
 fi
 
+########################### 显式 KV 池 ###########################
+# [1114 perf] MY_ENV_DSV41_KV_CACHE_BYTES 非 0 时显式指定 vLLM KV 池字节数（字节），
+# 绕过 gpu_memory_utilization（vllm-ascend worker.py 的 fast path 会忽略 gmu）。
+# 背景：共卡 RL 下 gmu=0.6 会把 21 GiB 钉成 KV（KV=61.27*gmu-15.75），训练侧仅剩
+# ~13 GiB；图模式/更大 micro-batch 需要显式 3 GiB 池留出余量。0=不传（基线行为）。
+KV_OVERRIDES=()
+if [ "${MY_ENV_DSV41_KV_CACHE_BYTES:-0}" != "0" ]; then
+    KV_OVERRIDES+=(
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_memory_bytes=${MY_ENV_DSV41_KV_CACHE_BYTES}"
+    )
+fi
+
+########################### 图模式开关 ###########################
+# [1114] MY_ENV_DSV41_GRAPH_MODE=0（默认）：enforce_eager=True，行为与基线完全一致。
+# 1：vLLM decode 段 ACL Graph。官方 DeepSeek-V4.1-Flash 单机共卡配方
+#    （docs/source/tutorials/models/DeepSeek-V4.1-Flash.md §5.1）：
+#    compilation_config.cudagraph_mode=FULL_DECODE_ONLY
+#    + ascend_compilation_config.enable_npugraph_ex=true；prefill 不进图。
+#    static_kernel 保持 false（官方推荐）。TASK_QUEUE_ENABLE 在图模式下设 1（已是）。
+MY_ENV_DSV41_GRAPH_MODE=${MY_ENV_DSV41_GRAPH_MODE:-0}
+case "${MY_ENV_DSV41_GRAPH_MODE}" in
+    0|1) ;;
+    *) echo "MY_ENV_DSV41_GRAPH_MODE 只接受 0/1，收到 ${MY_ENV_DSV41_GRAPH_MODE}" >&2; exit 1 ;;
+esac
+GRAPH_OVERRIDES=()
+if [ "${MY_ENV_DSV41_GRAPH_MODE}" = "1" ]; then
+    ENFORCE_EAGER=False
+    GRAPH_OVERRIDES+=(
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode=FULL_DECODE_ONLY"
+        "${VLLM_ADDITIONAL_CONFIG_ROOT}.ascend_compilation_config.enable_npugraph_ex=true"
+    )
+    # 可选：显式 capture 档位；默认空=按 vLLM 自动推导。
+    # 注：verl 的 vllm_async_server 会从 engine_kwargs 里 pop compilation_config，
+    # capture sizes 走 rollout 自己的字段（RolloutConfig.cudagraph_capture_sizes）。
+    if [ -n "${MY_ENV_DSV41_CUDAGRAPH_CAPTURE_SIZES:-}" ]; then
+        GRAPH_OVERRIDES+=(
+            "actor_rollout_ref.rollout.cudagraph_capture_sizes=${MY_ENV_DSV41_CUDAGRAPH_CAPTURE_SIZES}"
+        )
+    fi
+else
+    ENFORCE_EAGER=True
+    GRAPH_OVERRIDES+=(
+        "${VLLM_ADDITIONAL_CONFIG_ROOT}.ascend_compilation_config.enable_npugraph_ex=false"
+    )
+fi
+
 ########################### parameter arrays ###########################
 
 DATA=(
@@ -341,8 +387,9 @@ ROLLOUT=(
     actor_rollout_ref.rollout.enable_chunked_prefill=True
     actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PROMPT_LEN + MAX_RESPONSE_LEN))
     actor_rollout_ref.rollout.free_cache_engine=${FREE_CACHE_ENGINE:-True}
-    # run_vllm2.sh serves the checkpoint with --enforce-eager.
-    actor_rollout_ref.rollout.enforce_eager=True
+    # [1114 图模式] MY_ENV_DSV41_GRAPH_MODE=0：eager（默认，行为与基线逐位一致）；
+    # 1：decode 段 ACL Graph（官方 DSV4.1 单机共卡配方，见上方 GRAPH_OVERRIDES）。
+    actor_rollout_ref.rollout.enforce_eager=${ENFORCE_EAGER}
     actor_rollout_ref.rollout.enable_prefix_caching=False
     # [1030 longrun] VL 模型必须从 checkpoint 真实加载（dummy 会丢视觉/engram 语义）
     actor_rollout_ref.rollout.load_format=auto
@@ -364,8 +411,9 @@ ROLLOUT=(
     "${ENGINE_ENGRAM_OVERRIDES[@]}"
     "${ENGINE_LOAD_OVERRIDES[@]}"
     "${PIN_OVERRIDES[@]}"
-    "${VLLM_ADDITIONAL_CONFIG_ROOT}.ascend_compilation_config.enable_npugraph_ex=false"
+    "${KV_OVERRIDES[@]}"
     "${VLLM_ADDITIONAL_CONFIG_ROOT}.ascend_compilation_config.enable_static_kernel=false"
+    "${GRAPH_OVERRIDES[@]}"
     # RL weight updates need weight_nz_mode=0 (FRACTAL_NZ breaks synced-weight precision);
     # rl_config.enabled sets that (and disables expandable segments) on the Ascend side.
     "${VLLM_ADDITIONAL_CONFIG_ROOT}.rl_config.enabled=true"
