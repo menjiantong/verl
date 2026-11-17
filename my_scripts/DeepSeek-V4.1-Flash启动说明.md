@@ -131,3 +131,28 @@ cd /mnt/share/m00899630/workspace/dsv41-verl-rebase/verl
 STEPS=200 bash my_scripts/final/1116_dsv41_1k2k_graph_mb2_v1.sh
 ```
 
+
+
+## 4. sleep mode=2
+
+
+```
+cd FSDPTurbo
+git reset --hard 1852e93064c8e679bb0f731206ad0e549ccde1a2
+cd ..
+
+cd verl
+git reset --hard eb058ff28b7c827719afdc6f2a5951ae6d3f309a
+cd ..
+
+cd vllm-ascend/
+git reset --hard 16c3159dd375721a94d293d5ef8c82302daad8f3
+cd ..
+
+cd vllm
+git reset --hard fd46ca5adaee11331a4c2f1b74483fef491f03cf
+cd ..
+
+bash build.sh
+bash my_scripts/final/1117_dsv41_sleep2_single.sh
+```
