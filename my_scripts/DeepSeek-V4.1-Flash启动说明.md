@@ -135,6 +135,7 @@ STEPS=200 bash my_scripts/final/1116_dsv41_1k2k_graph_mb2_v1.sh
 
 ## 4. sleep mode=2
 
+### 4.1 单机
 
 ```
 cd FSDPTurbo
@@ -155,4 +156,27 @@ cd ..
 
 bash build.sh
 bash my_scripts/final/1117_dsv41_sleep2_single.sh
+```
+
+### 4.2 四机
+
+```
+cd FSDPTurbo
+git reset --hard 6e7815e5e54bb92621b5757b12967f095483245c
+cd ..
+
+cd verl
+git reset --hard c40cbdc4c9399e15ece987fc2826139a3ae8b067
+cd ..
+
+cd vllm-ascend/
+git reset --hard 16c3159dd375721a94d293d5ef8c82302daad8f3
+cd ..
+
+cd vllm
+git reset --hard fd46ca5adaee11331a4c2f1b74483fef491f03cf
+cd ..
+
+bash build.sh
+bash my_scripts/final/1117_dsv41_4node_mixed_swapopt_v1.sh
 ```
