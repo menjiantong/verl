@@ -158,7 +158,7 @@ bash build.sh
 bash my_scripts/final/1117_dsv41_sleep2_single.sh
 ```
 
-### 4.2 四机
+### 4.2 四机 + 参数梯度驻卡 
 
 ```
 cd FSDPTurbo
@@ -180,3 +180,26 @@ cd ..
 bash build.sh
 bash my_scripts/final/1117_dsv41_4node_mixed_swapopt_v1.sh
 ```
+问题：reward不上升
+
+### 4.3 单机 32 专家 + 参数梯度驻卡（修复「reward 不涨」）
+
+单机 16 卡跑 DeepSeek-V4.1-Flash-top32（250.63B）+ countbenchqa，
+sleep mode=2，参数/梯度驻卡（Adam 矩在主机），验证 reward 能正常上涨。
+
+```
+cd FSDPTurbo
+git reset --hard 201f4136b15a2298dc85aeddbf59495e8655b016
+cd ..
+```
+
+- 开关 `MY_ENV_DSV41_GATHER_SPLIT_BACKWARD`：默认 `1`（修复）；`0` 复现用。
+
+
+| 脚本 | 用途 |
+|---|---|
+| `1118_1117_dsv41_sleep2_single_resident_v1.sh` | 基线：单机 + sleep2 + 参数梯度驻卡 + 32 专家 + countbenchqa，**CP=4** |
+| `1118_1117_dsv41_sleep2_single_resident_cp1_15step_v1.sh` | 同上但 **CP=1**（减少 CP 集合通信） |
+
+
+**单机 32 专家用 CP=1**：CP=4 每步 200 s， CP=1  132.6 s（快 1.5×），HBM 多 2 GB（26.05 vs 24.18 GB）。CP=4时，FSDP Turbo需要指定到 `201f413`。
