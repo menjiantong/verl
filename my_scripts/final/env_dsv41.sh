@@ -28,10 +28,57 @@ export VERL_DSV41_VISION=1 VERL_DSV41_EMPTY_CACHE_AFTER_BUILD=1 VERL_DSV41_EMPTY
 export FSDP_TURBO_ATTN_RECOMPUTE=1 FSDP_TURBO_ATTN_CHUNK=64
 
 # ---- CANN / Python ----
-for _env in /usr/local/Ascend/cann/set_env.sh /usr/local/Ascend/ascend-toolkit/set_env.sh \
-            /usr/local/Ascend/cann-9.1.0/set_env.sh /usr/local/Ascend/nnal/atb/set_env.sh; do
-  [ -f "$_env" ] && source "$_env" >/dev/null 2>&1
-done
+# [1117 B075] 灵枢 80.5.27.x 的 CANN toolkit 是 B075，其 libnnopbase.so 丢
+# npu_sparse_flash_mla 的 view stride（73856）→ DSV4.1 rollout logprob 全 NaN
+# （mjt_workplace/dsv41_nan_rootcause_b075_libnnopbase_20261117.md）。受影响节点把
+# MY_ENV_DSV41_CANN_OVERLAY 指向 B243 整包解压目录（/root/cann_b243/cann-9.1.0），
+# 整车改用该构建；未设置时行为与原来完全一致。ATB 是独立组件，始终用系统版本。
+# 默认 auto：仅在检测到 B075 且 overlay 已解包时启用；显式设路径可强制，设 0 可关闭。
+if [ "${MY_ENV_DSV41_CANN_OVERLAY:-auto}" = "auto" ]; then
+  _dsv41_toolkit_info=/usr/local/Ascend/cann-9.1.0/aarch64-linux/ascend_toolkit_install.info
+  _dsv41_inner=$(grep -o 'innerversion=[^[:space:]]*' "$_dsv41_toolkit_info" 2>/dev/null | head -1 || true)
+  if grep -q "innerversion=V100R001C11B075" "$_dsv41_toolkit_info" 2>/dev/null; then
+    if [ -f /root/cann_b243/cann-9.1.0/set_env.sh ]; then
+      export MY_ENV_DSV41_CANN_OVERLAY=/root/cann_b243/cann-9.1.0
+      echo "MY_DEBUG_LOG env_dsv41 cann_overlay=auto->B243 ${_dsv41_inner:-inner=unknown}"
+    else
+      # Running on B075 anyway produces NaN rollout logprobs (libnnopbase view-stride).
+      echo "ERROR: env_dsv41 detected B075 but /root/cann_b243/cann-9.1.0/set_env.sh is missing;" \
+           "unpack cann_910_b243_124.tar there first (see dsv41_nan_rootcause_b075_libnnopbase_20261117.md)" >&2
+      unset MY_ENV_DSV41_CANN_OVERLAY
+    fi
+  else
+    unset MY_ENV_DSV41_CANN_OVERLAY
+    echo "MY_DEBUG_LOG env_dsv41 cann_overlay=none ${_dsv41_inner:-inner=unknown}"
+  fi
+fi
+if [ -n "${MY_ENV_DSV41_CANN_OVERLAY:-}" ] && [ ! -f "${MY_ENV_DSV41_CANN_OVERLAY}/set_env.sh" ]; then
+  echo "ERROR: MY_ENV_DSV41_CANN_OVERLAY=${MY_ENV_DSV41_CANN_OVERLAY} has no set_env.sh" >&2
+  exit 1
+fi
+if [ -n "${MY_ENV_DSV41_CANN_OVERLAY:-}" ]; then
+  # overlay 包里的 set_env.sh 把 version_dirpath 写死为 /usr/local/Ascend/cann-9.1.0，
+  # 直接 source 会指回旧 B075，因此按它的逻辑显式导出（架构固定 aarch64）。
+  _ov="${MY_ENV_DSV41_CANN_OVERLAY}"
+  export ASCEND_TOOLKIT_HOME="$_ov" ASCEND_HOME_PATH="$_ov" ASCEND_OPP_PATH="$_ov/opp"
+  export ASCEND_AICPU_PATH="$_ov" TOOLCHAIN_HOME="$_ov/toolkit"
+  export PATH="$_ov/bin:$_ov/tools/ccec_compiler/bin:$_ov/tools/profiler/bin:$PATH"
+  _ov_py="$_ov/python/site-packages:$_ov/opp/built-in/op_impl/ai_core/tbe"
+  [ -n "${PYTHONPATH:-}" ] && _ov_py="$_ov_py:$PYTHONPATH"
+  export PYTHONPATH="$_ov_py"
+  _ov_ld="$_ov/lib64:$_ov/lib64/plugin/opskernel:$_ov/lib64/plugin/nnengine:$_ov/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver"
+  [ -d "$_ov/devlib" ] && _ov_ld="$_ov_ld:$_ov/devlib"
+  [ -n "${LD_LIBRARY_PATH:-}" ] && _ov_ld="$_ov_ld:$LD_LIBRARY_PATH"
+  export LD_LIBRARY_PATH="$_ov_ld"
+  mkdir -p "$_ov/var/log" 2>/dev/null || true
+  [ -f /usr/local/Ascend/nnal/atb/set_env.sh ] && source /usr/local/Ascend/nnal/atb/set_env.sh >/dev/null 2>&1
+  echo "MY_DEBUG_LOG env_dsv41 cann_overlay=$_ov"
+else
+  for _env in /usr/local/Ascend/cann/set_env.sh /usr/local/Ascend/ascend-toolkit/set_env.sh \
+              /usr/local/Ascend/cann-9.1.0/set_env.sh /usr/local/Ascend/nnal/atb/set_env.sh; do
+    [ -f "$_env" ] && source "$_env" >/dev/null 2>&1
+  done
+fi
 export PATH=/usr/local/python3.11.15/bin:$PATH
 export MY_ENV_COMPAT_ROOT=/mnt/share/m00899630/envcompat
 export PYTHONPATH="$MY_ENV_COMPAT_ROOT:$R/vllm:$R/vllm-ascend:$R/FSDPTurbo:$R/verl:${PYTHONPATH:-}"
@@ -72,5 +119,10 @@ export VLLM_ENGINE_READY_TIMEOUT_S=3600 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000
 export ASCEND_CONNECT_TIMEOUT=10000 ASCEND_TRANSFER_TIMEOUT=10000
 export OMP_PROC_BIND=false OMP_NUM_THREADS=10 TASK_QUEUE_ENABLE=1
 
-ray stop --force >/dev/null 2>&1 || true
-ray start --head --port="$RAY_PORT" --node-ip-address="$MY_IP" --disable-usage-stats --include-dashboard=false
+# [1117 4node-mixed] 多机编排时 Ray 由启动器统一起（默认 0 = 单机行为逐字不变）
+if [ "${MY_ENV_DSV41_RAY_SKIP_START:-0}" = "1" ]; then
+  echo "MY_DEBUG_LOG env_dsv41 ray_skip_start=1"
+else
+  ray stop --force >/dev/null 2>&1 || true
+  ray start --head --port="$RAY_PORT" --node-ip-address="$MY_IP" --disable-usage-stats --include-dashboard=false
+fi
