@@ -203,3 +203,14 @@ cd ..
 
 
 **单机 32 专家用 CP=1**：CP=4 每步 200 s， CP=1  132.6 s（快 1.5×），HBM 多 2 GB（26.05 vs 24.18 GB）。CP=4时，FSDP Turbo需要指定到 `201f413`。
+
+
+### 4.4 4机 384 专家 + 参数梯度驻卡（修复「reward 不涨」）
+
+
+commit id同上
+```
+bash my_scripts/final/1118_1117_dsv41_4node_dapo17k_yundao_v1.sh
+bash my_scripts/final/1118_1117_dsv41_4node_dapo17k_yundao_v2_usekl.sh  # 开启KL
+``` 
+云道机器启动，注意下存在一些云道特有变量
