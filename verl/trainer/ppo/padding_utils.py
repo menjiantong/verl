@@ -125,7 +125,23 @@ def construct_minimal_padding_template(
         rollout_log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
     )
     if "multi_modal_inputs" in template_sample:
-        template_sample["multi_modal_inputs"] = {}
+        # [1120 refill-fix] 旧实现把合成样本的 multi_modal_inputs 清空为 {}，
+        # 但 DeepSeek-V4.1 等 VL 引擎要求「有 token_types 的样本」按 batch 逐条对齐：
+        # extract_multi_modal_inputs 会先跳过 {} 再 torch.cat，token_types 行数比
+        # input_ids 少一行，model.py:209 `engram_mask & attention_mask`
+        # 报 "size of tensor a (3) must match tensor b (4)"。
+        # （证据：P5a 日志 rl_rebase_bsnd_3step_20261120_1431.out 末尾，
+        #  63 样本因 reward 异常触发 refill 后合成 1 条，old_log_prob 阶段崩溃。）
+        # 修复：沿用源样本的 token_types 宽度、整行填 TEXT(-1)，images=[]；
+        # 这样 cat 后形状一致，合成样本不写任何图像 span，
+        # 语义与原意（纯文本空样本）一致。
+        multi_modal_inputs = template_sample["multi_modal_inputs"]
+        token_types = multi_modal_inputs.get("token_types") if isinstance(multi_modal_inputs, dict) else None
+        template_sample["multi_modal_inputs"] = (
+            {"token_types": torch.full_like(token_types, -1), "images": []}
+            if token_types is not None
+            else {}
+        )
     if routed_experts is not None:
         template_sample["routed_experts"] = routed_experts
     else:

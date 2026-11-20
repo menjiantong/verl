@@ -45,6 +45,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -64,6 +65,80 @@ logger = logging.getLogger(__name__)
 _EXPERT_WEIGHT_PATTERN = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w1|w2|w3)\.weight$")
 # The adapter wraps the backbone as ``self.model``, the checkpoint names the backbone.
 _MODEL_PREFIX = "model."
+
+
+_VLLM_CUSTOM_OPP_ENV = "ASCEND_CUSTOM_OPP_PATH"
+
+
+def _disable_vllm_custom_opp_vendor() -> None:
+    """[1120 RL TND] 训练进程内禁用 vllm-ascend 的 CANN vendor 算子包（幂等）。
+
+    背景（worklog_20261120_tnd_p1_baseline.md §30）：``vllm_ascend.utils`` 的
+    ``bootstrap_custom_op_env()`` 会把 ``_cann_ops_custom/vendors/custom_transformer``
+    前插到 ``ASCEND_CUSTOM_OPP_PATH``。该 vendor 的 ``aclnnSparseFlashMlaMetadata``
+    与训练侧契约不兼容：``has_cmp_kv=false`` 时要求 ``cmp_ratio=0``，而训练路径按
+    ``compress_ratio or 1`` 传 1（标准 CANN 9.3 接受）；改成 0 又要求 metadata 形状
+    1024，而标准实现为 2048（两套布局不同，不能混用），故 TND 前向在 vendor 下必崩。
+
+    证据：``mjt_workplace/task/1120_try_tnd/scripts/1122_probe_sfa_meta_timing_v1.py``
+    （mode a/b/d）实测 aclnn 在**首次调用**时才解析该变量（import 之后再设置也立即生效），
+    因此在训练进程首个 aclnn 调用前清除变量、并让后续 ``bootstrap_custom_op_env``
+    变成 no-op，即可回到标准算子；P4 纯训练与裸探针都在该状态下通过。推理跑在独立
+    ``vLLMHttpServer`` 进程（日志前缀 ``(vLLMHttpServer pid=...)``，不 import 本模块），
+    仍照常使用 vendor。只在训练 worker 进程内生效，不改 vllm-ascend 安装产物。
+    """
+    was_set = os.environ.get(_VLLM_CUSTOM_OPP_ENV)
+
+    def _strip_vendor_entries() -> None:
+        """只移除 vllm-ascend 的 `_cann_ops_custom` 条目，保留其它自定义算子包。"""
+        raw = os.environ.get(_VLLM_CUSTOM_OPP_ENV)
+        if not raw:
+            return
+        kept = os.pathsep.join(
+            part for part in raw.split(os.pathsep) if part and "_cann_ops_custom" not in part
+        )
+        if kept:
+            os.environ[_VLLM_CUSTOM_OPP_ENV] = kept
+        else:
+            os.environ.pop(_VLLM_CUSTOM_OPP_ENV, None)
+
+    _strip_vendor_entries()
+    if was_set is not None:
+        # 进程启动时就带该变量：若它在 import torch_npu 之前设置，ACL 初始化即绑定 vendor，
+        # 清变量无法回退（worklog §30.3 pop 变体）；必须在启动环境里根除。
+        logger.warning(
+            "[1120 RL TND] ASCEND_CUSTOM_OPP_PATH was present when the training vendor "
+            "guard ran (%s). If it was set before import torch_npu, the vllm custom vendor "
+            "is already bound and TND SFA metadata will fail with EZ0026; otherwise it was "
+            "just stripped. Keep the launcher environment free of it.",
+            was_set,
+        )
+    try:
+        from vllm_ascend import utils as vllm_ascend_utils
+    except ImportError:
+        vllm_ascend_utils = None
+    if vllm_ascend_utils is not None:
+        if not getattr(vllm_ascend_utils, "_VERL_TRAIN_VENDOR_DISABLED", False):
+            def _skip_bootstrap_custom_op_env(*args, **kwargs):
+                return None
+
+            vllm_ascend_utils.bootstrap_custom_op_env = _skip_bootstrap_custom_op_env
+            vllm_ascend_utils._VERL_TRAIN_VENDOR_DISABLED = True
+        platform_mod = sys.modules.get("vllm_ascend.platform")
+        if platform_mod is not None:
+            platform_mod.bootstrap_custom_op_env = vllm_ascend_utils.bootstrap_custom_op_env
+    # import/patch 过程中若已有代码前插了 vendor（import 副作用），这里再清一次，
+    # 使本函数返回后的状态与时序无关。
+    _strip_vendor_entries()
+    if os.environ.get("MY_ENV_DSV41_RL_TND_DEBUG") == "1":
+        print(
+            "[1120 RL TND] vllm custom opp vendor disabled in training process "
+            f"(was={was_set!r}, now={os.environ.get(_VLLM_CUSTOM_OPP_ENV)!r})",
+            flush=True,
+        )
+
+
+_disable_vllm_custom_opp_vendor()
 
 
 def _normalize_dsv41_images(images):
@@ -844,6 +919,143 @@ def refresh_dsv41_expert_metadata(module, device) -> None:
     refresh_expert_parallel_metadata(module, device=device)
 
 
+# [1120 RL TND] ------------------------------------------------------------------
+# TND packed 稀疏注意力的数据侧约束（证据：fsdp_turbo adapter.py forward 的 TND 校验块）：
+#   1) 每个文档长度必须能被所有生效压缩比整除。本实验权重 text_config.compress_ratios
+#      集合为 {0,1,2}（top32/top64 config.json），故补偶即可；
+#      MY_ENV_DSV41_RL_TND_PAD_MULTIPLE 默认 2。
+#   2) packed 流的 batch 维为 1，多模态记录合并为单条目，ImageInput.start 换成 packed
+#      全局偏移（上游 dataloader 对每个文档 `replace(image, start=image.start + offset)`）。
+#   3) verl padded 批的 prompt 是左填充的：agent loop 的 token_types / image.start
+#      坐标含该左填充（agent_loop.py:960 `full[0, left_pad:...]`），而 engine 拿到的
+#      input_ids 已由 left_right_2_no_padding 剥掉左填充，故按样本扣除 left_pad。
+# 补偶只作用于与 input_ids 同 offsets 的 nested 张量；response_mask 等二维张量保持原样，
+# 尾部补齐由 no_padding_2_padding 依据 pad_lens 处理（与 MY_ENV_DSV41_CP_PAD_MULTIPLE
+# 既有机制一致，见 verl/workers/utils/padding.py 的 [1102 CP] 注释）。
+
+
+def _tnd_pad_nested_samples(micro_batch) -> None:
+    multiple = int(os.environ.get("MY_ENV_DSV41_RL_TND_PAD_MULTIPLE", "2") or "2")
+    input_ids = micro_batch.get("input_ids")
+    if input_ids is None or not isinstance(input_ids, torch.Tensor) or not input_ids.is_nested:
+        return
+    offsets = input_ids.offsets()
+    lengths = offsets.diff()
+    if multiple <= 1:
+        return
+    new_lengths = (lengths + multiple - 1) // multiple * multiple
+    if torch.equal(new_lengths, lengths):
+        return
+    new_offsets = torch.cat([offsets.new_zeros(1), torch.cumsum(new_lengths, 0)])
+    pad_token_id = tu_get_non_tensor(micro_batch, "pad_token_id", 0)
+    fills = {"input_ids": pad_token_id, "token_types": -1}
+    for key in list(micro_batch.keys()):
+        tensor = micro_batch.get(key)
+        if not isinstance(tensor, torch.Tensor) or not tensor.is_nested:
+            continue
+        if not torch.equal(tensor.offsets(), offsets):
+            continue
+        values = tensor.values()
+        chunks = []
+        for start, length, target in zip(offsets[:-1].tolist(), lengths.tolist(), new_lengths.tolist()):
+            chunks.append(values[start:start + length])
+            if target > length:
+                chunks.append(values.new_full((target - length,) + tuple(values.shape[1:]), fills.get(key, 0)))
+        micro_batch[key] = torch.nested.nested_tensor_from_jagged(torch.cat(chunks), new_offsets)
+
+
+def tu_get_non_tensor(micro_batch, key, default):
+    from verl.utils import tensordict_utils as tu
+
+    return tu.get_non_tensor_data(data=micro_batch, key=key, default=default)
+
+
+def _tnd_sample_layout(micro_batch, padded_lens):
+    """每样本真实长度与 prompt 左填充量。
+
+    verl 的 padded 批：prompts [bs, prompt_len]，attention_mask 同时覆盖
+    prompt（左填充）与 response（右填充），真实 token 数 = 两侧 mask 之和。
+    no_padding_2_padding 用同一口径（padding.py:123-124），此处与其保持一致。
+    """
+    prompts = micro_batch.get("prompts")
+    mask = micro_batch.get("attention_mask")
+    if (
+        isinstance(prompts, torch.Tensor)
+        and isinstance(mask, torch.Tensor)
+        and not prompts.is_nested
+        and not mask.is_nested
+    ):
+        prompt_len = int(prompts.shape[1])
+        prompt_lens = mask[:, :prompt_len].sum(dim=1)
+        response_lens = mask[:, prompt_len:].sum(dim=1)
+        real_lens = [int(x) for x in (prompt_lens + response_lens).tolist()]
+        left_pads = [prompt_len - int(x) for x in prompt_lens.tolist()]
+        if len(real_lens) == len(padded_lens):
+            return real_lens, left_pads
+    return list(padded_lens), [0] * len(padded_lens)
+
+
+def _tnd_convert_packed_inputs(model_inputs, micro_batch) -> None:
+    from dataclasses import replace
+
+    input_ids = model_inputs["input_ids"]
+    if input_ids.dim() != 2 or input_ids.shape[0] != 1:
+        raise ValueError(
+            "[1120 RL TND] TND requires packed inputs; set actor_rollout_ref.model.use_remove_padding=True."
+        )
+    offsets = micro_batch["input_ids"].offsets()
+    total = int(offsets[-1].item())
+    if int(input_ids.shape[1]) != total:
+        raise ValueError(
+            f"[1120 RL TND] packed length {int(input_ids.shape[1])} != sum(actual_seq_len) {total}; "
+            "pad_to_length/ulysses packing is incompatible with TND."
+        )
+    padded_lens = [int(x) for x in offsets.diff().tolist()]
+    real_lens, left_pads = _tnd_sample_layout(micro_batch, padded_lens)
+    # TND 的 rope 位置由 cu_seqlens 在模型内部逐文档推导（model.py/layers.py 无
+    # position_ids 入口），传 verl 的 position_ids 会被 adapter 拒绝；
+    # cu_seqlens(_cpu) 是 verl 自带打包路径的键，TND 由 actual_seq_len 派生，一并移除。
+    for key in ("cu_seqlens", "cu_seqlens_cpu", "position_ids"):
+        model_inputs.pop(key, None)
+    model_inputs["sfa_layout"] = "TND"
+    model_inputs["actual_seq_len"] = offsets[1:].to(dtype=torch.int32)
+
+    token_types = model_inputs.get("token_types")
+    if token_types is not None and not getattr(token_types, "is_nested", False):
+        packed = token_types.new_full((1, total), -1)
+        start = 0
+        for row, (length, real, left_pad) in enumerate(zip(padded_lens, real_lens, left_pads)):
+            take = max(0, min(real, length, int(token_types.shape[1]) - left_pad))
+            if take:
+                packed[0, start:start + take] = token_types[row, left_pad:left_pad + take]
+            start += length
+        model_inputs["token_types"] = packed
+
+    images = model_inputs.get("images")
+    merged = []
+    if images is not None:
+        starts = [int(x) for x in offsets[:-1].tolist()]
+        for index, sample in enumerate(images):
+            shift = starts[index] - (left_pads[index] if index < len(left_pads) else 0)
+            for image in sample or ():
+                if isinstance(image, dict):
+                    image = dict(image)
+                    image["start"] = int(image["start"]) + shift
+                else:
+                    image = replace(image, start=image.start + shift)
+                merged.append(image)
+        # packed 批 batch 维为 1：全部文档的图像记录合成单条目（顺序与模型内部
+        # records 的展平顺序一致），并还原成 ImageInput（跨进程可能退化为 dict）。
+        model_inputs["images"] = _normalize_dsv41_images([merged])
+
+    if os.environ.get("MY_ENV_DSV41_RL_TND_DEBUG") == "1":
+        print(
+            f"[1120 RL TND] samples={len(padded_lens)} total={total} padded={padded_lens} "
+            f"real={real_lens} left_pad={left_pads} images={len(merged)}",
+            flush=True,
+        )
+
+
 class _KeepTrainFlagEvalCtx:
     """[1102 CP] 包一层 eval 上下文，只把 module 的 training 标志改回 True。
 
@@ -864,6 +1076,37 @@ class _KeepTrainFlagEvalCtx:
 
     def __exit__(self, *exc):
         return self._inner.__exit__(*exc)
+
+
+def _restore_ignored_modules_device(module, fsdp_turbo_config) -> None:
+    """[1120 rebase engine] 把 CPU offload 下漏搬的 ignored modules 搬回计算设备。
+
+    证据（worklog §26）：本 engine 的 fsdp_plan.ignored_modules 只有
+    ``model.vision`` / ``model.aligner`` —— 视觉塔与对齐器不归 FSDP 管理
+    （frozen，全 rank 复制）。upstream 的 prepare_*_for_fsdp 先把全部参数转 meta，
+    于是 FSDP 包装时 ``_move_unmanaged_ignored_modules`` 因参数仍是 meta 而跳过
+    （fully_shard_parallel.py:70-72，:108 显式跳过 meta）；offload_policy 时
+    ``initialize_deepseek_v41_model`` 又把它们物化到 CPU，checkpoint 直读装载
+    （_load_direct_shards 对真实参数 ``copy_``）不改设备 ⇒ 前向时 proj 权重在 CPU、
+    输入在 NPU：``RuntimeError: ... mat1 is on npu:N, different from other tensors on cpu``
+    （P5a v2 日志 15:06，vision.py:69）。旧 FSDPTurbo 的 prepare 直接
+    ``.to(device)`` 非 meta 参数，故 9.1 基线无此问题；这里在参数物化且装载完成后
+    调用 upstream 同一 helper，恢复等价行为。
+    """
+
+    from fsdp_turbo.distributed.fully_shard_parallel.fully_shard_parallel import (
+        _move_unmanaged_ignored_modules,
+        get_ignored_modules,
+    )
+
+    ignored_modules, _ = get_ignored_modules(module, fsdp_turbo_config.distributed.fsdp_plan)
+    if not ignored_modules:
+        return
+    # 只搬「未被 FSDP/EP 包装、且没有 pre_fsdp_hook」的张量：EP experts 的 FSDPModule
+    # 子树与 HostOffloadEngram 的 pre_fsdp_hook 子树由 helper 内部保护
+    # （upstream tests/unit_tests/distributed/test_ignored_module_device_placement.py）。
+    # 非 offload 路径下参数已在计算设备，.to(device) 返回自身，是 no-op。
+    _move_unmanaged_ignored_modules(module, ignored_modules, torch.accelerator.current_accelerator())
 
 
 @EngineRegistry.register(
@@ -985,8 +1228,21 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
         rejected). verl's padded batch path always builds one, so remove it here. Packed
         (remove-padding) inputs would need per-sequence positions the reference forward
         cannot consume, so fail loudly instead of training on wrong positions.
+
+        [1120 RL TND] With ``MY_ENV_DSV41_RL_SFA_LAYOUT=TND`` the packed inputs verl's
+        rmpad path already produces are converted to the TND contract instead: samples are
+        padded up to the compression-ratio multiple (even for real weights) and the model
+        receives ``actual_seq_len``/``sfa_layout`` plus document-offset image spans.
         """
+        tnd_layout = os.environ.get("MY_ENV_DSV41_RL_SFA_LAYOUT", "BSND").upper()
+        if tnd_layout not in ("BSND", "TND"):
+            raise ValueError(f"MY_ENV_DSV41_RL_SFA_LAYOUT must be BSND or TND, got {tnd_layout!r}.")
+        if tnd_layout == "TND":
+            _tnd_pad_nested_samples(micro_batch)
         model_inputs, output_args = super().prepare_model_inputs(micro_batch)
+        if tnd_layout == "TND":
+            _tnd_convert_packed_inputs(model_inputs, micro_batch)
+            return model_inputs, output_args
         model_inputs.pop("position_ids", None)
         if model_inputs.get("cu_seqlens") is not None:
             raise NotImplementedError(
@@ -1012,9 +1268,10 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
         return model_inputs, output_args
 
     def _build_dsv41_module(self):
+        # [1120 RL TND] 建模前再确认一次：vllm rollout 初始化可能重新前插 vendor 路径。
+        _disable_vllm_custom_opp_vendor()
         from fsdp_turbo.models.deepseek.deepseek_v41 import (
             build_deepseek_v41_model,
-            initialize_deepseek_v41_model,
             prepare_deepseek_v41_model_for_fsdp,
         )
 
@@ -1026,6 +1283,25 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
         # rank's row range from the checkpoint afterwards (see
         # :meth:`_load_host_engram_tables`).
         vision_enabled = os.environ.get("VERL_DSV41_VISION", "0") == "1"
+        # [1120 rebase engine] mHC 后端选择：rebase 树的注册表默认优先级会先命中
+        # tilekernels，而 mhc_tilekernels.py:_validate_device 要求 Ascend 950，非 950
+        # 设备上抛 ValueError（只能 ModuleNotFoundError 才回退，registry.py:198-208）。
+        # upstream 的 A3/TND 示例与 P4 纯训练配置都显式取 eager：
+        # examples/deepseek_v41/config_tnd.yaml:25-27。950 上保留默认（tilekernels）。
+        # MY_ENV_DSV41_OPS_BACKEND（JSON）逐项覆盖，例如 {"mhc_post": "ascendc"}。
+        ops_backend: dict[str, str] = {"mhc_pre_sinkhorn_premix": "eager", "mhc_post": "eager"}
+        # torch.accelerator.get_device_name 在 torch 2.10.0 + torch_npu 2.10.0.post4 上不存在
+        # （实测 AttributeError），改用 torch.npu.get_device_name（实测 "Ascend910_9392"）。
+        try:
+            device_name = torch.npu.get_device_name(torch.npu.current_device())
+        except (AttributeError, RuntimeError):
+            # 查询失败时保留 eager（A3/A2 正确；950 上 eager 也可运行，仅少一次融合）。
+            device_name = ""
+        if "950" in device_name:
+            ops_backend = {}
+        ops_override = os.environ.get("MY_ENV_DSV41_OPS_BACKEND")
+        if ops_override:
+            ops_backend.update(json.loads(ops_override))
         training_model = build_deepseek_v41_model(
             tokenizer=self.model_config.tokenizer,
             # [1030 rebase] 新 FSDPTurbo 的 host-offload engram 表默认在 meta 上构造，
@@ -1041,14 +1317,15 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
             use_fused_vision_flash_attn=os.environ.get("MY_ENV_TRAIN_FUSED_VISION_ATTN", "0") == "1",
             # [1031 融合算子 A/B] 其余训练侧融合开关，默认 0 保持生产行为；
             # 逐项置 1 可对比其与推理侧融合实现的数值差异。
-            use_fused_mhc=os.environ.get("MY_ENV_TRAIN_FUSED_MHC", "0") == "1",
+            # [1120 rebase engine] upstream ModelArgs 已无 use_fused_mhc 形参（main 0383285），
+            # 旧 fork 的该项默认即关闭，删除后行为不变。
             use_fused_compressor=os.environ.get("MY_ENV_TRAIN_FUSED_COMPRESSOR", "0") == "1",
             use_fused_clipped_swiglu=os.environ.get("MY_ENV_TRAIN_FUSED_CLIPPED_SWIGLU", "0") == "1",
             use_triton_inplace_rope=os.environ.get("MY_ENV_TRAIN_TRITON_INPLACE_ROPE", "0") == "1",
             use_fused_lightning_indexer=os.environ.get("MY_ENV_TRAIN_FUSED_LIGHTNING_INDEXER", "0") == "1",
-            # The routed experts stay on meta until the checkpoint loader
-            # materializes each rank's shard.
-            experts_meta_init=True,
+            ops=ops_backend,
+            # [1120 rebase engine] experts_meta_init 形参在 upstream main 已移除；
+            # 分片参数改由 _build_fsdp_module 在 FSDPTurbo 之后 initialize 物化。
             config_path=_config_path_from_model_path(self._dsv41_model_path()),
             # [1030 rebase] 新 FSDPTurbo 由 config.json 的 vision_config 决定是否建视觉塔
             # (ModelArgs.vision_enabled = vision_n_layers > 0)，不再接受 include_vision 形参。
@@ -1076,7 +1353,8 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
                 _log_rank0("vision tower enabled: %d parameters frozen", frozen)
             else:
                 _log_rank0("vision tower enabled: parameters remain trainable (not FSDP-managed!)")
-        initialize_deepseek_v41_model(training_model)
+        # [1120 rebase engine] initialize 必须在 FSDPTurbo 分片之后调用
+        # （upstream examples/deepseek_v41/train.py:165），见 _build_fsdp_module。
         training_model = prepare_deepseek_v41_model_for_fsdp(
             training_model,
             device=torch.accelerator.current_accelerator(),
@@ -1152,7 +1430,23 @@ class FSDPTurboDSV41EngineWithLMHead(FSDPTurboEngineWithLMHead):
             offload_policy = True
             self._uses_fsdp2_cpu_offload_policy = True
 
+        # [1120 rebase engine] upstream 的 initialize 在 FSDP/EP 分片之后物化本地分片
+        # （adapter.py:806 文档 + examples/deepseek_v41/train.py:165 顺序）。
+        # CPU offload 时物化到 CPU，否则物化到计算设备；_init_weights 的填充方式
+        # 由 MY_ENV_DSV41_MODEL_INIT 控制（zero 模式等价 memset）。
+        from fsdp_turbo.models.deepseek.deepseek_v41.adapter import (
+            initialize_deepseek_v41_model as _initialize_dsv41_model,
+        )
+
+        _initialize_dsv41_model(
+            module,
+            device=torch.device("cpu") if offload_policy else torch.accelerator.current_accelerator(),
+            initialize_weights=True,
+        )
+
         self._materialize_dsv41_parameters(module, param_meta, buffer_meta, offload_policy, engram_tables)
+        # [1120 rebase engine] checkpoint 装载完成后再搬 ignored modules（见 helper 注释）。
+        _restore_ignored_modules_device(module, self.fsdp_turbo_config)
         return module
 
     def _materialize_dsv41_parameters(self, module, param_meta, buffer_meta, offload_policy, engram_tables=()):

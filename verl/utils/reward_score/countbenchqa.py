@@ -27,20 +27,38 @@ _THINK_END_RE = re.compile(r"</think>", re.IGNORECASE)
 _STANDALONE_INT_RE = re.compile(r"(?<![\d.])[+-]?\d+(?!\d|[A-Za-z]|\.\d)")
 
 
+def _safe_int(text: str) -> int | None:
+    # [1120 reward-fix] Python 3.11 对超过 4300 位的十进制串调 int() 会抛
+    # ValueError（"Exceeds the limit (4300 digits)"）。CountBenchQA 答案是小整数，
+    # 超长串必为无效预测，按 None 处理（与崩溃前"该值不可能等于 expected"的语义一致）。
+    # 证据：2026-11-20 14:49 P5a 日志 rl_rebase_bsnd_3step_20261120_1431.out:2013，
+    # rollout 生成了 6075 位数字（countbenchqa.py:79 -> :43）。
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
 def _last_boxed_int(text: str) -> int | None:
     matches = list(_BOXED_RE.finditer(text))
     if not matches:
         return None
     groups = matches[-1].groups()
     value = next(group for group in groups if group is not None)
-    return int(value)
+    return _safe_int(value)
 
 
 def _last_int_after_think(text: str) -> int | None:
     closes = list(_THINK_END_RE.finditer(text))
     tail = text[closes[-1].end() :] if closes else text
     numbers = _STANDALONE_INT_RE.findall(tail)
-    return int(numbers[-1]) if numbers else None
+    # 从右往左取第一个可解析的整数：超长串跳过（[1120 reward-fix]），
+    # 语义仍为"最后一个整数"。
+    for candidate in reversed(numbers):
+        value = _safe_int(candidate)
+        if value is not None:
+            return value
+    return None
 
 
 def compute_score(
