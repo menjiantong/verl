@@ -214,3 +214,26 @@ bash my_scripts/final/1118_1117_dsv41_4node_dapo17k_yundao_v1.sh
 bash my_scripts/final/1118_1117_dsv41_4node_dapo17k_yundao_v2_usekl.sh  # 开启KL
 ``` 
 云道机器启动，注意下存在一些云道特有变量
+
+
+## 5. colocate async
+
+```
+cd FSDPTurbo
+git reset --hard 201f4136b15a2298dc85aeddbf59495e8655b016
+cd ..
+
+cd verl
+git reset --hard bf3f4584b101cc0ad53a2989b5d26bc5835ff7c6
+cd ..
+
+cd vllm-ascend/
+git reset --hard 16c3159dd375721a94d293d5ef8c82302daad8f3
+cd ..
+
+cd vllm
+git reset --hard fd46ca5adaee11331a4c2f1b74483fef491f03cf
+cd ..
+
+bash my_scripts/final/1120_dav41_4node_dapo17k_yundao_colocate_async_sh
+```
