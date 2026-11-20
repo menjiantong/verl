@@ -991,6 +991,17 @@ class vLLMHttpServer:
                 - aborted_count: Number of requests aborted
                 - request_ids: List of aborted request IDs
         """
+        # [1119] 门禁关闭移到 node_rank 守卫之前：恢复上游 #7511 的「每个 server actor 都关/开门」
+        # 不变量（resume_generation() 的注释即假设 "every server in the replica closed the gate"，
+        # 且它会在所有 server actor 上 set 事件），#7652 把守卫插到关门之前破坏了这个对称性。
+        # 影响面（代码核实）：node_rank == 0 时两种位置逐语句等价（中间没有 await）；非 0 节点走
+        # run_headless、没有 self.engine，generate() 的入场只会打到副本的 servers[0]，因此这些 actor
+        # 的 gate 此前是死状态 —— 本改动不改变任何请求的准入行为。
+        # 因此 A3 的 OOM 与本次改动的因果关系**未证实**：A3→A3c 同期还改了 KV 3→1 GiB、swap 0.05→0.03。
+        # 保留此改动只因为它恢复不变量且无副作用；OOM 的定案证据见 worklog §12（训练侧 allocator 碎片）。
+        self._submission_paused = True
+        self._resume_event.clear()
+
         # Only node rank 0 owns AsyncLLM/self.engine. The remaining actors in a
         # multi-node replica run vLLM's headless entry point, so there is no
         # engine object to abort through on those actors.
@@ -998,10 +1009,7 @@ class vLLMHttpServer:
             return {"aborted_count": 0, "request_ids": []}
 
         try:
-            # Close the gate first, then let admissions already past it land, so the pause
-            # below actually covers them.
-            self._submission_paused = True
-            self._resume_event.clear()
+            # Gate already closed above; let admissions past it land so the pause covers them.
             deadline = time.monotonic() + _GATE_BARRIER_TIMEOUT_S
             while self._admitting > 0:
                 if time.monotonic() > deadline:

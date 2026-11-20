@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# =============================================================================
+# [1119 v2] DSV4.1 4机×16卡 DAPO-512：显存拆解 → 2k 推 6k → colocate_async
+#
+# 基线：1118_1117_dsv41_4node_dapo17k_yundao_v2_usekl.sh（超参逐字继承）
+# 相对基线的差异（只有路径/编排/形状，数值超参不动）：
+#   1) prompt 固定 2048（v2 目标口径），response  2k|4k|6k ；
+#   2) trainer_mode  sync|async ；
+#   3) ++actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 
+#   4) ++actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 
+#   5) MY_ENV_DSV41_SWAP_MEM_FRACTION=0.03
+#   6) export MY_ENV_DSV41_KV_CACHE_BYTES=${MY_ENV_DSV41_KV_CACHE_BYTES:-1073741824}
+#   7) export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+#   8)   trainer.v1.trainer_mode=colocate_async  trainer.v1.colocate_async.num_warmup_batches=1
+# =============================================================================
+set -eo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+
+# ---- 云道 rank 信息：必须在 source env 之前（env 里 NNODES=${NNODES:-1}）----
+export NNODES=${MA_NUM_HOSTS:-1}
+export NODE_RANK=${VC_TASK_INDEX:-0}
+# 作业容器只有 172.16.x/eth0（证据：1110 8 机 driver 日志 node0-7 Net 行），devserver 的
+# 首个地址才是 7.150.x。env_dsv41_yundao_384.sh 用 grep '^7\.' 找 MY_IP，在作业容器里会得到
+# 空值（NIC 回退到不存在的 enp48s3u1u1 → Ray/HCCL 绑定失败）。这里先按首地址定 MY_IP，
+# 两种环境都对：作业容器 172.16.x、裸机 devserver 7.150.x。
+export MY_IP=${MY_IP:-$(hostname -I | awk '{print $1}')}
+# VC_WORKER_HOSTS 首项是平台给的 worker-0 主机名（形如 ma-job-...-worker-0...），不是 IP，
+# 直接原样用作 Ray head 地址（1110 8 机就是这样起的）。
+HEAD_HOST=${VC_WORKER_HOSTS%%,*}
+if [ "$NNODES" -gt 1 ] && [ -z "$HEAD_HOST" ]; then
+  echo "MY_DEBUG_LOG [yundao] no_head nnodes=$NNODES (VC_WORKER_HOSTS unset)" >&2
+  exit 2
+fi
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
+
+# ---- sleep L2（必须在 ray start 之前导出：worker 进程继承 raylet 环境） ----
+export MY_ENV_DSV41_SLEEP_LEVEL=${MY_ENV_DSV41_SLEEP_LEVEL:-2}
+export MY_ENV_VLLM_SLEEP_PIN_MEMORY=${MY_ENV_VLLM_SLEEP_PIN_MEMORY:-0}
+# swapopt 旋钮（默认值）；step 内换入批次占“空闲显存”的比例
+export MY_ENV_DSV41_SWAP_MEM_FRACTION=${MY_ENV_DSV41_SWAP_MEM_FRACTION:-0.03}
+export MY_ENV_DSV41_SWAP_PARAM_PREFETCH=${MY_ENV_DSV41_SWAP_PARAM_PREFETCH:-0}
+# 主机矩用 pageable（见基线文件头）；=1 回退到 pinned
+export MY_ENV_DSV41_SWAP_HOST_PINNED=${MY_ENV_DSV41_SWAP_HOST_PINNED:-0}
+
+# ---- 步数必须在 source 之前定：env_dsv41_yundao_384.sh 会把它默认成 200 ----
+export MY_ENV_DSV41_STEPS=${MY_ENV_DSV41_STEPS:-${STEPS:-100}}
+
+# ---- 云道公共环境：不起 Ray（Ray 由本脚本按 ModelArts rank 编排） ----
+source "$here/env_dsv41_yundao_384.sh"
+cd /efs_rl/m00899630/workspace/dsv41-verl-rebase/verl
+
+# ---- 云道 env 不含 PYTHONPATH，镜像里也没有安装 vllm/verl：显式加 4 个仓库根 ----
+export PYTHONPATH=/efs_rl/m00899630/workspace/dsv41-verl-rebase/vllm:/efs_rl/m00899630/workspace/dsv41-verl-rebase/vllm-ascend:/efs_rl/m00899630/workspace/dsv41-verl-rebase/FSDPTurbo:/efs_rl/m00899630/workspace/dsv41-verl-rebase/verl:${PYTHONPATH:-}
+
+# ---- 与基线完全一致的形状/图/KV/micro-batch ----
+export MAX_PROMPT_LEN=2048 MAX_RESPONSE_LEN=6144
+export MY_ENV_DSV41_GRAPH_MODE=1
+export MY_ENV_DSV41_KV_CACHE_BYTES=${MY_ENV_DSV41_KV_CACHE_BYTES:-1073741824}
+export MY_ENV_DSV41_CUDAGRAPH_CAPTURE_SIZES="[1,2,4,8,16,24,32]"
+
+# ---- 4 机拓扑（env_dsv41_yundao_384.sh 已是同一组值；显式写死，防止 env 漂移） ----
+export NDEVICES_PER_NODE=16
+export FSDP_SIZE=64 EP_SIZE=64 EFSDP_SIZE=1
+export GEN_TP=8 GEN_DP=8 GEN_EP=64
+export CP_SIZE=4
+
+# ---- 全量模型 + DAPO-17k；KL 关闭（否则 ref worker 再持一份 engram+优化器） ----
+export USE_KL=1
+export MODEL_PATH=${MODEL_PATH_OVERRIDE:-/efs_rl/weights/DeepSeek-V4.1-Flash-bf16}
+export TRAIN_FILE=/efs_rl/m00899630/dsv41/rl_data/dapo_math_17k/dapo-math-17k.parquet
+export TEST_FILE=/efs_rl/m00899630/dsv41/rl_data/dapo_math_val_64.parquet
+export EXPERIMENT_NAME=${EXPERIMENT_NAME:-DSV41-4node-dapo17k-yundao}
+
+# ---- 缓存隔离（同基线：多机 64 进程并发编译不能共享同一个目录） ----
+export TRITON_CACHE_DIR=/tmp/m00899630_cache/triton
+export TORCHINDUCTOR_CACHE_DIR=/tmp/m00899630_cache/torchinductor
+export TORCH_EXTENSIONS_DIR=$MY_ENV_CACHE_ROOT/torch_extensions/$(hostname)
+export VLLM_CACHE_ROOT=$MY_ENV_CACHE_ROOT/vllm/$(hostname)
+mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$TORCH_EXTENSIONS_DIR" "$VLLM_CACHE_ROOT" 2>/dev/null || true
+
+# Ray object store 钉小（训练状态占主机内存；默认 200 GB 太大）
+RAY_OBJ_STORE=${RAY_OBJECT_STORE_BYTES:-8000000000}
+
+# ---- 非 rank0：join 后保持容器存活（云道方式：只有 rank0 跑训练） ----
+if [ "$NNODES" -gt 1 ] && [ "$NODE_RANK" -ne 0 ]; then
+  echo "MY_DEBUG_LOG [yundao] join rank=$NODE_RANK/$NNODES host=$(hostname) ip=$MY_IP -> $HEAD_HOST:$RAY_PORT"
+  # 先清掉上一轮残留的 raylet：否则要么端口冲突返回非 0，要么复用旧 raylet，
+  # worker 会继承旧环境（无 CANN overlay / pinned=1 等）。
+  ray stop --force >/dev/null 2>&1 || true
+  ok=0
+  for _ in $(seq 1 60); do
+    # 注意：--include-dashboard 只能配 --head；worker 分支传了会 PANIC
+    # "`--include-dashboard` should only be specified when starting head node"（ray 2.60）。
+    if ray start --address="${HEAD_HOST}:${RAY_PORT}" --node-ip-address="$MY_IP" \
+         --disable-usage-stats --object-store-memory="$RAY_OBJ_STORE"; then
+      ok=1
+      break
+    fi
+    sleep 5
+  done
+  [ "$ok" = 1 ] || { echo "MY_DEBUG_LOG [yundao] join_failed head=$HEAD_HOST:$RAY_PORT" >&2; exit 5; }
+  ray status --address="${HEAD_HOST}:${RAY_PORT}" 2>&1 | tail -6
+  echo "MY_DEBUG_LOG [yundao] worker_ready rank=$NODE_RANK/$NNODES"
+  sleep infinity
+  exit 0
+fi
+
+# ---- rank0（含单机裸跑）：起 Ray head，等齐后再跑训练 ----
+echo "MY_DEBUG_LOG [yundao] master rank=$NODE_RANK/$NNODES host=$(hostname) ip=$MY_IP nic=$NIC head=$HEAD_HOST nodes=$NNODES fsdp=$FSDP_SIZE ep=$EP_SIZE gen=${GEN_TP}x${GEN_DP} kl=$USE_KL steps=$MY_ENV_DSV41_STEPS sleep=${MY_ENV_DSV41_SLEEP_LEVEL}"
+for f in "$MODEL_PATH/config.json" "$TRAIN_FILE" "$TEST_FILE"; do
+  [ -e "$f" ] || { echo "ERROR: missing $f"; exit 1; }
+done
+
+# rank0 必须是平台列表首项：否则多机时会出现两个 head（平台按 VC_WORKER_HOSTS 顺序发 rank）。
+# 主机名可能同时解析出 IPv6，解析结果不等于 MY_IP 不代表错，这里只告警不退出；
+# head 直接用 HEAD_HOST 绑定（与 1110 8 机 driver 日志里的做法逐字一致）。
+if [ "$NNODES" -gt 1 ]; then
+  _head_addr=$(getent hosts "$HEAD_HOST" 2>/dev/null | awk 'NR==1{print $1}' || true)
+  case "$_head_addr" in
+    ""|"$MY_IP"|"$HEAD_HOST") ;;
+    *) echo "MY_DEBUG_LOG [yundao] head_host_resolve head=$HEAD_HOST(${_head_addr}) my_ip=$MY_IP (continue)" ;;
+  esac
+fi
+
+_head_bind=${HEAD_HOST:-$MY_IP}
+ray stop --force >/dev/null 2>&1 || true
+ray start --head --port="$RAY_PORT" --node-ip-address="$_head_bind" \
+          --disable-usage-stats --include-dashboard=false --object-store-memory="$RAY_OBJ_STORE"
+export RAY_ADDRESS="$_head_bind:$RAY_PORT"
+
+if [ "$NNODES" -gt 1 ]; then
+  want=$((NNODES * NDEVICES_PER_NODE))
+  got=0
+  for _ in $(seq 1 120); do
+    got=$(ray status 2>/dev/null | awk '/NPU/{split($1,a,"/"); s+=a[2]} END{print int(s)}') || true
+    [ "${got:-0}" -ge "$want" ] && break
+    sleep 5
+  done
+  [ "${got:-0}" -ge "$want" ] || {
+    echo "MY_DEBUG_LOG [yundao] cluster_not_ready npu=${got:-0}/$want" >&2
+    exit 4
+  }
+  echo "MY_DEBUG_LOG [yundao] cluster_ready npu=${got}/${want}"
+fi
+ray status | tail -20
+
+# AdamWSwapSafe 还不能 load_state_dict，save 出来的 checkpoint 续训必崩；固定关闭保存，
+# 并拒绝任何把 save_freq 覆盖成其它值的透传参数（"$@" 在入口脚本参数之后生效）。
+for _a in "$@"; do
+  case "$_a" in
+    trainer.save_freq=*|++trainer.save_freq=*)
+      case "$_a" in
+        trainer.save_freq=-1|++trainer.save_freq=-1) ;;
+        *) echo "ERROR: trainer.save_freq must stay -1 with AdamWSwapSafe (got $_a)" >&2; exit 1 ;;
+      esac ;;
+  esac
+done
+
+# mb 与基线一致：actor mb1 / logprob mb2（全量 64 卡下 [mb×seq, vocab] fp32 logits
+# 缓冲是最大单次分配；mb2 时 2.12 GiB，基线 run7 实测两步峰值 59.6 GiB/卡）
+exec bash examples/grpo_trainer/run_deepseek_v41_top64_grpo_fsdp_turbo_npu.sh \
+  trainer.total_training_steps="${MY_ENV_DSV41_STEPS}" \
+  '++actor_rollout_ref.actor.fsdp_config.turbo_config.memory.recompute_plan=["model.layers.{*}"]' \
+  ++actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+  ++actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
+  ++actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+  actor_rollout_ref.rollout.free_cache_engine=True \
+  actor_rollout_ref.actor.fsdp_config.offload_policy=False \
+  actor_rollout_ref.actor.fsdp_config.param_offload=False \
+  actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+  actor_rollout_ref.actor.optim.optimizer_impl=verl.utils.dsv41_swap_optim \
+  actor_rollout_ref.actor.optim.optimizer=AdamWSwapSafe \
+  trainer.save_freq=-1 \
+  '+actor_rollout_ref.ref.fsdp_config.turbo_config.distributed.kv_allgather_parallel_size=4' \
+  trainer.v1.trainer_mode=colocate_async \
+  trainer.v1.colocate_async.num_warmup_batches=1 \
+  "$@"
