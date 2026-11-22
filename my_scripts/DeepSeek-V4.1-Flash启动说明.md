@@ -237,3 +237,39 @@ cd ..
 
 bash my_scripts/final/1120_dav41_4node_dapo17k_yundao_colocate_async_sh
 ```
+
+
+
+## 6. 开启TND
+
+TND需要cann9.3.0
+
+```
+docker pull swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.3.0-beta.1-a3-ubuntu22.04-py3.11
+
+git clone -b dev_dsv41_tnd_1120  https://gitcode.com/menjiantong/FSDPTurbo
+git clone -b from_9a38d36_1030 https://github.com/menjiantong/vllm-ascend/
+git clone -b from_a98247a_1030 https://github.com/menjiantong/vllm/
+git clone -b dev_dsv41_rebase1030_cp_engram https://github.com/menjiantong/verl
+
+cd FSDPTurbo
+git reset --hard 996893be4462c860bcf81424e30b4e89753f7f4e
+cd ..
+
+cd vllm-ascend/
+git reset --hard 16c3159dd375721a94d293d5ef8c82302daad8f3
+cd ..
+
+cd vllm
+git reset --hard fd46ca5adaee11331a4c2f1b74483fef491f03cf
+cd ..
+
+cd verl 
+git reset --hard ea8ec7a687dda8c580e2f67e3b0d379099dc6789
+cd ..
+
+bash build_930.sh
+
+bash my_scripts/final/1121_rl_dsv41_rebase_tnd_100step.sh
+bash my_scripts/final/1121_rl_dsv41_rebase_tnd_100step.sh
+```
