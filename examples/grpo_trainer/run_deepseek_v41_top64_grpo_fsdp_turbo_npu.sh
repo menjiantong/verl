@@ -232,6 +232,11 @@ PIN_OVERRIDES=()
 if [ "${VERL_DSV41_OFFLOAD_PIN_MEMORY:-1}" = "0" ]; then
     PIN_OVERRIDES=(
         "+actor_rollout_ref.actor.fsdp_config.turbo_config.distributed.fsdp_plan.pin_memory=false"
+        # [1123 修复] ref 与 actor 同用 FSDPTurbo offload，pin_memory 默认 True：首个 ref
+        # 前向 lazy_init 逐分片 pin（16.97 GiB/rank × 16 = 271.5 GiB/节点）
+        # 本开关语义为"全局关闭 offload 锁页"，
+        # 此前只覆盖 actor，ref 遗漏。单变量验证：step1 ref 996.63→30.44 s、 step 1537.9→716.3 s
+        "+actor_rollout_ref.ref.fsdp_config.turbo_config.distributed.fsdp_plan.pin_memory=false"
     )
 fi
 
