@@ -242,6 +242,8 @@ bash my_scripts/final/1120_dav41_4node_dapo17k_yundao_colocate_async_sh
 
 ## 6. 开启TND
 
+
+### 6.1 单机 
 TND需要cann9.3.0
 
 ```
@@ -272,4 +274,51 @@ bash build_930.sh
 
 bash my_scripts/final/1121_rl_dsv41_rebase_tnd_100step.sh
 bash my_scripts/final/1121_rl_dsv41_rebase_tnd_100step.sh
+```
+
+
+### 6.2 4机TND
+
+```
+
+cd FSDPTurbo
+git reset --hard 996893be4462c860bcf81424e30b4e89753f7f4e
+cd ..
+
+cd vllm-ascend/
+git reset --hard da1e09cc9c2dd9b156d67f4e0150c7df6b6ef88c
+cd ..
+
+cd vllm
+git reset --hard fd46ca5adaee11331a4c2f1b74483fef491f03cf
+cd ..
+
+cd verl 
+git reset --hard 2d31449a834a420e3502fec25b56f4e3a68c7d2c
+cd ..
+
+bash verl/my_scripts/final/1123_dsv41_4node_dapo17k_yundao_colocate_async_tnd.sh
+```
+
+### 6.3 4机TND + use fused swiglu
+
+```
+cd FSDPTurbo
+git reset --hard 996893be4462c860bcf81424e30b4e89753f7f4e
+cd ..
+
+cd vllm-ascend/
+git reset --hard 16c3159dd375721a94d293d5ef8c82302daad8f3
+cd ..
+
+cd vllm
+git reset --hard fd46ca5adaee11331a4c2f1b74483fef491f03cf
+cd ..
+
+cd verl 
+git reset --hard a8c33358fa2b61e306764ddd5487e957152ea2fc
+cd ..
+
+bash verl/my_scripts/final/1125_dsv41_4node_dapo17k_yundao_colocate_async_tnd_fix_pin_swiglu.sh
+
 ```
