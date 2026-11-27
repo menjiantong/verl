@@ -322,3 +322,28 @@ cd ..
 bash verl/my_scripts/final/1125_dsv41_4node_dapo17k_yundao_colocate_async_tnd_fix_pin_swiglu.sh
 
 ```
+
+### 6.4 4机TND + use fused swiglu （优化显存）
+
+mHC 序列分块 + chunk moe +  全层重计算 
+
+```
+cd FSDPTurbo
+git reset --hard 936583ced05ab3e00aa5790054546215d9c838af
+cd ..
+
+cd vllm-ascend/
+git reset --hard 16c3159dd375721a94d293d5ef8c82302daad8f3
+cd ..
+
+cd vllm
+git reset --hard fd46ca5adaee11331a4c2f1b74483fef491f03cf
+cd ..
+
+cd verl 
+git reset --hard 41cc535e644e2a495de963534e9d8d37a51dbe64
+cd ..
+
+bash verl/my_scripts/final/1126_dsv41_4node_dapo17k_yundao_opt_snapshot_v1.sh
+
+```
